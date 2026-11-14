@@ -1,0 +1,31 @@
+# Nikki / Mihomo (Clash.Meta) 片段：把出国流量路由进本机的 prism-client SOCKS5。
+# prism-client 以路由器模式运行，监听 127.0.0.1:1080；Mihomo 负责 LAN 透明代理/TUN 与分流。
+#
+# 关键点：Prism v1 的数据面是 TCP-only。为避免浏览器走 QUIC(UDP/443) 绕过隧道，
+# 下面用一条规则拒绝 UDP/443，强制回落到 TCP(TLS)，这些 TCP 流再走 PRISM-SG。
+
+proxies:
+  - name: "PRISM-SG"
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+    udp: false
+
+proxy-groups:
+  - name: "出国"
+    type: select
+    proxies:
+      - "PRISM-SG"
+      - "DIRECT"
+
+rules:
+  # 1) 掐掉 QUIC，让浏览器回落到 TCP（这样才能进隧道）
+  - AND,((NETWORK,udp),(DST-PORT,443)),REJECT
+  # 2) 国内直连
+  - GEOIP,CN,DIRECT,no-resolve
+  # 3) 其余全部走新加坡出口
+  - MATCH,出国
+
+# 提示：如果你用 Mihomo 的 TUN 模式做全局接管，确保 prism-client 到新加坡的
+# 直连流量本身不要再被 TUN 回环（给 prism-client 进程或其目的IP加 DIRECT 例外），
+# 否则会环路。常见做法是按进程名 PROCESS-NAME,prism-client,DIRECT 放行。

@@ -1,0 +1,14 @@
+{
+  "_comment": "路由器模式：跑在 OpenWrt 上，只开 SOCKS5，由 Nikki/Mihomo 按规则把出国流量喂进来。",
+
+  "server": "sg.example.com:443",
+  "sni": "sg.example.com",
+  "server_public_key": "服务器X25519公钥(base64)-keygen输出里的public_key",
+  "id": "本客户端ID(base64)",
+  "psk": "本客户端PSK(base64)",
+  "allow_insecure": false,
+
+  "mode": "router",
+  "socks_listen": "127.0.0.1:1080",
+  "pool_size": 4
+}

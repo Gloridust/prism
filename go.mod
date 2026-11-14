@@ -1,3 +1,3 @@
-module prism
+module github.com/gloridust/prism
 
-go 1.27
+go 1.24

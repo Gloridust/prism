@@ -1,270 +1,265 @@
 # Prism 协议规范 v1
 
-> Prism 是一套为企业自建流量出口设计的、认证加密的隧道协议。
-> 它是**原创 wire-level 协议**，不是对 VLESS / Trojan / REALITY 等协议的二次开发。
-> 密码学原语全部采用成熟标准件（X25519 / AES-256-GCM / HKDF-SHA256），
-> 原创性体现在握手编排、认证模型、抗主动探测、分帧、流量整形与多路复用等协议层设计上。
-
-本文件是**权威规范**，参考实现（`pkg/prism`）必须与之一致。
+> 一个**原创**的抗审查隧道传输协议。目标：把多地办公室的出口统一收敛到新加坡公司，
+> 对抗 GFW 级别的审查方（被动 DPI、主动探测、SNI 封锁、TLS-in-TLS 检测、熵分析、流量分析、重放）。
+>
+> 本文是权威规范，字节级布局与 `pkg/prism` 的实现一一对应。
 
 ---
 
-## 0. 设计目标与威胁模型
+## 0. 这不是什么（原创性声明）
 
-部署形态：公司在**出口服务器（新加坡）**运行 `prism-server`，各办公室/员工端运行 `prism-client`，
-所有被选中的流量经 Prism 隧道汇聚到出口服务器后再访问互联网。出口服务器是公司**唯一流量出口**。
+Prism 不是 REALITY / Trojan / VLESS 的二次开发，三者的核心机制与 Prism 不同：
 
-威胁模型（Threat Model）：
+| 协议 | 伪装模型 | 鉴权 | 抗主动探测方式 |
+|---|---|---|---|
+| **Trojan** | TLS-over-TCP，密码放在 TLS 之后 | 口令 SHA224 | 鉴权失败回落到真实网站 |
+| **VLESS** | 自身无加密，依赖外层 TLS | UUID 明文标识 | 依赖外层传输 |
+| **REALITY** | **借用**第三方站点的真实证书（握手期做 MITM 转发） | ClientHello 内嵌 X25519 鉴权 | 未鉴权连接被透明转发到被借用的真站 |
+| **Prism** | **在自有域名上做一个真实应用**，把代理藏成该应用的合法负载 | **Noise-IK 风格 X25519 + PSK**，首包不可区分于随机 | 未鉴权连接由同机**真实 Web 回落**接管 |
 
-| 能力 | 攻击者（无公司 PSK） | 说明 |
-|---|---|---|
-| 被动观测（Passive DPI） | 看到的是**均匀随机字节流**，无明文特征、无 TLS 指纹、无固定字节头 | 握手首包起整条流不可区分于随机 |
-| 主动探测（Active Probing） | 向服务器发任意/随机/重放数据，**得不到任何可区分响应** | 认证失败走“诱饵/沉默”策略（见 §7） |
-| 流量分析（长度/时序） | 握手为**定长**；数据记录长度被加密隐藏，支持填充与掩护流量 | 见 §5、§8 |
-| 重放（Replay） | 重放旧握手被拒 | 时间戳窗口 + 临时公钥去重（见 §4.4） |
-| 密钥泄露（前向保密） | 泄露长期私钥**无法解密历史会话** | 每会话 ECDHE（见 §4） |
+Prism 的三个独有设计点：
 
-**非目标**：Prism 不声称能抵抗拥有公司 PSK 的内部攻击者，也不是匿名网络（出口可见真实目的地）。
-它解决的是“企业把自有流量安全、抗干扰地汇聚到自有出口”的问题。
+1. **身份即首包随机性**：ClientInit 是「一个 X25519 公钥点 + 一段 AEAD 密文」，整体 80 字节，
+   对没有服务器私钥 **且** 没有 PSK 的观察者而言与随机串不可区分——没有任何可供 DPI 匹配的明文结构。
+2. **双因子互认 + 前向保密**：鉴权同时需要服务器静态私钥（服务端）和每客户端 PSK（客户端）两个因子；
+   会话密钥由双方临时密钥（ephemeral-ephemeral）派生，事后即使泄露服务器静态私钥也无法解密历史会话。
+3. **反 TLS-in-TLS 的数据面**：数据阶段**不**在 TLS 里再套一层 TLS，而是自有的 AEAD 分帧 + 多路复用 + 整形，
+   记录长度分布服从可配置 profile，而非内层 TLS 握手突发——专门规避已公开的 TLS-in-TLS 指纹攻击
+   （Xue et al., USENIX Security 2024 一类）。
 
 ---
 
-## 1. 密码学套件（Cipher Suite v1）
+## 1. 威胁模型
 
-| 用途 | 算法 |
+审查方能力假设（取 GFW 级别，向下兼容更弱对手）：
+
+- **T1 被动 DPI**：对每个包做特征匹配、TLS 指纹（JA3/JA4）、明文字段识别。
+- **T2 主动探测**：主动连接可疑服务器，发任意探测包，观察响应以判定是否为代理。
+- **T3 SNI/证书识别**：按 TLS SNI 或证书封锁；ESNI/ECH 未普及地区尤甚。
+- **T4 TLS-in-TLS 检测**：识别"TLS 里套 TLS"的内层握手突发与记录长度特征。
+- **T5 熵分析**：全随机载荷（如裸 Shadowsocks）呈现异常高且均匀的熵，本身即特征。
+- **T6 流量分析**：按包长分布、时序、方向性做统计/ML 分类。
+- **T7 重放**：录制握手首包重放，探测服务器是否有可区分响应。
+
+Prism 对每条威胁的应对见 §7。
+
+---
+
+## 2. 架构
+
+```
+   办公室/家庭                             新加坡
+┌──────────────────┐                 ┌────────────────────────┐
+│ 应用 / 浏览器     │                 │  prism-server :443      │
+│   │              │                 │   ├─ 鉴权成功 → 隧道出口 │→ 互联网
+│   ▼ (系统代理/TUN)│   Prism/TLS     │   └─ 鉴权失败 → 真实网站 │  (统一出口IP)
+│ prism-client ────┼───────TCP:443──▶│      (cover backend)    │
+│ (SOCKS5/HTTP)    │   看起来=普通HTTPS │                        │
+└──────────────────┘                 └────────────────────────┘
+   模式一：OpenWrt + Nikki 路由注入
+   模式二：桌面自动系统代理 + 控制面板
+```
+
+- **客户端**一份跨平台二进制，两种部署：路由器旁车（SOCKS5，Nikki 注入）/ 桌面（SOCKS5+HTTP+系统代理+面板）。
+- **服务端**在新加坡同时是「代理出口」和「真实网站」。任何没拿到有效凭据的访问者（含主动探测）看到的就是一个普通网站。
+
+---
+
+## 3. 术语与密码学参数
+
+| 记号 | 含义 |
 |---|---|
-| 密钥协商 | X25519（`crypto/ecdh`） |
-| AEAD | AES-256-GCM（12 字节 nonce，16 字节 tag） |
-| 哈希 / 握手摘要 | SHA-256 |
-| KDF | HKDF-SHA256（Extract + Expand，自实现） |
-| 混淆键流（Obfuscation） | AES-256-CTR |
+| `DH` | X25519（`crypto/ecdh`） |
+| `AEAD` | 默认 AES-256-GCM（12B nonce，16B tag）；可换 ChaCha20-Poly1305（路由器推荐） |
+| `HASH` | SHA-256 |
+| `HKDF` | RFC 5869 的 Extract/Expand（基于 HMAC-SHA256） |
+| `ProtocolName` | `"Prism/1 X25519 AESGCM SHA256"`，域分隔标签 |
+| `(S_pub,S_priv)` | 服务器长期 X25519 静态密钥对 |
+| `PSK` | 每客户端 32 字节预共享密钥（第二鉴权因子） |
+| `CID` | 4 字节客户端标识（加密后传输，仅用于记账/吊销） |
+| `(E_pub,E_priv)` | 客户端每连接一次性临时密钥 |
+| `(F_pub,F_priv)` | 服务器每连接一次性临时密钥 |
 
-套件标识字符串（协议域分隔符）：
-
-```
-Prism_IKpsk_25519_AESGCM_SHA256_v1
-```
-
-所有 KDF 的 info 都带独立常量标签，避免跨上下文密钥复用。
-
----
-
-## 2. 密钥与身份
-
-- **PSK（公司预共享密钥，32 字节）**：全公司一把，用于①混淆键流②绑定握手摘要。
-  缺少 PSK 的攻击者无法构造合法握手，也无法把流量去混淆。
-- **服务器静态密钥对 `(S_priv, S_pub)`**（X25519）：客户端内置 `S_pub`。
-- **客户端静态密钥对 `(C_priv, C_pub)`**（X25519）：即“用户身份”。服务器维护**允许的 `C_pub` 列表**，
-  按条目即可授权/吊销单个用户，无需改动 PSK。
-
-密钥编码：32 字节原始值的 **Base64URL(no padding)** 文本，便于配置文件书写。
+**AEAD nonce**：`4 字节 0 || 8 字节大端计数器`。每把密钥各自独立，计数器从 0 起每帧 +1，收发方向分别用不同密钥，故不会 nonce 复用。
 
 ---
 
-## 3. 符号与基础运算
+## 4. 密钥与身份管理
 
-- `X25519(priv, pub)` → 32 字节共享密钥（低阶点/全零结果由标准库判错）。
-- `HKDF(salt, ikm, info, L)` → L 字节。
-- `AEAD_Seal(key, nonce, plaintext, ad)` / `AEAD_Open(...)`：AES-256-GCM。
-- `nonce(counter)`：12 字节，前 4 字节 0，后 8 字节 counter 的大端表示。
-
-### 3.1 握手对称状态机（Symmetric State）
-
-借鉴 Noise 的 `MixKey/MixHash` 构造（标准、可证明安全的组合方式），字段：
-
-- `ck`（链接键，32B）、`h`（摘要，32B）、`k`（当前 AEAD 密钥，32B）、`n`（当前 nonce 计数）。
-
-初始化：`ck = h = SHA256("Prism_IKpsk_25519_AESGCM_SHA256_v1")`。
-
-```
-MixHash(data):      h = SHA256(h || data)
-MixKey(ikm):        tmp = HKDF(salt=ck, ikm=ikm, info="prism-mix", 64)
-                    ck = tmp[0:32]; k = tmp[32:64]; n = 0
-EncryptAndHash(pt): ct = AEAD_Seal(k, nonce(n), pt, ad=h); n++; MixHash(ct); -> ct
-DecryptAndHash(ct): pt = AEAD_Open(k, nonce(n), ct, ad=h); n++; MixHash(ct); -> pt
-Split():            tmp = HKDF(salt=ck, ikm="", info="prism-split", 64)
-                    return tmp[0:32], tmp[32:64]
-```
+- 服务器生成一次 `(S_pub,S_priv)`；`S_priv` 只存在于新加坡那台机器。`S_pub` 分发给所有客户端。
+- 每个办公室/设备配发一条 `Credential = {CID, PSK}`。服务器保存全部凭据集合，**逐条试认证**（见 §6），因此：
+  - 吊销某设备 = 从服务器凭据集合删除该条；
+  - 不同站点用不同 PSK，一处泄露不影响他处。
+- 用 `prism-server keygen <域名>` 一键生成服务器身份 + 一条客户端凭据，并打印可直接粘贴的 server.json / client.json。
 
 ---
 
-## 4. 握手（Prism Handshake, PHS）
+## 5. 载波层（Carrier）
 
-模式为 **IK + PSK**：发起方（客户端）预先知道响应方（服务器）静态公钥；
-双方都用各自静态密钥参与，实现**双向认证 + 发起方身份隐藏 + 前向保密 + 1-RTT**。
+握手与数据面本身与载波无关；载波只需提供一条可靠有序字节流，以及「升级为 Prism / 回落为掩护」的决策点。
 
-预置（两端一致）：
-```
-InitSymState()
-MixHash(PSK)          // 绑定公司密钥
-MixHash(S_pub)        // 预消息：已知响应方静态公钥
-```
-
-### 4.1 Message 1（Client → Server），token 序列 `e, es, s, ss`
-
-客户端计算：
-```
-生成临时密钥 (E_priv, E_pub)
-MixHash(E_pub)
-MixKey( X25519(E_priv, S_pub) )            // es
-encStatic  = EncryptAndHash(C_pub)          // s      (48B = 32 明文 + 16 tag)
-MixKey( X25519(C_priv, S_pub) )            // ss
-encPayload = EncryptAndHash(Payload1)       // 定长 32 明文 -> 48B
-body1 = E_pub(32) || encStatic(48) || encPayload(48)     // 共 128B
-```
-
-`Payload1`（32 字节明文）：
-```
-version(1=0x01) | timestamp(8, 大端 Unix 秒) | flags(1) | pad(22, 随机)
-```
-
-### 4.2 线路混淆与成帧
-
-body 不以明文/曲线点形态出现在线路上，而是用 **PSK 键流**整体 XOR：
-```
-salt_c = 随机 16B
-okey = HKDF(PSK, salt_c, "prism-obfs-key", 32)
-oiv  = HKDF(PSK, salt_c, "prism-obfs-iv",  16)
-wire1 = salt_c(16, 明文随机) || AES256-CTR(okey, oiv, body1)      // 共 144B，定长
-```
-`salt_c` 随机、CTR 输出随机，故 `wire1` 整体不可区分于随机。
-**特别地**：X25519 公钥本身并非均匀随机（可被指纹识别），经 CTR XOR 后在线路上变为均匀随机。
-
-### 4.3 Message 2（Server → Client），token 序列 `e, ee, se`
-
-服务器成功校验 Message 1 后：
-```
-生成临时密钥 (F_priv, F_pub)
-MixHash(F_pub)
-MixKey( X25519(F_priv, E_pub) )            // ee
-MixKey( X25519(F_priv, C_pub) )            // se
-encPayload2 = EncryptAndHash(Payload2)      // 定长 32 明文 -> 48B
-body2 = F_pub(32) || encPayload2(48)        // 共 80B
-
-salt_s = 随机 16B
-okey2 = HKDF(PSK, salt_s, "prism-obfs-key", 32)
-oiv2  = HKDF(PSK, salt_s, "prism-obfs-iv",  16)
-wire2 = salt_s(16) || AES256-CTR(okey2, oiv2, body2)             // 共 96B，定长
-```
-`Payload2`（32B）：`version(1) | flags(1) | pad(30, 随机)`。
-
-### 4.4 服务器校验与重放保护
-
-- `encStatic` / `encPayload` 任一 AEAD 校验失败 → 认证失败（§7）。
-- `C_pub` 不在允许列表 → 认证失败。
-- `|now - timestamp| > HandshakeWindow`（默认 ±90s）→ 拒绝。
-- `E_pub` 在时间窗内已出现过（LRU/布隆去重）→ 拒绝（防重放）。
-
-### 4.5 密钥导出（Split）
-
-握手完成后双方执行 `Split()`：
-```
-k_c2s, k_s2c = Split()
-```
-`k_c2s` 用于 Client→Server 方向，`k_s2c` 用于 Server→Client 方向。
-会话标识 `session_id = h`（最终握手摘要）。
-
-### 4.6 0-RTT（可选，默认关）
-
-`flags` bit0 置位时，Message 1 的 `encPayload` 后可追加一段 `EncryptAndHash(earlyData)`，
-并相应延长 `wire1`（此时放弃定长特性）。默认关闭以优先抗流量分析。
+- **v1 参考实现：`tcp-tls`** —— 服务器用**自有域名的真实证书**在 :443 跑 TLS 1.3。
+  - ALPN 只宣告 `http/1.1`（与回落的 HTTP/1.1 掩护服务器一致，避免「ALPN 说 h2 却没有 h2 流量」的破绽）。
+  - 生产应使用 uTLS 一类库把 ClientHello 指纹对齐到主流浏览器（参考实现用 Go `crypto/tls`，指纹可被识别，见 §8）。
+- **规划：`quic-h3`** —— 原生 HTTP/3 站点，鉴权令牌藏在请求里，数据面走 WebTransport/QUIC datagram；
+  QUIC 头大部分加密、天然多路复用，可彻底消除 TLS-in-TLS 突发，并在传输层带来按流独立的拥塞控制（mux 层已在 §7.4 消除队头阻塞）。
+- **规划：`cdn-ws`** —— 经 CDN 的 WebSocket，便于域前置式部署与抗 IP 封锁。
 
 ---
 
-## 5. 记录层（Record Layer）
+## 6. 握手协议
 
-握手后每方向用固定 `k`、独立递增 nonce 计数器加密记录。
-为**隐藏真实长度**，每条记录由两段 AEAD 组成：
+两条**定长**消息。两条都是「裸 X25519 点（对观察者=均匀随机）+ AEAD 块」，无任何明文结构。
+
+### 6.1 密钥调度
 
 ```
-rec = AEAD_Seal(k, nonce(ctr),   uint16_be(len), ad=nil)   // 长度段：2 明文 + 16 tag = 18B
-   || AEAD_Seal(k, nonce(ctr+1), payload,        ad=nil)   // 载荷段：len + 16 tag
-ctr += 2
-```
-读取方先读 18B 解出 `len`，再读 `len+16` 解出载荷。单条载荷 `len ∈ [1, 16384]`。
-观测者只见连续随机字节，无法从流中还原记录边界或真实长度。
+# 客户端算 es = DH(E_priv, S_pub)；服务端算 es = DH(S_priv, E_pub)
+es   = DH(ephemeral, static)
+ck0  = HKDF-Extract(salt = ProtocolName, ikm = es)
+ck1  = HKDF-Extract(salt = ck0,          ikm = PSK)          # 混入 PSK：无 PSK 不可解
+k_init = HKDF-Expand(ck1, "prism init v1", 32)
 
-nonce 计数器单向递增，远未触及 2^64 上限，无复用风险。
+# 服务器验证通过后，双方各出一个临时公钥，做 ee 以获得前向保密
+# 客户端算 ee = DH(E_priv, F_pub)；服务端算 ee = DH(F_priv, E_pub)
+ee   = DH(ephemeral_c, ephemeral_s)
+ck2  = HKDF-Extract(salt = ck1, ikm = ee)
+k_resp = HKDF-Expand(ck2, "prism resp v1", 32)
+k_c2s  = HKDF-Expand(ck2, "prism c2s v1", 32)               # 客户端→服务器 数据密钥
+k_s2c  = HKDF-Expand(ck2, "prism s2c v1", 32)               # 服务器→客户端 数据密钥
+```
+
+### 6.2 ClientInit（客户端 → 服务器，共 80 字节）
+
+```
+偏移  长度  内容
+0     32    E_pub                       # X25519 公钥，均匀随机
+32    48    AEAD_Seal(k_init, nonce=0,  # 对下面 32 字节明载荷加密 + 16B tag
+                       ad = SHA256(ProtocolName || E_pub),
+                       plaintext = payload)
+```
+
+payload（32 字节明文）：
+
+```
+偏移  长度  内容
+0     4     CID                         # 客户端标识
+4     8     timestamp (int64, 大端, Unix 秒)   # 新鲜度
+12    16    client_nonce (随机)
+28    1     flags                       # bit0=请求多路复用；低位=profile id
+29    3     reserved (置 0)
+```
+
+### 6.3 ServerResp（服务器 → 客户端，共 48 字节）
+
+```
+偏移  长度  内容
+0     32    F_pub                       # 服务器临时公钥
+32    16    AEAD_Seal(k_resp, nonce=0,  # 空明文，仅 tag：密钥确认
+                       ad = SHA256(ProtocolName || E_pub || ClientInit[32:80] || F_pub),
+                       plaintext = "")
+```
+
+客户端能成功 Open 这 16 字节 tag ⟺ 服务器确实持有 `S_priv` 且与客户端共享同一 `PSK`——即**服务器被认证**，可防 MITM。
+
+### 6.4 服务端处理与回落判定
+
+1. 读满 80 字节（带握手超时）。读不满 → 回落。
+2. 解析 `E_pub`、`ct`；算 `es = DH(S_priv, E_pub)`、`ck0`、`ad = SHA256(ProtocolName||E_pub)`。
+3. **逐条凭据试认证**：对每个 `PSK` 推 `ck1 / k_init`，尝试 `AEAD_Open(ct)`。失败则换下一条。
+   （N 很小：几个办公室/一支设备队列；每次仅一个 48 字节 GCM open。）
+4. 成功后校验：解出的 `CID` 与该凭据匹配；`timestamp` 在 `±window`（默认 120s）内；`E_pub` 未在重放窗口出现过。
+5. 任一步失败 → 返回 `ErrNotPrism` 和**已消费的字节**，调用方把这些字节 + 后续连接透明交给掩护 Web 服务器。
+6. 成功 → 生成 `F_pub`、算 `ee / ck2`，发 ServerResp，进入数据阶段。
+
+### 6.5 抗重放
+
+- 每连接一次性 `E_pub`，故重复的 `E_pub` 必是重放。
+- 服务器维护窗口内 `E_pub` 集合（`ReplayWindow`，惰性过期），命中即拒。配合 `timestamp` 新鲜度窗口双保险。
 
 ---
 
-## 6. 多路复用层（Mux）
+## 7. 数据阶段：分帧、多路复用、整形
 
-一条 Prism 记录连接承载多条逻辑流（多个目标），以摊薄握手成本并混合流量特征。
-Mux 帧封装在记录层载荷之内：
+握手完成后，在同一条载波（外层 TLS）上跑 Prism 自有数据面。
 
-```
-帧头: streamID(uint32_be) | cmd(uint8) | length(uint16_be) | payload[length]
-```
-
-| cmd | 名称 | 含义 |
-|---|---|---|
-| 0x01 | SYN | 新建流；payload = 目标地址（§6.1） |
-| 0x02 | PSH | 流数据 |
-| 0x03 | FIN | 半关闭（对端不再发数据） |
-| 0x04 | RST | 强制关闭 |
-| 0x05 | WND | 窗口更新；payload = uint32_be 增量信用 |
-| 0x06 | NOP | 保活/填充（payload 可为随机填充） |
-
-流 ID 分配：客户端发起用奇数，服务器发起（保留）用偶数，避免冲突。
-
-### 6.1 目标地址格式（SYN 载荷）
+### 7.1 线上帧格式
 
 ```
-atyp(1) | addr | port(uint16_be)
-atyp=0x01 IPv4(4B) | atyp=0x03 域名(len(1)+bytes) | atyp=0x04 IPv6(16B)
+[2B 大端 ctLen][ct ...]                 # ctLen 是唯一明文；等价于 TLS 记录长度字段
+ct = AEAD_Seal(k_dir, nonce=counter, plaintext=inner, ad=nil); counter 每帧 +1
 ```
 
-### 6.2 流量控制
+inner（解密后的内层帧）：
 
-每条流初始接收窗口 `InitialWindow`（默认 256KiB）。发送方累计发送字节数不得超过已获得的信用；
-接收方每消费数据即回发 `WND` 增量。信用防止单流耗尽缓冲、并提供背压。
+```
+偏移  长度  内容
+0     1     cmd        # 0x00 DATA / 0x01 PAD / 0x02 SYN / 0x03 FIN / 0x04 RST / 0x05 WND
+1     4     streamID
+5     2     dataLen
+7     dataLen   data
+7+dataLen ..  padding  # 其余为填充，加密内不可区分于载荷
+```
+
+- `SYN`：开流，`data` = 目标地址（SOCKS 风格 `atyp||addr||port`，**域名不本地解析**，由新加坡出口解析，避免本地 DNS 泄露目的）。
+- `DATA`：某流的数据。`FIN`：半关闭（本侧不再发）。`RST`：中止流。`PAD`：纯掩护填充，忽略。
+- `WND`：**流量控制信用**，`data` 为 4 字节大端信用值；接收方消费数据后回补发送方可发额度。
+
+### 7.2 多路复用
+
+- 多条逻辑流复用一条载波连接，像浏览器 keep-alive 的长连接，而非大量短连接（短连接本身是特征）。
+- 客户端用奇数 ID、服务端用偶数 ID，ID 空间不相交。
+- **逐流信用流量控制**：每条流初始接收窗口 512 KiB；接收方每消费约半个窗口即发 `WND` 帧回补发送方信用。单条流在途字节不超过一个窗口，既限制单流缓冲，又让载波读循环只做分发、从不因某条流阻塞——**从机制上消除 §7.4 的队头阻塞**。
+
+### 7.3 整形（profile）
+
+- 填充、分片大小、发送时序可按 profile 选择，使包长分布贴近某真实负载（网页浏览/视频流），对抗 **T4/T6**。
+- v1 默认 profile 为直通（不额外填充）；预留 profile 接口。
+
+### 7.4 队头阻塞的消除
+
+mux 层实现了**逐流信用流量控制**（§7.2）：载波读循环只把每一帧分发到对应流的接收队列、**自身从不阻塞**，
+单条慢流至多占用它自己一个窗口（512 KiB）的缓冲，不会拖住同一载波上的其他流。客户端仍维持一个小连接池
+（默认 4 条载波）以提升并行度与容灾；传输层级的按流拥塞控制可由 `quic-h3` 进一步提供。
 
 ---
 
-## 7. 抗主动探测（Anti-Probing）
+## 8. 各威胁如何被应对
 
-当 Message 1 校验失败（PSK 错误、AEAD 失败、身份不在列表、时间戳越界、重放）时，
-服务器**绝不**返回任何与正常握手可区分的字节或时序。两种可配策略：
-
-- **decoy（诱饵，推荐）**：把已读取的字节原样转发给预配置的真实后端（如本机一台 nginx/一个真实站点），
-  并双向拼接，探测者看到的是一个正常服务。
-- **reset（沉默重置）**：读尽并静默关闭，表现与通用关闭服务无异。
-
-因为整条首包（含曲线点）均为随机外观，缺少 PSK 的探测者既无法构造合法首包，也无法凭响应区分 Prism。
-
----
-
-## 8. 流量整形（Traffic Shaping，可选）
-
-- **长度分桶填充**：记录载荷填充到桶边界（如 256/576/1280/1500/4096/16384），削弱基于长度的分析。
-- **掩护流量**：空闲时按配置周期发送 `NOP` 记录，打断时序相关性。
-默认关闭以优先吞吐；高敏感链路可开启。
-
----
-
-## 9. 传输层（Transport）
-
-v1 为 **TCP**。传输层被抽象为可插拔接口，后续可加 QUIC/UDP、WebSocket/HTTP(S) 外壳（过 CDN）等，
-均不改变 §4–§8 的协议语义。
-
----
-
-## 10. 常量汇总（默认值）
-
-| 名称 | 值 |
+| 威胁 | 机制 |
 |---|---|
-| 套件标识 | `Prism_IKpsk_25519_AESGCM_SHA256_v1` |
-| Message 1 定长 | 144 B |
-| Message 2 定长 | 96 B |
-| HandshakeWindow | ±90 s |
-| 记录最大载荷 | 16384 B |
-| Mux 初始窗口 | 262144 B |
-| 密钥/盐长度 | 32 / 16 B |
+| T1 被动 DPI | 外层是对自有域名的真实 TLS 1.3；Prism 首包无明文结构 |
+| T2 主动探测 | 无有效凭据 → 同机真实 Web 回落，探测者只见一个正常网站 |
+| T3 SNI/证书 | 用**自有域名 + 真实证书**，SNI 就是你自己的正常域名；可叠加 ECH |
+| T4 TLS-in-TLS | 数据面不套内层 TLS，用自有 AEAD 分帧 + 整形，无内层握手突发 |
+| T5 熵分析 | 高熵字节只出现在载波本就期望高熵处（TLS 记录体）；无裸随机段 |
+| T6 流量分析 | profile 整形 + 多路复用长连接，贴近真实应用的长度/时序分布 |
+| T7 重放 | 一次性 `E_pub` + 新鲜度窗口 + 重放集合 |
 
 ---
 
-## 11. 版本协商
+## 9. 安全局限与诚实告警（务必读）
 
-版本写在 `Payload1/Payload2` 的 `version` 字段。v1 固定 `0x01`。
-不兼容变更递增版本号；服务器可拒绝不支持的版本（走 §7 失败路径以不泄露信息）。
+1. **握手是自研、未经审计的构造**。它刻意对齐 Noise_IKpsk2 的形态，便于生产替换为经过验证的 Noise 库
+   （如 flynn/noise）。**面对高风险对手上线前，请做独立密码学评审**，或直接换成成熟 Noise 实现。
+2. **TLS 指纹**：参考实现用 Go `crypto/tls`，其 ClientHello 指纹可被识别。生产应接 uTLS 对齐主流浏览器指纹。
+3. **自有域名会被枚举/封锁**：一旦域名/IP 被发现即可被墙。运维上要做到域名不复用、不公开关联，必要时上 CDN/域前置。
+4. **v1 数据面 TCP-only**：目的地的 QUIC(UDP) 不被隧道。需在 Nikki 侧掐 UDP/443 强制回落 TCP（见 `config/nikki-mihomo.example.yaml`）。
+5. **队头阻塞**：mux 层已用逐流信用流控消除（§7.2/§7.4）；连接池用于并行度与容灾，`quic-h3` 可在传输层再加按流拥塞控制。
+6. **这是一个坚实的工程基座，不是经过实网对抗检验的成品**。抗审查协议必须在真实网络里对抗、迭代。
+7. **默认 AEAD 是 AES-256-GCM**（零依赖、可离线构建）。无 AES 硬件加速的路由器（MIPS/部分 ARM）应换
+   ChaCha20-Poly1305（`pkg/prism/aead.go` 的 `NewAEAD` 换成 x/crypto 的构造即可，线格式不变）。
+8. **合规**：统一出口是正当的企业网络需求，但请确认符合你各运营地的法律法规与公司合规要求。
+
+---
+
+## 10. 路线图
+
+- [ ] `quic-h3` 载波（原生 HTTP/3 伪装 + 按流拥塞控制）
+- [ ] uTLS 指纹对齐 / ECH
+- [ ] profile 整形库（网页/视频/下载画像）
+- [ ] 握手替换为经审计的 Noise_IKpsk2 实现
+- [ ] UDP relay（SOCKS UDP ASSOCIATE / QUIC 直穿）
+- [ ] 订阅分发与密钥轮换、per-CID 配额与审计
+- [ ] 桌面原生 TUN 全局模式

@@ -1,54 +1,54 @@
 package prism
 
 import (
-	"encoding/binary"
+	"hash/maphash"
 	"sync"
 	"time"
 )
 
-// ReplayCache 在时间窗内记录已见过的客户端临时公钥，拒绝重放。
-// 轻量实现：map[string]deadline + 惰性清理；窗口应 >= 2*handshakeWindow。
-type ReplayCache struct {
-	mu     sync.Mutex
-	seen   map[string]int64 // key -> 过期 Unix 秒
-	window int64
-	last   int64 // 上次清理时间
+// ReplayWindow rejects a client ephemeral public key that has already been seen
+// inside the freshness window. Because every handshake uses a fresh ephemeral,
+// a duplicate is necessarily a replayed ClientInit. Memory is bounded by the
+// number of handshakes per window; entries expire lazily.
+type ReplayWindow struct {
+	ttl  time.Duration
+	mu   sync.Mutex
+	seed maphash.Seed
+	seen map[uint64]int64 // hash(E_pub) -> expiry unix-nano
+	next int64            // next lazy-sweep time (unix-nano)
 }
 
-// NewReplayCache window 为保留秒数（默认取 2*handshakeWindow=180s 较安全）。
-func NewReplayCache(window int64) *ReplayCache {
-	if window <= 0 {
-		window = 2 * handshakeWindow
+// NewReplayWindow builds a replay guard that remembers ephemerals for ttl.
+func NewReplayWindow(ttl time.Duration) *ReplayWindow {
+	return &ReplayWindow{
+		ttl:  ttl,
+		seed: maphash.MakeSeed(),
+		seen: make(map[uint64]int64),
 	}
-	return &ReplayCache{seen: make(map[string]int64), window: window}
 }
 
-// Add 登记一个临时公钥；若此前已见（重放）返回 false。
-func (r *ReplayCache) Add(ephPub []byte) bool {
-	now := time.Now().Unix()
-	key := string(ephPub)
+// Accept records ePub and returns true if it is new, false if it is a replay.
+func (r *ReplayWindow) Accept(ePub []byte) bool {
+	var h maphash.Hash
+	h.SetSeed(r.seed)
+	h.Write(ePub)
+	key := h.Sum64()
 
+	now := time.Now().UnixNano()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if now-r.last > r.window {
-		r.prune(now)
-		r.last = now
+	if now >= r.next {
+		for k, exp := range r.seen {
+			if exp <= now {
+				delete(r.seen, k)
+			}
+		}
+		r.next = now + r.ttl.Nanoseconds()
 	}
 	if exp, ok := r.seen[key]; ok && exp > now {
 		return false
 	}
-	r.seen[key] = now + r.window
+	r.seen[key] = now + r.ttl.Nanoseconds()
 	return true
 }
-
-func (r *ReplayCache) prune(now int64) {
-	for k, exp := range r.seen {
-		if exp <= now {
-			delete(r.seen, k)
-		}
-	}
-}
-
-// 占位：确保 binary 被引用（后续可能用于更紧凑的 key 编码）
-var _ = binary.BigEndian

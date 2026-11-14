@@ -2,317 +2,243 @@ package prism
 
 import (
 	"crypto/ecdh"
-	"crypto/sha256"
+	"crypto/rand"
+	"crypto/subtle"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"time"
 )
 
-// 握手 wire 常量（见 docs/PROTOCOL.md §4、§10）
+// Wire sizes of the two fixed-length handshake messages. Both are a bare
+// X25519 point (uniform random to an observer) followed by an AEAD blob, so
+// neither contains any plaintext structure a DPI box can match on.
 const (
-	msg1Len          = SaltSize + 32 + 48 + 48 // 144：salt + E_pub + encStatic + encPayload
-	msg2Len          = SaltSize + 32 + 48       // 96 ：salt + F_pub + encPayload2
-	payload1PlainLen = 32
-	payload2PlainLen = 32
-	versionV1        = 0x01
-	handshakeWindow  = 90 // 秒；|now-ts| 超过即拒
+	payloadSize    = 32                              // CID4 + ts8 + nonce16 + flags1 + rsvd3
+	clientInitSize = keySize + payloadSize + tagSize // 32 + 32 + 16 = 80
+	serverRespSize = keySize + tagSize               // 32 + 16 = 48
 )
 
+// KDF labels (domain separation inside one handshake).
 var (
-	errAuth        = errors.New("prism: handshake authentication failed")
-	errVersion     = errors.New("prism: unsupported protocol version")
-	errHandshakeIO = errors.New("prism: handshake short read")
+	labelInit = []byte("prism init v1")
+	labelResp = []byte("prism resp v1")
+	labelC2S  = []byte("prism c2s v1")
+	labelS2C  = []byte("prism s2c v1")
 )
 
-// HandshakeResult 握手产物。
-type HandshakeResult struct {
-	TxKey      []byte // 本端发送方向密钥
-	RxKey      []byte // 本端接收方向密钥
-	SessionID  []byte // 最终握手摘要 h
-	PeerStatic []byte // 对端静态公钥（服务器侧 = 客户端身份）
+// ErrNotPrism is returned by ServerHandshake when the peer is not an
+// authenticated Prism client. The caller MUST then fall back to serving cover
+// traffic using the returned Consumed bytes followed by the live connection —
+// this is what makes the server survive active probing.
+var ErrNotPrism = errors.New("prism: not an authenticated client (fall back to cover)")
+
+// Flags carried in ClientInit (bit 0 reserved = mux requested). The profile id
+// occupies the low nibble so a client can request a shaping profile.
+const flagMux = 0x01
+
+// Keys is the output of a completed handshake: direction-separated traffic
+// keys. Send/Recv are relative to the local role.
+type Keys struct {
+	Send []byte // key for frames we send
+	Recv []byte // key for frames we receive
 }
 
-// --- 握手对称状态机（MixKey/MixHash 构造，见 §3.1）---
-
-type symState struct {
-	ck []byte
-	h  []byte
-	k  []byte
-	n  uint64
+// clientInitPayload is the 32-byte plaintext sealed inside ClientInit.
+type clientInitPayload struct {
+	ID    ClientID
+	Time  int64
+	Nonce [16]byte
+	Flags byte
 }
 
-func newSymState() *symState {
-	sum := sha256.Sum256([]byte(ProtocolName))
-	return &symState{
-		ck: append([]byte(nil), sum[:]...),
-		h:  append([]byte(nil), sum[:]...),
+func (p *clientInitPayload) marshal() []byte {
+	b := make([]byte, payloadSize)
+	copy(b[0:4], p.ID[:])
+	binary.BigEndian.PutUint64(b[4:12], uint64(p.Time))
+	copy(b[12:28], p.Nonce[:])
+	b[28] = p.Flags
+	// b[29:32] reserved zero
+	return b
+}
+
+func unmarshalPayload(b []byte) clientInitPayload {
+	var p clientInitPayload
+	copy(p.ID[:], b[0:4])
+	p.Time = int64(binary.BigEndian.Uint64(b[4:12]))
+	copy(p.Nonce[:], b[12:28])
+	p.Flags = b[28]
+	return p
+}
+
+// ClientHandshake runs the initiator side over rw (an already-established
+// carrier byte stream, e.g. a TLS conn). It proves possession of the PSK and
+// authenticates the server, and returns per-direction traffic keys.
+func ClientHandshake(rw io.ReadWriter, serverPub *ecdh.PublicKey, cred Credential, aeadFor func([]byte) (AEAD, error)) (*Keys, error) {
+	if len(cred.PSK) != keySize {
+		return nil, errors.New("prism: PSK must be 32 bytes")
 	}
-}
-
-func (s *symState) mixHash(data []byte) {
-	hh := sha256.New()
-	hh.Write(s.h)
-	hh.Write(data)
-	s.h = hh.Sum(nil)
-}
-
-func (s *symState) mixKey(ikm []byte) {
-	out := hkdf(s.ck, ikm, []byte("prism-mix"), 64)
-	s.ck = out[:32]
-	s.k = out[32:64]
-	s.n = 0
-}
-
-func (s *symState) encryptAndHash(pt []byte) ([]byte, error) {
-	aead, err := newAEAD(s.k)
-	if err != nil {
-		return nil, err
-	}
-	ct := aead.Seal(nil, nonceFromCounter(s.n), pt, s.h)
-	s.n++
-	s.mixHash(ct)
-	return ct, nil
-}
-
-func (s *symState) decryptAndHash(ct []byte) ([]byte, error) {
-	aead, err := newAEAD(s.k)
-	if err != nil {
-		return nil, err
-	}
-	pt, err := aead.Open(nil, nonceFromCounter(s.n), ct, s.h)
-	if err != nil {
-		return nil, err
-	}
-	s.n++
-	s.mixHash(ct)
-	return pt, nil
-}
-
-func (s *symState) split() (k1, k2 []byte) {
-	out := hkdf(s.ck, nil, []byte("prism-split"), 64)
-	return out[:32], out[32:64]
-}
-
-func absInt64(x int64) int64 {
-	if x < 0 {
-		return -x
-	}
-	return x
-}
-
-// ClientHandshake 以发起方身份完成 PHS。
-func ClientHandshake(rw io.ReadWriter, psk []byte, serverPub *ecdh.PublicKey, clientPriv *ecdh.PrivateKey) (*HandshakeResult, error) {
-	ss := newSymState()
-	ss.mixHash(psk)
-	ss.mixHash(serverPub.Bytes())
-
-	// -> e
-	eph, err := GenerateKeyPair()
+	// 1. fresh ephemeral
+	eph, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, err
 	}
 	ePub := eph.PublicKey().Bytes()
-	ss.mixHash(ePub)
-	// es
-	es, err := dh(eph, serverPub)
+
+	// 2. es = DH(e, S), key schedule up to k_init
+	es, err := eph.ECDH(serverPub)
 	if err != nil {
 		return nil, err
 	}
-	ss.mixKey(es)
-	// s
-	encStatic, err := ss.encryptAndHash(clientPriv.PublicKey().Bytes())
-	if err != nil {
-		return nil, err
-	}
-	// ss
-	sss, err := dh(clientPriv, serverPub)
-	if err != nil {
-		return nil, err
-	}
-	ss.mixKey(sss)
-	// payload1
-	p1 := make([]byte, payload1PlainLen)
-	p1[0] = versionV1
-	binary.BigEndian.PutUint64(p1[1:9], uint64(time.Now().Unix()))
-	p1[9] = 0 // flags：0-RTT 关
-	copy(p1[10:], randBytes(payload1PlainLen-10))
-	encPayload, err := ss.encryptAndHash(p1)
+	ck0 := hkdfExtract([]byte(ProtocolName), es)
+	ck1 := hkdfExtract(ck0, cred.PSK)
+	kInit := hkdfExpand(ck1, labelInit, keySize)
+
+	initAEAD, err := aeadFor(kInit)
 	if err != nil {
 		return nil, err
 	}
 
-	body := make([]byte, 0, 128)
-	body = append(body, ePub...)
-	body = append(body, encStatic...)
-	body = append(body, encPayload...)
+	// 3. seal payload, AD binds the ephemeral
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return nil, err
+	}
+	pl := clientInitPayload{ID: cred.ID, Time: time.Now().Unix(), Nonce: nonce, Flags: flagMux}
+	hCI := mixHash([]byte(ProtocolName), ePub)
+	ct := initAEAD.Seal(0, pl.marshal(), hCI)
 
-	salt := randBytes(SaltSize)
-	if err := obfuscate(psk, salt, body); err != nil {
+	msg := make([]byte, 0, clientInitSize)
+	msg = append(msg, ePub...)
+	msg = append(msg, ct...)
+	if _, err := rw.Write(msg); err != nil {
 		return nil, err
-	}
-	msg1 := make([]byte, 0, msg1Len)
-	msg1 = append(msg1, salt...)
-	msg1 = append(msg1, body...)
-	if _, err := rw.Write(msg1); err != nil {
-		return nil, err
-	}
-
-	// <- message 2
-	msg2 := make([]byte, msg2Len)
-	if _, err := io.ReadFull(rw, msg2); err != nil {
-		return nil, err
-	}
-	salt2 := msg2[:SaltSize]
-	body2 := msg2[SaltSize:]
-	if err := obfuscate(psk, salt2, body2); err != nil {
-		return nil, err
-	}
-	fPub := body2[:32]
-	encP2 := body2[32:80]
-	fPubKey, err := ParsePublicKey(fPub)
-	if err != nil {
-		return nil, err
-	}
-	ss.mixHash(fPub)
-	// ee
-	ee, err := dh(eph, fPubKey)
-	if err != nil {
-		return nil, err
-	}
-	ss.mixKey(ee)
-	// se = DH(client static, server ephemeral)
-	se, err := dh(clientPriv, fPubKey)
-	if err != nil {
-		return nil, err
-	}
-	ss.mixKey(se)
-	p2, err := ss.decryptAndHash(encP2)
-	if err != nil {
-		return nil, err
-	}
-	if p2[0] != versionV1 {
-		return nil, errVersion
 	}
 
-	k1, k2 := ss.split()
-	return &HandshakeResult{
-		TxKey:      k1, // client -> server
-		RxKey:      k2, // server -> client
-		SessionID:  ss.h,
-		PeerStatic: serverPub.Bytes(),
+	// 4. read ServerResp = F_pub || confirm-tag
+	resp := make([]byte, serverRespSize)
+	if _, err := io.ReadFull(rw, resp); err != nil {
+		return nil, fmt.Errorf("prism: reading server response: %w", err)
+	}
+	fPub, err := ecdh.X25519().NewPublicKey(resp[:keySize])
+	if err != nil {
+		return nil, err
+	}
+	ee, err := eph.ECDH(fPub)
+	if err != nil {
+		return nil, err
+	}
+	ck2 := hkdfExtract(ck1, ee)
+	kResp := hkdfExpand(ck2, labelResp, keySize)
+	respAEAD, err := aeadFor(kResp)
+	if err != nil {
+		return nil, err
+	}
+	hSR := mixHash([]byte(ProtocolName), ePub, ct, resp[:keySize])
+	if _, err := respAEAD.Open(0, resp[keySize:], hSR); err != nil {
+		// Server failed to prove it holds S_priv + PSK: possible MITM / wrong
+		// server. Abort rather than leak data.
+		return nil, errors.New("prism: server authentication failed")
+	}
+
+	return &Keys{
+		Send: hkdfExpand(ck2, labelC2S, keySize),
+		Recv: hkdfExpand(ck2, labelS2C, keySize),
 	}, nil
 }
 
-// ServerHandshake 以响应方身份完成 PHS。
-// 返回的 raw 为已从对端读取的原始字节，供认证失败时的诱饵(decoy)拼接使用。
-func ServerHandshake(rw io.ReadWriter, psk []byte, serverPriv *ecdh.PrivateKey, allowed func([]byte) bool, replay *ReplayCache) (res *HandshakeResult, raw []byte, err error) {
-	buf := make([]byte, msg1Len)
-	n, rerr := io.ReadFull(rw, buf)
-	raw = buf[:n]
-	if rerr != nil {
-		return nil, raw, errHandshakeIO
+// ServerHandshake runs the responder side. It reads a fixed ClientInit, trial-
+// authenticates against every provisioned credential, enforces the freshness
+// window and anti-replay, and on success writes ServerResp and returns traffic
+// keys plus the matched credential. On ANY failure it returns ErrNotPrism and
+// the bytes it consumed, so the caller can transparently serve cover traffic.
+func ServerHandshake(rw io.ReadWriter, serverPriv *ecdh.PrivateKey, creds []Credential, replay *ReplayWindow, window time.Duration, aeadFor func([]byte) (AEAD, error)) (*Keys, *Credential, []byte, error) {
+	init := make([]byte, clientInitSize)
+	n, err := io.ReadFull(rw, init)
+	if err != nil {
+		// Too few bytes to even be a ClientInit — hand what we have to cover.
+		return nil, nil, init[:n], ErrNotPrism
 	}
 
-	// 复制一份用于去混淆，保留 raw 原样供诱饵回放
-	work := append([]byte(nil), buf...)
-	salt := work[:SaltSize]
-	body := work[SaltSize:]
-	if err := obfuscate(psk, salt, body); err != nil {
-		return nil, raw, err
+	ePubBytes := init[:keySize]
+	ct := init[keySize:]
+	ePub, err := ecdh.X25519().NewPublicKey(ePubBytes)
+	if err != nil {
+		return nil, nil, init, ErrNotPrism
 	}
-	ePub := body[:32]
-	encStatic := body[32:80]
-	encPayload := body[80:128]
+	es, err := serverPriv.ECDH(ePub)
+	if err != nil {
+		return nil, nil, init, ErrNotPrism
+	}
+	ck0 := hkdfExtract([]byte(ProtocolName), es)
+	hCI := mixHash([]byte(ProtocolName), ePubBytes)
 
-	ss := newSymState()
-	ss.mixHash(psk)
-	ss.mixHash(serverPriv.PublicKey().Bytes())
+	// Trial-decrypt against each credential's PSK. N is tiny (a few offices /
+	// a device fleet); each trial is one GCM open over 48 bytes.
+	for i := range creds {
+		cred := creds[i]
+		if len(cred.PSK) != keySize {
+			continue
+		}
+		ck1 := hkdfExtract(ck0, cred.PSK)
+		kInit := hkdfExpand(ck1, labelInit, keySize)
+		initAEAD, err := aeadFor(kInit)
+		if err != nil {
+			continue
+		}
+		pt, err := initAEAD.Open(0, ct, hCI)
+		if err != nil {
+			continue // not this PSK
+		}
+		pl := unmarshalPayload(pt)
+		// Bind the decrypted CID to the credential we matched (defence in depth).
+		if subtle.ConstantTimeCompare(pl.ID[:], cred.ID[:]) != 1 {
+			return nil, nil, init, ErrNotPrism
+		}
+		// Freshness window.
+		skew := time.Since(time.Unix(pl.Time, 0))
+		if skew < -window || skew > window {
+			return nil, nil, init, ErrNotPrism
+		}
+		// Anti-replay: a fresh ephemeral per connection means a repeated E_pub
+		// is a replay.
+		if replay != nil && !replay.Accept(ePubBytes) {
+			return nil, nil, init, ErrNotPrism
+		}
 
-	ePubKey, err := ParsePublicKey(ePub)
-	if err != nil {
-		return nil, raw, errAuth
-	}
-	ss.mixHash(ePub)
-	es, err := dh(serverPriv, ePubKey)
-	if err != nil {
-		return nil, raw, errAuth
-	}
-	ss.mixKey(es)
-	cPubBytes, err := ss.decryptAndHash(encStatic)
-	if err != nil {
-		return nil, raw, errAuth
-	}
-	cPubKey, err := ParsePublicKey(cPubBytes)
-	if err != nil {
-		return nil, raw, errAuth
-	}
-	sss, err := dh(serverPriv, cPubKey)
-	if err != nil {
-		return nil, raw, errAuth
-	}
-	ss.mixKey(sss)
-	p1, err := ss.decryptAndHash(encPayload)
-	if err != nil {
-		return nil, raw, errAuth
-	}
-	if p1[0] != versionV1 {
-		return nil, raw, errAuth
-	}
-	ts := int64(binary.BigEndian.Uint64(p1[1:9]))
-	if absInt64(time.Now().Unix()-ts) > handshakeWindow {
-		return nil, raw, errAuth
-	}
-	if allowed != nil && !allowed(cPubBytes) {
-		return nil, raw, errAuth
-	}
-	if replay != nil && !replay.Add(ePub) {
-		return nil, raw, errAuth
-	}
+		// Authenticated. Respond for forward secrecy + key confirmation.
+		fEph, err := ecdh.X25519().GenerateKey(rand.Reader)
+		if err != nil {
+			return nil, nil, init, err
+		}
+		fPub := fEph.PublicKey().Bytes()
+		ee, err := fEph.ECDH(ePub)
+		if err != nil {
+			return nil, nil, init, err
+		}
+		ck2 := hkdfExtract(ck1, ee)
+		kResp := hkdfExpand(ck2, labelResp, keySize)
+		respAEAD, err := aeadFor(kResp)
+		if err != nil {
+			return nil, nil, init, err
+		}
+		hSR := mixHash([]byte(ProtocolName), ePubBytes, ct, fPub)
+		confirm := respAEAD.Seal(0, nil, hSR)
 
-	// -> message 2
-	feph, err := GenerateKeyPair()
-	if err != nil {
-		return nil, raw, err
-	}
-	fPub := feph.PublicKey().Bytes()
-	ss.mixHash(fPub)
-	ee, err := dh(feph, ePubKey)
-	if err != nil {
-		return nil, raw, err
-	}
-	ss.mixKey(ee)
-	se, err := dh(feph, cPubKey)
-	if err != nil {
-		return nil, raw, err
-	}
-	ss.mixKey(se)
-	p2 := make([]byte, payload2PlainLen)
-	p2[0] = versionV1
-	copy(p2[2:], randBytes(payload2PlainLen-2))
-	encP2, err := ss.encryptAndHash(p2)
-	if err != nil {
-		return nil, raw, err
-	}
-	body2 := make([]byte, 0, 80)
-	body2 = append(body2, fPub...)
-	body2 = append(body2, encP2...)
-	salt2 := randBytes(SaltSize)
-	if err := obfuscate(psk, salt2, body2); err != nil {
-		return nil, raw, err
-	}
-	msg2 := make([]byte, 0, msg2Len)
-	msg2 = append(msg2, salt2...)
-	msg2 = append(msg2, body2...)
-	if _, err := rw.Write(msg2); err != nil {
-		return nil, raw, err
+		resp := make([]byte, 0, serverRespSize)
+		resp = append(resp, fPub...)
+		resp = append(resp, confirm...)
+		if _, err := rw.Write(resp); err != nil {
+			return nil, nil, init, err
+		}
+
+		return &Keys{
+			Send: hkdfExpand(ck2, labelS2C, keySize),
+			Recv: hkdfExpand(ck2, labelC2S, keySize),
+		}, &cred, nil, nil
 	}
 
-	k1, k2 := ss.split()
-	return &HandshakeResult{
-		TxKey:      k2, // server -> client
-		RxKey:      k1, // client -> server
-		SessionID:  ss.h,
-		PeerStatic: cPubBytes,
-	}, raw, nil
+	// No credential authenticated: a prober, a scanner, or a real browser.
+	return nil, nil, init, ErrNotPrism
 }

@@ -1,0 +1,24 @@
+{
+  "_comment": "新加坡出口服务器配置。用 `prism-server keygen 你的域名` 生成密钥后替换下面的值。",
+
+  "listen": ":443",
+
+  "_tls": "生产务必用你自己域名的真实证书（certbot/Let's Encrypt）。self_signed 仅供本地测试，过不了仔细探测。",
+  "cert_file": "/etc/prism/fullchain.pem",
+  "key_file": "/etc/prism/privkey.pem",
+  "self_signed": "",
+
+  "private_key": "服务器X25519私钥(base64)-只放在新加坡这台机器上-绝不外泄",
+
+  "_credentials": "每个办公室/设备配发一条；吊销就删掉对应条目。",
+  "credentials": [
+    { "name": "office-local", "id": "客户端ID(base64,4字节)", "psk": "预共享密钥(base64,32字节)" },
+    { "name": "staff-laptop-01", "id": "另一个ID", "psk": "另一个PSK" }
+  ],
+
+  "window_seconds": 120,
+
+  "_cover": "未通过鉴权的访问者（含主动探测）看到的内容。三选一，优先级 Backend > StaticDir > 内置占位页。强烈建议反代到一个真实网站。",
+  "cover_backend": "http://127.0.0.1:8080",
+  "cover_static_dir": ""
+}

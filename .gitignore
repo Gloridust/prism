@@ -1,7 +1,8 @@
-/bin/
+/dist/
+/prism-server
+/prism-client
 *.exe
-*.out
-prism-server
-prism-client
-prism-keygen
-*.local.json
+*.pem
+server.json
+client.json
+dist/

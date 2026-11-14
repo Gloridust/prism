@@ -5,134 +5,187 @@ import (
 	"crypto/rand"
 	"io"
 	"net"
-	"sync"
 	"testing"
+	"time"
 )
 
-func mustKey(t *testing.T) ([]byte, []byte) {
+func testCred(t *testing.T) Credential {
 	t.Helper()
-	k, err := GenerateKeyPair()
+	psk, err := NewPSK()
 	if err != nil {
 		t.Fatal(err)
 	}
-	return k.Bytes(), k.PublicKey().Bytes()
+	return Credential{ID: ClientID{0xDE, 0xAD, 0xBE, 0xEF}, PSK: psk}
 }
 
-func TestHandshakeAndRecordRoundTrip(t *testing.T) {
-	psk := make([]byte, 32)
-	rand.Read(psk)
-	sPriv, sPub := mustKey(t)
-	cPriv, cPub := mustKey(t)
+func TestAEADRoundTrip(t *testing.T) {
+	key := make([]byte, keySize)
+	rand.Read(key)
+	a, err := NewAEAD(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := []byte("the quick brown fox")
+	ct := a.Seal(7, msg, []byte("ad"))
+	pt, err := a.Open(7, ct, []byte("ad"))
+	if err != nil || !bytes.Equal(pt, msg) {
+		t.Fatalf("roundtrip failed: %v", err)
+	}
+	if _, err := a.Open(8, ct, []byte("ad")); err == nil {
+		t.Fatal("wrong counter must fail")
+	}
+	if _, err := a.Open(7, ct, []byte("bad")); err == nil {
+		t.Fatal("wrong ad must fail")
+	}
+	ct[0] ^= 1
+	if _, err := a.Open(7, ct, []byte("ad")); err == nil {
+		t.Fatal("tamper must fail")
+	}
+}
 
-	serverPriv, _ := ParsePrivateKey(sPriv)
-	serverPub, _ := ParsePublicKey(sPub)
-	clientPriv, _ := ParsePrivateKey(cPriv)
+func TestReplayWindow(t *testing.T) {
+	r := NewReplayWindow(time.Minute)
+	e := make([]byte, 32)
+	rand.Read(e)
+	if !r.Accept(e) {
+		t.Fatal("first use must be accepted")
+	}
+	if r.Accept(e) {
+		t.Fatal("replay must be rejected")
+	}
+	e2 := make([]byte, 32)
+	rand.Read(e2)
+	if !r.Accept(e2) {
+		t.Fatal("distinct ephemeral must be accepted")
+	}
+}
 
-	c1, c2 := net.Pipe()
-	replay := NewReplayCache(0)
+func runHandshake(t *testing.T) (cli, srv *Keys, cliConn, srvConn net.Conn, kp *ServerKeypair, cred Credential) {
+	t.Helper()
+	kp, err := GenerateServerKeypair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred = testCred(t)
+	cliConn, srvConn = net.Pipe()
+	replay := NewReplayWindow(2 * time.Minute)
 
-	var wg sync.WaitGroup
-	wg.Add(1)
-	var serverErr error
-	var srvConn *Conn
-
+	type res struct {
+		k   *Keys
+		err error
+	}
+	ch := make(chan res, 1)
 	go func() {
-		defer wg.Done()
-		allowed := func(pub []byte) bool { return bytes.Equal(pub, cPub) }
-		res, _, err := ServerHandshake(c2, psk, serverPriv, allowed, replay)
-		if err != nil {
-			serverErr = err
-			return
-		}
-		srvConn, serverErr = NewConn(c2, res)
+		k, _, _, err := ServerHandshake(srvConn, kp.Private, []Credential{cred}, replay, 2*time.Minute, NewAEAD)
+		ch <- res{k, err}
 	}()
-
-	res, err := ClientHandshake(c1, psk, serverPub, clientPriv)
+	cli, err = ClientHandshake(cliConn, kp.Public, cred, NewAEAD)
 	if err != nil {
 		t.Fatalf("client handshake: %v", err)
 	}
-	wg.Wait()
-	if serverErr != nil {
-		t.Fatalf("server handshake: %v", serverErr)
+	r := <-ch
+	if r.err != nil {
+		t.Fatalf("server handshake: %v", r.err)
 	}
+	srv = r.k
+	return
+}
 
-	// 身份校验：服务器应看到客户端静态公钥
-	if !bytes.Equal(srvConn.PeerStatic, cPub) {
-		t.Fatalf("server saw wrong client identity")
+func TestHandshakeKeyAgreement(t *testing.T) {
+	cli, srv, cliConn, srvConn, _, _ := runHandshake(t)
+	defer cliConn.Close()
+	defer srvConn.Close()
+	if !bytes.Equal(cli.Send, srv.Recv) || !bytes.Equal(cli.Recv, srv.Send) {
+		t.Fatal("handshake did not agree on direction keys")
 	}
-	// 会话 ID 两端一致
-	if !bytes.Equal(res.SessionID, srvConn.SessionID) {
-		t.Fatalf("session id mismatch")
+	if bytes.Equal(cli.Send, cli.Recv) {
+		t.Fatal("directions must use distinct keys")
 	}
+}
 
-	cliConn, err := NewConn(c1, res)
+func TestServerFallbackOnGarbage(t *testing.T) {
+	kp, _ := GenerateServerKeypair()
+	cred := testCred(t)
+	cliConn, srvConn := net.Pipe()
+	defer cliConn.Close()
+	defer srvConn.Close()
+
+	blob := make([]byte, 100)
+	rand.Read(blob)
+	go func() { cliConn.Write(blob) }()
+
+	k, _, consumed, err := ServerHandshake(srvConn, kp.Private,
+		[]Credential{cred}, NewReplayWindow(time.Minute), time.Minute, NewAEAD)
+	if err != ErrNotPrism || k != nil {
+		t.Fatalf("expected fallback, got k=%v err=%v", k, err)
+	}
+	if !bytes.Equal(consumed, blob[:clientInitSize]) {
+		t.Fatal("fallback must return consumed bytes for cover replay")
+	}
+}
+
+func TestSessionEcho(t *testing.T) {
+	cli, srv, cliConn, srvConn, _, _ := runHandshake(t)
+	defer cliConn.Close()
+	defer srvConn.Close()
+
+	cs, err := NewSession(cliConn, cli, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ss, err := NewSession(srvConn, srv, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// 双向数据：客户端 -> 服务器
-	payload := make([]byte, 100000)
-	rand.Read(payload)
+	// Server: accept streams and echo.
 	go func() {
-		cliConn.Write(payload)
-		cliConn.Write([]byte("PING"))
+		for {
+			st, err := ss.Accept()
+			if err != nil {
+				return
+			}
+			go func(st *Stream) {
+				io.Copy(st, st)
+				st.CloseWrite()
+			}(st)
+		}
 	}()
 
-	got := make([]byte, len(payload))
-	if _, err := io.ReadFull(srvConn, got); err != nil {
-		t.Fatalf("server read: %v", err)
+	st, err := cs.OpenStream("example.com:80")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("prism-"), 5000) // ~30KB, spans frames
+	go func() {
+		st.Write(payload)
+		st.CloseWrite()
+	}()
+
+	got, err := io.ReadAll(st)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if !bytes.Equal(got, payload) {
-		t.Fatalf("payload mismatch")
-	}
-	ping := make([]byte, 4)
-	io.ReadFull(srvConn, ping)
-	if string(ping) != "PING" {
-		t.Fatalf("ping mismatch: %q", ping)
-	}
-
-	// 服务器 -> 客户端
-	go func() { srvConn.Write([]byte("PONG")) }()
-	pong := make([]byte, 4)
-	io.ReadFull(cliConn, pong)
-	if string(pong) != "PONG" {
-		t.Fatalf("pong mismatch: %q", pong)
+		t.Fatalf("echo mismatch: got %d bytes want %d", len(got), len(payload))
 	}
 }
 
-func TestReplayRejected(t *testing.T) {
-	r := NewReplayCache(0)
-	eph := make([]byte, 32)
-	rand.Read(eph)
-	if !r.Add(eph) {
-		t.Fatal("first add should succeed")
-	}
-	if r.Add(eph) {
-		t.Fatal("replay should be rejected")
-	}
-}
+func TestSessionStreamTargetPropagation(t *testing.T) {
+	cli, srv, cliConn, srvConn, _, _ := runHandshake(t)
+	defer cliConn.Close()
+	defer srvConn.Close()
 
-func TestWrongPSKFails(t *testing.T) {
-	psk := make([]byte, 32)
-	rand.Read(psk)
-	badPSK := make([]byte, 32)
-	rand.Read(badPSK)
-	sPriv, sPub := mustKey(t)
-	cPriv, cPub := mustKey(t)
-	serverPriv, _ := ParsePrivateKey(sPriv)
-	serverPub, _ := ParsePublicKey(sPub)
-	clientPriv, _ := ParsePrivateKey(cPriv)
+	cs, _ := NewSession(cliConn, cli, true)
+	ss, _ := NewSession(srvConn, srv, false)
 
-	c1, c2 := net.Pipe()
-	done := make(chan error, 1)
-	go func() {
-		allowed := func(pub []byte) bool { return bytes.Equal(pub, cPub) }
-		_, _, err := ServerHandshake(c2, psk, serverPriv, allowed, NewReplayCache(0))
-		done <- err
-	}()
-	// 客户端用错误 PSK；服务器应认证失败
-	go ClientHandshake(c1, badPSK, serverPub, clientPriv)
-	if err := <-done; err == nil {
-		t.Fatal("expected handshake failure with wrong PSK")
+	want := "1.2.3.4:443"
+	go cs.OpenStream(want)
+	st, err := ss.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Target() != want {
+		t.Fatalf("target = %q, want %q", st.Target(), want)
 	}
 }

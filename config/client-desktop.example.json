@@ -1,0 +1,17 @@
+{
+  "_comment": "桌面模式：在家办公的 macOS/Windows 员工用。自动设置系统代理，并在 http://127.0.0.1:9797 提供一个控制面板网页。",
+
+  "server": "sg.example.com:443",
+  "sni": "sg.example.com",
+  "server_public_key": "服务器X25519公钥(base64)",
+  "id": "本设备ID(base64)",
+  "psk": "本设备PSK(base64)",
+  "allow_insecure": false,
+
+  "mode": "desktop",
+  "socks_listen": "127.0.0.1:1080",
+  "http_listen": "127.0.0.1:1081",
+  "panel_listen": "127.0.0.1:9797",
+  "pool_size": 4,
+  "auto_connect": true
+}
