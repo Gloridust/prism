@@ -1,0 +1,7 @@
+/bin/
+*.exe
+*.out
+prism-server
+prism-client
+prism-keygen
+*.local.json
