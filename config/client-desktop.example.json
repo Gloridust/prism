@@ -8,6 +8,9 @@
   "psk": "本设备PSK(base64)",
   "allow_insecure": false,
 
+  "_cipher": "载波 AEAD，桌面有 AES-NI 用默认 aes-256-gcm 即可；留空=aes-256-gcm。所选算法必须在服务端 ciphers 列表里。",
+  "cipher": "aes-256-gcm",
+
   "mode": "desktop",
   "socks_listen": "127.0.0.1:1080",
   "http_listen": "127.0.0.1:1081",

@@ -3,7 +3,17 @@
 
   "listen": ":443",
 
-  "_tls": "生产务必用你自己域名的真实证书（certbot/Let's Encrypt）。self_signed 仅供本地测试，过不了仔细探测。",
+  "_tls": "证书三选一，优先级 acme > cert_file/key_file > self_signed。self_signed 仅供本地测试，过不了仔细探测（启动会打印 WARNING）。",
+
+  "_acme": "推荐：自动签发/续期 Let's Encrypt，走 TLS-ALPN-01，只用现成的 :443，无需 80 端口。把 enabled 改成 true、填上域名即可。首次测试可把 directory_url 指向 staging 避免触发额度：https://acme-staging-v02.api.letsencrypt.org/directory",
+  "acme": {
+    "enabled": false,
+    "domains": ["sg.example.com"],
+    "email": "you@example.com",
+    "cache_dir": "/etc/prism/acme",
+    "directory_url": ""
+  },
+
   "cert_file": "/etc/prism/fullchain.pem",
   "key_file": "/etc/prism/privkey.pem",
   "self_signed": "",
@@ -15,6 +25,9 @@
     { "name": "office-local", "id": "客户端ID(base64,4字节)", "psk": "预共享密钥(base64,32字节)" },
     { "name": "staff-laptop-01", "id": "另一个ID", "psk": "另一个PSK" }
   ],
+
+  "_ciphers": "接受的载波 AEAD，按序试解密。留空=['aes-256-gcm']。要同时服务有 AES-NI 的桌面和无 AES-NI 的路由器(用 ChaCha)，就列上两者——同线格式、无明文选择符，服务端自动识别每个客户端用的算法。",
+  "ciphers": ["aes-256-gcm", "chacha20-poly1305"],
 
   "window_seconds": 120,
 

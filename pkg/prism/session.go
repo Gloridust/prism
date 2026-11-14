@@ -69,13 +69,19 @@ type Session struct {
 }
 
 // NewSession wraps a post-handshake carrier. initiator must be true on the
-// client and false on the server.
+// client and false on the server. The data phase uses the cipher the handshake
+// agreed on (keys.aead); a hand-built Keys with no cipher set defaults to
+// AES-256-GCM, matching the zero-dependency reference build.
 func NewSession(transport io.ReadWriteCloser, keys *Keys, initiator bool) (*Session, error) {
-	sendAEAD, err := NewAEAD(keys.Send)
+	newAEAD := keys.aead
+	if newAEAD == nil {
+		newAEAD = NewAEAD
+	}
+	sendAEAD, err := newAEAD(keys.Send)
 	if err != nil {
 		return nil, err
 	}
-	recvAEAD, err := NewAEAD(keys.Recv)
+	recvAEAD, err := newAEAD(keys.Recv)
 	if err != nil {
 		return nil, err
 	}

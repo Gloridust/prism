@@ -1,6 +1,8 @@
 # Prism build & cross-compile.
-# Prereq on a build host WITH network for the first `go` run (stdlib only, so
-# no third-party downloads are actually needed).
+# Prereq: a build host WITH module access for the first `go` run — Prism now has
+# third-party deps (uTLS, golang.org/x/crypto), so `go mod download` (or
+# `go mod vendor`) them once for offline/cross builds. All deps are pure Go, so
+# GOOS/GOARCH cross-compiles need no CGO. See README "依赖与取舍".
 
 VERSION ?= 0.1.0
 LDFLAGS := -s -w -X main.version=$(VERSION)
@@ -8,6 +10,7 @@ OUT := dist
 
 .PHONY: all test server client keygen clean \
         client-linux-amd64 client-linux-arm64 client-linux-mipsle client-linux-mips \
+        client-linux-mipsle-chacha client-linux-mips-chacha \
         client-darwin-arm64 client-darwin-amd64 client-windows-amd64 \
         server-linux-amd64 server-linux-arm64
 
@@ -39,6 +42,13 @@ client-linux-mipsle:
 	GOOS=linux GOARCH=mipsle GOMIPS=softfloat go build -ldflags "$(LDFLAGS)" -o $(OUT)/prism-client-linux-mipsle ./cmd/prism-client
 client-linux-mips:
 	GOOS=linux GOARCH=mips GOMIPS=softfloat go build -ldflags "$(LDFLAGS)" -o $(OUT)/prism-client-linux-mips ./cmd/prism-client
+
+# Router firmware defaulting to ChaCha20-Poly1305 (no AES-NI) via -tags prism_chacha.
+# An explicit "cipher" in client.json still overrides the compiled default.
+client-linux-mipsle-chacha:
+	GOOS=linux GOARCH=mipsle GOMIPS=softfloat go build -tags prism_chacha -ldflags "$(LDFLAGS)" -o $(OUT)/prism-client-linux-mipsle-chacha ./cmd/prism-client
+client-linux-mips-chacha:
+	GOOS=linux GOARCH=mips GOMIPS=softfloat go build -tags prism_chacha -ldflags "$(LDFLAGS)" -o $(OUT)/prism-client-linux-mips-chacha ./cmd/prism-client
 
 # --- client: desktops (work from home) ---
 client-darwin-arm64:

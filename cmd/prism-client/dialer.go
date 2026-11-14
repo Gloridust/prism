@@ -2,11 +2,12 @@ package main
 
 import (
 	"crypto/ecdh"
-	"crypto/tls"
 	"errors"
 	"net"
 	"sync"
 	"time"
+
+	utls "github.com/refraction-networking/utls"
 
 	"github.com/gloridust/prism/pkg/prism"
 )
@@ -17,9 +18,10 @@ import (
 // failover across carriers.
 type Dialer struct {
 	server    string
-	tlsCfg    *tls.Config
+	tlsCfg    *utls.Config
 	serverPub *ecdh.PublicKey
 	cred      prism.Credential
+	aead      prism.AEADFactory
 
 	mu   sync.Mutex
 	pool []*prism.Session
@@ -32,15 +34,24 @@ func NewDialer(c *ClientConfig, cred *prism.Credential) (*Dialer, error) {
 	if err != nil {
 		return nil, err
 	}
+	aead, err := prism.AEADByName(c.cipher())
+	if err != nil {
+		return nil, err
+	}
 	return &Dialer{
 		server:    c.Server,
 		serverPub: pub,
 		cred:      *cred,
+		aead:      aead,
 		pool:      make([]*prism.Session, c.PoolSize),
-		tlsCfg: &tls.Config{
+		// uTLS Config carries only the fields we steer (SNI/ALPN/verify); the
+		// ClientHello itself is dictated by the mimicked browser profile below,
+		// which is the whole point — Go's native crypto/tls ClientHello is
+		// fingerprintable, so we present Chrome's instead.
+		tlsCfg: &utls.Config{
 			ServerName:         c.SNI,
 			InsecureSkipVerify: c.AllowInsecure, // #nosec G402 - gated by config, testing/self-signed
-			MinVersion:         tls.VersionTLS12,
+			MinVersion:         utls.VersionTLS12,
 			NextProtos:         []string{"http/1.1"},
 		},
 	}, nil
@@ -63,13 +74,17 @@ func (d *Dialer) dialSession() (*prism.Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	tlsConn := tls.Client(raw, d.tlsCfg)
+	// Present a current-stable-Chrome ClientHello so the carrier handshake is
+	// fingerprint-indistinguishable from an ordinary browser; SNI and ALPN are
+	// exactly as configured (our own domain, http/1.1). The prism inner
+	// handshake then runs unchanged on top of the established TLS stream.
+	tlsConn := utls.UClient(raw, d.tlsCfg, utls.HelloChrome_Auto)
 	tlsConn.SetDeadline(time.Now().Add(10 * time.Second))
 	if err := tlsConn.Handshake(); err != nil {
 		raw.Close()
 		return nil, err
 	}
-	keys, err := prism.ClientHandshake(tlsConn, d.serverPub, d.cred, prism.NewAEAD)
+	keys, err := prism.ClientHandshake(tlsConn, d.serverPub, d.cred, d.aead)
 	if err != nil {
 		raw.Close()
 		return nil, err

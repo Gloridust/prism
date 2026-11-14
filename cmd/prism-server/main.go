@@ -48,6 +48,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("tls: %v", err)
 	}
+	aeads, err := prism.AEADFactoriesByName(cfg.Ciphers)
+	if err != nil {
+		log.Fatalf("ciphers: %v", err)
+	}
 
 	s := &server{
 		tls:    tlsCfg,
@@ -56,13 +60,18 @@ func main() {
 		replay: prism.NewReplayWindow(cfg.window()),
 		window: cfg.window(),
 		cover:  coverHandler(cfg),
+		aeads:  aeads,
 	}
 
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		log.Fatalf("listen %s: %v", cfg.Listen, err)
 	}
-	log.Printf("listening on %s with %d credential(s)", cfg.Listen, len(creds))
+	ciphers := cfg.Ciphers
+	if len(ciphers) == 0 {
+		ciphers = []string{prism.CipherAES256GCM}
+	}
+	log.Printf("listening on %s with %d credential(s), ciphers %v", cfg.Listen, len(creds), ciphers)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -80,6 +89,7 @@ type server struct {
 	replay *prism.ReplayWindow
 	window time.Duration
 	cover  http.Handler
+	aeads  []prism.AEADFactory // carrier ciphers to trial, in order
 }
 
 func (s *server) handle(raw net.Conn) {
@@ -93,7 +103,7 @@ func (s *server) handle(raw net.Conn) {
 	}
 
 	_ = tlsConn.SetReadDeadline(time.Now().Add(handshakeTimeout))
-	keys, cred, consumed, err := prism.ServerHandshake(tlsConn, s.priv, s.creds, s.replay, s.window, prism.NewAEAD)
+	keys, cred, consumed, err := prism.ServerHandshake(tlsConn, s.priv, s.creds, s.replay, s.window, s.aeads...)
 	if err != nil {
 		// Not an authenticated client -> behave exactly like a web server.
 		_ = tlsConn.SetReadDeadline(time.Time{})

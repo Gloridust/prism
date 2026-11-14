@@ -43,6 +43,12 @@ const flagMux = 0x01
 type Keys struct {
 	Send []byte // key for frames we send
 	Recv []byte // key for frames we receive
+
+	// aead is the cipher the handshake agreed on (the factory the client dialed
+	// with / the server matched during trial-decrypt). NewSession uses it so the
+	// data phase runs the identical cipher both ends authenticated under. A nil
+	// value means the default (AES-256-GCM), for callers that build Keys by hand.
+	aead AEADFactory
 }
 
 // clientInitPayload is the 32-byte plaintext sealed inside ClientInit.
@@ -75,7 +81,7 @@ func unmarshalPayload(b []byte) clientInitPayload {
 // ClientHandshake runs the initiator side over rw (an already-established
 // carrier byte stream, e.g. a TLS conn). It proves possession of the PSK and
 // authenticates the server, and returns per-direction traffic keys.
-func ClientHandshake(rw io.ReadWriter, serverPub *ecdh.PublicKey, cred Credential, aeadFor func([]byte) (AEAD, error)) (*Keys, error) {
+func ClientHandshake(rw io.ReadWriter, serverPub *ecdh.PublicKey, cred Credential, aeadFor AEADFactory) (*Keys, error) {
 	if len(cred.PSK) != keySize {
 		return nil, errors.New("prism: PSK must be 32 bytes")
 	}
@@ -145,15 +151,23 @@ func ClientHandshake(rw io.ReadWriter, serverPub *ecdh.PublicKey, cred Credentia
 	return &Keys{
 		Send: hkdfExpand(ck2, labelC2S, keySize),
 		Recv: hkdfExpand(ck2, labelS2C, keySize),
+		aead: aeadFor,
 	}, nil
 }
 
 // ServerHandshake runs the responder side. It reads a fixed ClientInit, trial-
-// authenticates against every provisioned credential, enforces the freshness
+// authenticates against every provisioned credential under every enabled cipher
+// (aeads, defaulting to AES-256-GCM when none are given), enforces the freshness
 // window and anti-replay, and on success writes ServerResp and returns traffic
-// keys plus the matched credential. On ANY failure it returns ErrNotPrism and
-// the bytes it consumed, so the caller can transparently serve cover traffic.
-func ServerHandshake(rw io.ReadWriter, serverPriv *ecdh.PrivateKey, creds []Credential, replay *ReplayWindow, window time.Duration, aeadFor func([]byte) (AEAD, error)) (*Keys, *Credential, []byte, error) {
+// keys plus the matched credential. The matched cipher is recorded on the
+// returned Keys so the data phase uses it too — this is how one server endpoint
+// serves both AES-GCM desktops and ChaCha20-Poly1305 routers at once. On ANY
+// failure it returns ErrNotPrism and the bytes it consumed, so the caller can
+// transparently serve cover traffic.
+func ServerHandshake(rw io.ReadWriter, serverPriv *ecdh.PrivateKey, creds []Credential, replay *ReplayWindow, window time.Duration, aeads ...AEADFactory) (*Keys, *Credential, []byte, error) {
+	if len(aeads) == 0 {
+		aeads = []AEADFactory{NewAEAD}
+	}
 	init := make([]byte, clientInitSize)
 	n, err := io.ReadFull(rw, init)
 	if err != nil {
@@ -174,8 +188,10 @@ func ServerHandshake(rw io.ReadWriter, serverPriv *ecdh.PrivateKey, creds []Cred
 	ck0 := hkdfExtract([]byte(ProtocolName), es)
 	hCI := mixHash([]byte(ProtocolName), ePubBytes)
 
-	// Trial-decrypt against each credential's PSK. N is tiny (a few offices /
-	// a device fleet); each trial is one GCM open over 48 bytes.
+	// Trial-decrypt against each credential's PSK under each enabled cipher. N
+	// is tiny (a few offices / a device fleet) and the cipher set is one or two,
+	// so this is a handful of AEAD opens over 48 bytes — negligible, and it lets
+	// one endpoint carry a mixed AES/ChaCha fleet with no on-wire selector.
 	for i := range creds {
 		cred := creds[i]
 		if len(cred.PSK) != keySize {
@@ -183,60 +199,65 @@ func ServerHandshake(rw io.ReadWriter, serverPriv *ecdh.PrivateKey, creds []Cred
 		}
 		ck1 := hkdfExtract(ck0, cred.PSK)
 		kInit := hkdfExpand(ck1, labelInit, keySize)
-		initAEAD, err := aeadFor(kInit)
-		if err != nil {
-			continue
-		}
-		pt, err := initAEAD.Open(0, ct, hCI)
-		if err != nil {
-			continue // not this PSK
-		}
-		pl := unmarshalPayload(pt)
-		// Bind the decrypted CID to the credential we matched (defence in depth).
-		if subtle.ConstantTimeCompare(pl.ID[:], cred.ID[:]) != 1 {
-			return nil, nil, init, ErrNotPrism
-		}
-		// Freshness window.
-		skew := time.Since(time.Unix(pl.Time, 0))
-		if skew < -window || skew > window {
-			return nil, nil, init, ErrNotPrism
-		}
-		// Anti-replay: a fresh ephemeral per connection means a repeated E_pub
-		// is a replay.
-		if replay != nil && !replay.Accept(ePubBytes) {
-			return nil, nil, init, ErrNotPrism
-		}
 
-		// Authenticated. Respond for forward secrecy + key confirmation.
-		fEph, err := ecdh.X25519().GenerateKey(rand.Reader)
-		if err != nil {
-			return nil, nil, init, err
-		}
-		fPub := fEph.PublicKey().Bytes()
-		ee, err := fEph.ECDH(ePub)
-		if err != nil {
-			return nil, nil, init, err
-		}
-		ck2 := hkdfExtract(ck1, ee)
-		kResp := hkdfExpand(ck2, labelResp, keySize)
-		respAEAD, err := aeadFor(kResp)
-		if err != nil {
-			return nil, nil, init, err
-		}
-		hSR := mixHash([]byte(ProtocolName), ePubBytes, ct, fPub)
-		confirm := respAEAD.Seal(0, nil, hSR)
+		for _, aeadFor := range aeads {
+			initAEAD, err := aeadFor(kInit)
+			if err != nil {
+				continue
+			}
+			pt, err := initAEAD.Open(0, ct, hCI)
+			if err != nil {
+				continue // not this PSK/cipher combination
+			}
+			pl := unmarshalPayload(pt)
+			// Bind the decrypted CID to the credential we matched (defence in depth).
+			if subtle.ConstantTimeCompare(pl.ID[:], cred.ID[:]) != 1 {
+				return nil, nil, init, ErrNotPrism
+			}
+			// Freshness window.
+			skew := time.Since(time.Unix(pl.Time, 0))
+			if skew < -window || skew > window {
+				return nil, nil, init, ErrNotPrism
+			}
+			// Anti-replay: a fresh ephemeral per connection means a repeated E_pub
+			// is a replay.
+			if replay != nil && !replay.Accept(ePubBytes) {
+				return nil, nil, init, ErrNotPrism
+			}
 
-		resp := make([]byte, 0, serverRespSize)
-		resp = append(resp, fPub...)
-		resp = append(resp, confirm...)
-		if _, err := rw.Write(resp); err != nil {
-			return nil, nil, init, err
-		}
+			// Authenticated. Respond for forward secrecy + key confirmation,
+			// using the very cipher the client proved possession under.
+			fEph, err := ecdh.X25519().GenerateKey(rand.Reader)
+			if err != nil {
+				return nil, nil, init, err
+			}
+			fPub := fEph.PublicKey().Bytes()
+			ee, err := fEph.ECDH(ePub)
+			if err != nil {
+				return nil, nil, init, err
+			}
+			ck2 := hkdfExtract(ck1, ee)
+			kResp := hkdfExpand(ck2, labelResp, keySize)
+			respAEAD, err := aeadFor(kResp)
+			if err != nil {
+				return nil, nil, init, err
+			}
+			hSR := mixHash([]byte(ProtocolName), ePubBytes, ct, fPub)
+			confirm := respAEAD.Seal(0, nil, hSR)
 
-		return &Keys{
-			Send: hkdfExpand(ck2, labelS2C, keySize),
-			Recv: hkdfExpand(ck2, labelC2S, keySize),
-		}, &cred, nil, nil
+			resp := make([]byte, 0, serverRespSize)
+			resp = append(resp, fPub...)
+			resp = append(resp, confirm...)
+			if _, err := rw.Write(resp); err != nil {
+				return nil, nil, init, err
+			}
+
+			return &Keys{
+				Send: hkdfExpand(ck2, labelS2C, keySize),
+				Recv: hkdfExpand(ck2, labelC2S, keySize),
+				aead: aeadFor,
+			}, &cred, nil, nil
+		}
 	}
 
 	// No credential authenticated: a prober, a scanner, or a real browser.

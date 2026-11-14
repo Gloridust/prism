@@ -243,13 +243,19 @@ mux 层实现了**逐流信用流量控制**（§7.2）：载波读循环只把�
 
 1. **握手是自研、未经审计的构造**。它刻意对齐 Noise_IKpsk2 的形态，便于生产替换为经过验证的 Noise 库
    （如 flynn/noise）。**面对高风险对手上线前，请做独立密码学评审**，或直接换成成熟 Noise 实现。
-2. **TLS 指纹**：参考实现用 Go `crypto/tls`，其 ClientHello 指纹可被识别。生产应接 uTLS 对齐主流浏览器指纹。
+2. **TLS 指纹**：已接 uTLS（`cmd/prism-client/dialer.go`，`utls.HelloChrome_Auto`）让客户端载波握手对齐
+   Chrome 的 ClientHello，SNI/ALPN 不变（http/1.1）；服务端仍用标准 `crypto/tls` 终止（指纹是客户端侧问题）。
+   残留风险：`HelloChrome_Auto` 只对齐到 uTLS 打包时的某个稳定版 Chrome，需随浏览器版本升级 uTLS；uTLS 指纹本身
+   也在被研究。ECH 尚未实现。
 3. **自有域名会被枚举/封锁**：一旦域名/IP 被发现即可被墙。运维上要做到域名不复用、不公开关联，必要时上 CDN/域前置。
 4. **v1 数据面 TCP-only**：目的地的 QUIC(UDP) 不被隧道。需在 Nikki 侧掐 UDP/443 强制回落 TCP（见 `config/nikki-mihomo.example.yaml`）。
 5. **队头阻塞**：mux 层已用逐流信用流控消除（§7.2/§7.4）；连接池用于并行度与容灾，`quic-h3` 可在传输层再加按流拥塞控制。
 6. **这是一个坚实的工程基座，不是经过实网对抗检验的成品**。抗审查协议必须在真实网络里对抗、迭代。
-7. **默认 AEAD 是 AES-256-GCM**（零依赖、可离线构建）。无 AES 硬件加速的路由器（MIPS/部分 ARM）应换
-   ChaCha20-Poly1305（`pkg/prism/aead.go` 的 `NewAEAD` 换成 x/crypto 的构造即可，线格式不变）。
+7. **默认 AEAD 是 AES-256-GCM**。无 AES 硬件加速的路由器（MIPS/部分 ARM）可切 ChaCha20-Poly1305
+   （`pkg/prism/aead_chacha.go` 的 `NewChaCha20Poly1305AEAD`）：客户端用配置 `cipher` 或构建标签 `prism_chacha`
+   选择，服务端用 `ciphers` 列出接受集合并**按序试解密**自动识别每个客户端用的算法。两者**线格式完全一致**
+   （12B nonce / 16B tag，首包仍 80 字节），**不在明文里携带算法选择符**（那会引入可识别特征并改变线格式）。
+   注意：引入 ChaCha 使 `go.mod` 依赖 `golang.org/x/crypto`（见 README「依赖与取舍」），不再是零第三方依赖。
 8. **合规**：统一出口是正当的企业网络需求，但请确认符合你各运营地的法律法规与公司合规要求。
 
 ---
@@ -257,7 +263,9 @@ mux 层实现了**逐流信用流量控制**（§7.2）：载波读循环只把�
 ## 10. 路线图
 
 - [ ] `quic-h3` 载波（原生 HTTP/3 伪装 + 按流拥塞控制）
-- [ ] uTLS 指纹对齐 / ECH
+- [x] uTLS 指纹对齐（Chrome ClientHello）；ECH 待做
+- [x] ChaCha20-Poly1305 可选算法（路由器无 AES-NI）
+- [x] ACME/Let's Encrypt 证书自动签发（TLS-ALPN-01）
 - [ ] profile 整形库（网页/视频/下载画像）
 - [ ] 握手替换为经审计的 Noise_IKpsk2 实现
 - [ ] UDP relay（SOCKS UDP ASSOCIATE / QUIC 直穿）

@@ -8,6 +8,9 @@
   "psk": "本客户端PSK(base64)",
   "allow_insecure": false,
 
+  "_cipher": "载波 AEAD。无 AES-NI 的路由器(MIPS/老 ARM)用 chacha20-poly1305 更快且常数时间；有 AES-NI 的用 aes-256-gcm。留空则用构建默认(见 cipher_default*.go / -tags prism_chacha)。所选算法必须在服务端 ciphers 列表里。",
+  "cipher": "chacha20-poly1305",
+
   "mode": "router",
   "socks_listen": "127.0.0.1:1080",
   "pool_size": 4

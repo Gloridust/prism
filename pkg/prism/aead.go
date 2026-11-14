@@ -8,12 +8,12 @@ import (
 )
 
 // AEAD is the pluggable authenticated-cipher used for both the handshake and
-// the data phase. The reference build wires AES-256-GCM (stdlib, zero deps, so
-// the whole project cross-compiles offline). On routers without AES hardware
-// (MIPS, some ARM) ChaCha20-Poly1305 is faster and constant-time in software;
-// swap NewAEAD for a golang.org/x/crypto/chacha20poly1305 constructor on a
-// build host that has module access. The wire format is identical (12-byte
-// nonce, 16-byte tag), so client and server only need to agree on the choice.
+// the data phase. The reference build wires AES-256-GCM (stdlib). On routers
+// without AES hardware (MIPS, some ARM) ChaCha20-Poly1305 is faster and
+// constant-time in software (see NewChaCha20Poly1305AEAD in aead_chacha.go).
+// Both ciphers share the exact same wire format — a 12-byte counter nonce and a
+// 16-byte tag — so a connection only needs both ends to pick the same one; see
+// AEADFactory / AEADByName for how that choice is wired through the handshake.
 type AEAD interface {
 	// Seal encrypts plaintext with a 96-bit counter nonce and associated data.
 	Seal(counter uint64, plaintext, ad []byte) []byte
@@ -21,6 +21,14 @@ type AEAD interface {
 	Open(counter uint64, ciphertext, ad []byte) ([]byte, error)
 	Overhead() int
 }
+
+// AEADFactory builds an AEAD from a 32-byte key. The handshake and the data
+// phase are both parameterised over it so the cipher is a per-connection
+// choice: the client dials with one factory, the server trial-authenticates
+// against the factories it enables, and the matched factory is remembered on
+// the resulting Keys so the data phase uses the identical cipher. NewAEAD is
+// the default (AES-256-GCM); NewChaCha20Poly1305AEAD is the router variant.
+type AEADFactory = func(key []byte) (AEAD, error)
 
 // NewAEAD builds the default AEAD (AES-256-GCM) from a 32-byte key.
 func NewAEAD(key []byte) (AEAD, error) {
@@ -35,10 +43,12 @@ func NewAEAD(key []byte) (AEAD, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &gcmAEAD{g: g}, nil
+	return &aeadCipher{g: g}, nil
 }
 
-type gcmAEAD struct{ g cipher.AEAD }
+// aeadCipher adapts any stdlib-style cipher.AEAD (AES-GCM or ChaCha20-Poly1305,
+// both 12-byte nonce / 16-byte tag) to prism's counter-nonce AEAD interface.
+type aeadCipher struct{ g cipher.AEAD }
 
 func nonceOf(counter uint64) []byte {
 	var n [nonceSize]byte
@@ -48,12 +58,12 @@ func nonceOf(counter uint64) []byte {
 	return n[:]
 }
 
-func (a *gcmAEAD) Seal(counter uint64, plaintext, ad []byte) []byte {
+func (a *aeadCipher) Seal(counter uint64, plaintext, ad []byte) []byte {
 	return a.g.Seal(nil, nonceOf(counter), plaintext, ad)
 }
 
-func (a *gcmAEAD) Open(counter uint64, ciphertext, ad []byte) ([]byte, error) {
+func (a *aeadCipher) Open(counter uint64, ciphertext, ad []byte) ([]byte, error) {
 	return a.g.Open(nil, nonceOf(counter), ciphertext, ad)
 }
 
-func (a *gcmAEAD) Overhead() int { return a.g.Overhead() }
+func (a *aeadCipher) Overhead() int { return a.g.Overhead() }

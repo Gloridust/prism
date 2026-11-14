@@ -17,6 +17,13 @@ type ClientConfig struct {
 	PSK             string `json:"psk"`               // base64 32 bytes
 	AllowInsecure   bool   `json:"allow_insecure"`    // skip cert verify (testing/self-signed)
 
+	// Cipher selects the carrier AEAD: "aes-256-gcm" (default) or
+	// "chacha20-poly1305". Routers without AES-NI (MIPS / older ARM) should use
+	// chacha. Empty falls back to the build default (see cipher_default*.go: a
+	// firmware image can be compiled with -tags prism_chacha to default to
+	// ChaCha). Whatever is chosen must be in the server's enabled "ciphers".
+	Cipher string `json:"cipher"`
+
 	// Mode selects the deployment shape:
 	//   "router"  : SOCKS5 only, for OpenWrt + Nikki to route into.
 	//   "desktop" : SOCKS5 + HTTP proxy + auto system proxy + control panel.
@@ -49,6 +56,15 @@ func (c *ClientConfig) defaults() {
 
 func (c *ClientConfig) autoConnect() bool {
 	return c.AutoConnect == nil || *c.AutoConnect
+}
+
+// cipher resolves the configured cipher name, falling back to the build default
+// (defaultCipher) when the config leaves it unset.
+func (c *ClientConfig) cipher() string {
+	if c.Cipher == "" {
+		return defaultCipher
+	}
+	return c.Cipher
 }
 
 func loadClientConfig(path string) (*ClientConfig, *prism.Credential, error) {
