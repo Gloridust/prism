@@ -118,7 +118,7 @@ chmod +x /etc/init.d/prism-client
 - 握手为**自研未审计**构造，刻意对齐 Noise_IKpsk2 以便替换为成熟库；面对高风险对手上线前请做密码学评审。
 - 载波已接 **uTLS 模拟 Chrome 指纹**（`cmd/prism-client/dialer.go`）；仍需跟随 Chrome 版本更新 uTLS，`HelloChrome_Auto` 只对齐到打包时的某个稳定版，且 uTLS 指纹本身也在被研究，需持续迭代。
 - 自有域名会被枚举/封锁，注意域名隔离与运维卫生。
-- v1 数据面 TCP-only，需在 Nikki 掐 QUIC。
+- UDP（DNS/QUIC/实时音视频）走 UDP-over-stream 转发，附带 TCP 可靠语义，对 QUIC 非最优但够用。
 - 出口默认拒绝连向私网/环回/云元数据地址（防 SSRF）；确需时在 server.json 设 `allow_private:true`。
 - 这是**坚实的工程基座，不是实网对抗成品**。完整清单见 `docs/PROTOCOL.md` §9。
 - 统一出口是正当企业需求，但请自行确认符合各运营地法律法规与公司合规。

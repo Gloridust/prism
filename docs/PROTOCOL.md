@@ -195,7 +195,7 @@ inner（解密后的内层帧）：
 
 ```
 偏移  长度  内容
-0     1     cmd        # 0x00 DATA / 0x01 PAD / 0x02 SYN / 0x03 FIN / 0x04 RST / 0x05 WND
+0     1     cmd        # 0x00 DATA/0x01 PAD/0x02 SYN/0x03 FIN/0x04 RST/0x05 WND/0x06 SYN-UDP
 1     4     streamID
 5     2     dataLen
 7     dataLen   data
@@ -230,6 +230,20 @@ mux 层实现了**逐流信用流量控制**（§7.2）：载波读循环只把�
 keepalive 可能数分钟才感知）。这是 WireGuard/QUIC 的持久保活 + 空闲超时模式，
 `PAD` 不携带流数据、收到即忽略，超时值可按部署调整。
 
+### 7.6 UDP 转发（UDP over stream）
+
+`SYN-UDP`(0x06) 开一条 UDP 中继流。该流的可靠字节通道上承载自定界的带址数据报：
+
+```
+[uint16 total][uint8 addrLen][addr(atyp||host||port)][payload]   total=1+addrLen+len(payload)
+```
+
+一次写入即一个数据报，读方据 total 还原包边界。客户端把 SOCKS5 UDP ASSOCIATE
+收到的每个数据报按此封帧上送；出口服务器据址（同样经 §8-T8 出口策略校验）用
+一个 UDP 套接字发往目标，并把每个回包按来源地址封帧回送。这是"UDP over 可靠流"
+——给原本无连接的 UDP 附加了有序可靠性，是把数据报塞进单条载波的通行取舍；对
+DNS、QUIC、实时音视频等足够可用。空闲 60s 的 UDP 关联自动回收。
+
 ---
 
 ## 8. 各威胁如何被应对
@@ -256,7 +270,7 @@ keepalive 可能数分钟才感知）。这是 WireGuard/QUIC 的持久保活 + 
    残留风险：`HelloChrome_Auto` 只对齐到 uTLS 打包时的某个稳定版 Chrome，需随浏览器版本升级 uTLS；uTLS 指纹本身
    也在被研究。ECH 尚未实现。
 3. **自有域名会被枚举/封锁**：一旦域名/IP 被发现即可被墙。运维上要做到域名不复用、不公开关联，必要时上 CDN/域前置。
-4. **v1 数据面 TCP-only**：目的地的 QUIC(UDP) 不被隧道。需在 Nikki 侧掐 UDP/443 强制回落 TCP（见 `config/nikki-mihomo.example.yaml`）。
+4. **UDP 为 over-stream**：UDP（DNS/QUIC/实时音视频）经 §7.6 的 UDP-over-stream 转发，附带了 TCP 的有序可靠语义，故对 QUIC 这类自带拥塞控制的协议并非最优（相当于在可靠流里再跑一层）。够用但非理想；原生数据报传输见 `quic-h3` 规划。
 5. **队头阻塞**：mux 层已用逐流信用流控消除（§7.2/§7.4）；连接池用于并行度与容灾，`quic-h3` 可在传输层再加按流拥塞控制。
 6. **这是一个坚实的工程基座，不是经过实网对抗检验的成品**。抗审查协议必须在真实网络里对抗、迭代。
 7. **默认 AEAD 是 AES-256-GCM**。无 AES 硬件加速的路由器（MIPS/部分 ARM）可切 ChaCha20-Poly1305

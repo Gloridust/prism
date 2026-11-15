@@ -139,9 +139,9 @@ func (d *Dialer) ensure(c *carrier) (*prism.Session, error) {
 	return ns, nil
 }
 
-// Open returns a stream to target "host:port", redialing dead carriers. It
-// tries each slot at most once per call before giving up.
-func (d *Dialer) Open(target string) (*prism.Stream, error) {
+// openWith tries each slot at most once, (re)dialing dead carriers, and opens a
+// stream via the given opener (TCP or UDP).
+func (d *Dialer) openWith(open func(*prism.Session) (*prism.Stream, error)) (*prism.Stream, error) {
 	var lastErr error
 	for attempt := 0; attempt <= len(d.pool); attempt++ {
 		c := d.nextSlot()
@@ -150,7 +150,7 @@ func (d *Dialer) Open(target string) (*prism.Stream, error) {
 			lastErr = err
 			continue
 		}
-		st, err := sess.OpenStream(target)
+		st, err := open(sess)
 		if err == nil {
 			return st, nil
 		}
@@ -166,6 +166,16 @@ func (d *Dialer) Open(target string) (*prism.Stream, error) {
 		lastErr = errors.New("prism: no carrier available")
 	}
 	return nil, lastErr
+}
+
+// Open returns a TCP stream to target "host:port", redialing dead carriers.
+func (d *Dialer) Open(target string) (*prism.Stream, error) {
+	return d.openWith(func(s *prism.Session) (*prism.Stream, error) { return s.OpenStream(target) })
+}
+
+// OpenUDP returns a UDP-relay stream, redialing dead carriers.
+func (d *Dialer) OpenUDP() (*prism.Stream, error) {
+	return d.openWith(func(s *prism.Session) (*prism.Stream, error) { return s.OpenUDP() })
 }
 
 // OpenConn adapts Open to a net.Conn for use as http.Transport.DialContext.

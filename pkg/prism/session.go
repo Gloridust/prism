@@ -10,12 +10,13 @@ import (
 
 // Inner frame command bytes.
 const (
-	cmdData byte = 0x00 // stream payload
-	cmdPad  byte = 0x01 // cover padding, carries no stream data
-	cmdSYN  byte = 0x02 // open a stream; data = encoded target address
-	cmdFIN  byte = 0x03 // half-close: no more data from this side
-	cmdRST  byte = 0x04 // abort a stream
-	cmdWnd  byte = 0x05 // flow-control credit; data = uint32 big-endian bytes
+	cmdData   byte = 0x00 // stream payload
+	cmdPad    byte = 0x01 // cover padding, carries no stream data
+	cmdSYN    byte = 0x02 // open a stream; data = encoded target address
+	cmdFIN    byte = 0x03 // half-close: no more data from this side
+	cmdRST    byte = 0x04 // abort a stream
+	cmdWnd    byte = 0x05 // flow-control credit; data = uint32 big-endian bytes
+	cmdSYNUDP byte = 0x06 // open a UDP-relay stream (carries addressed datagrams)
 )
 
 const (
@@ -239,6 +240,23 @@ func (s *Session) dispatch(plain []byte) {
 		case s.accept <- st:
 		case <-s.done:
 		}
+	case cmdSYNUDP:
+		if s.initiator {
+			return // clients don't accept streams
+		}
+		st := s.newStream(id, "")
+		st.udp = true
+		s.mu.Lock()
+		if _, exists := s.streams[id]; exists || s.closed {
+			s.mu.Unlock()
+			return
+		}
+		s.streams[id] = st
+		s.mu.Unlock()
+		select {
+		case s.accept <- st:
+		case <-s.done:
+		}
 	case cmdData:
 		if st := s.lookup(id); st != nil {
 			st.deliver(append([]byte(nil), data...))
@@ -293,6 +311,32 @@ func (s *Session) OpenStream(target string) (*Stream, error) {
 	s.mu.Unlock()
 
 	if err := s.writeFrame(cmdSYN, id, enc, 0); err != nil {
+		s.removeStream(id)
+		return nil, err
+	}
+	return st, nil
+}
+
+// OpenUDP (client) opens a UDP-relay stream. Write addressed datagrams to it
+// with WriteDatagram and read them with ReadDatagram; the server relays each to
+// its target over UDP and frames replies back the same way.
+func (s *Session) OpenUDP() (*Stream, error) {
+	if !s.initiator {
+		return nil, errors.New("prism: only the initiator may open streams")
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil, s.closeErr
+	}
+	id := s.nextID
+	s.nextID += 2
+	st := s.newStream(id, "")
+	st.udp = true
+	s.streams[id] = st
+	s.mu.Unlock()
+
+	if err := s.writeFrame(cmdSYNUDP, id, nil, 0); err != nil {
 		s.removeStream(id)
 		return nil, err
 	}
@@ -356,6 +400,7 @@ type Stream struct {
 	id     uint32
 	s      *Session
 	target string
+	udp    bool // true: a UDP-relay stream carrying addressed datagrams
 
 	// receive side
 	rmu      sync.Mutex
@@ -384,6 +429,11 @@ func (s *Session) newStream(id uint32, target string) *Stream {
 
 // Target is the destination "host:port" for a server-accepted stream.
 func (st *Stream) Target() string { return st.target }
+
+// IsUDP reports whether this is a UDP-relay stream (opened with OpenUDP). Its
+// byte stream carries length-delimited addressed datagrams (see datagram.go),
+// not a single TCP target.
+func (st *Stream) IsUDP() bool { return st.udp }
 
 // deliver is called by the session read loop. It never blocks: the sender's
 // flow-control window bounds how much can be queued here, so appending is safe

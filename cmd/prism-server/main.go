@@ -137,6 +137,10 @@ func (s *server) handle(raw net.Conn) {
 
 func (s *server) handleStream(st *prism.Stream) {
 	defer st.Close()
+	if st.IsUDP() {
+		s.handleUDP(st)
+		return
+	}
 	remote, err := safeDial(st.Target(), s.allowPrivate, 10*time.Second)
 	if err != nil {
 		if errors.Is(err, errBlockedTarget) {
