@@ -41,6 +41,9 @@ type Config struct {
 	// box's own network (e.g. an internal service behind it).
 	AllowPrivate bool `json:"allow_private"`
 
+	// Shaping enables egress length-shaping ("pad" or "none", default none).
+	Shaping string `json:"shaping"`
+
 	// Anti-replay / freshness.
 	WindowSeconds int `json:"window_seconds"` // default 120
 

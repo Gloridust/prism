@@ -24,6 +24,10 @@ type ClientConfig struct {
 	// ChaCha). Whatever is chosen must be in the server's enabled "ciphers".
 	Cipher string `json:"cipher"`
 
+	// Shaping enables egress length-shaping: "pad" rounds small frames up to
+	// fixed sizes to mask inner record lengths; "" / "none" disables it (default).
+	Shaping string `json:"shaping"`
+
 	// Mode selects the deployment shape:
 	//   "router"  : SOCKS5 only, for OpenWrt + Nikki to route into.
 	//   "desktop" : SOCKS5 + HTTP proxy + auto system proxy + control panel.

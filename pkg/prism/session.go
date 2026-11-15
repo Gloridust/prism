@@ -52,6 +52,15 @@ const (
 	wndThreshold = streamWindow / 2
 )
 
+// shapeBuckets are the plaintext frame sizes the "pad" shaping profile rounds
+// up to. Small inner records — a tunnelled TLS ClientHello, a DNS query, an ACK
+// — otherwise pass their length straight through to the carrier; padding them
+// to a handful of fixed sizes breaks that length correlation (obfs4-style). The
+// pad bytes live inside the AEAD and are ignored on receipt, so shaping is a
+// purely local per-direction choice that needs no negotiation. Full-size frames
+// exceed the largest bucket and are never padded, so bulk throughput is intact.
+var shapeBuckets = []int{64, 256, 576, 1280, 4096, 16000}
+
 var (
 	// ErrSessionClosed is returned once the underlying carrier is gone.
 	ErrSessionClosed = errors.New("prism: session closed")
@@ -90,13 +99,28 @@ type Session struct {
 	// readLoop/keepalive goroutines read fields, never shared globals.
 	keepEvery   time.Duration
 	idleTimeout time.Duration
+
+	buckets []int // egress length-shaping buckets; nil = no shaping
+}
+
+// Option configures a Session at construction.
+type Option func(*Session)
+
+// WithShaping enables an egress length-shaping profile: "pad" rounds each frame
+// up to the next shapeBuckets size; "none" (or "") disables it (the default).
+func WithShaping(mode string) Option {
+	return func(s *Session) {
+		if mode == "pad" {
+			s.buckets = shapeBuckets
+		}
+	}
 }
 
 // NewSession wraps a post-handshake carrier. initiator must be true on the
 // client and false on the server. The data phase uses the cipher the handshake
 // agreed on (keys.aead); a hand-built Keys with no cipher set defaults to
 // AES-256-GCM, matching the zero-dependency reference build.
-func NewSession(transport io.ReadWriteCloser, keys *Keys, initiator bool) (*Session, error) {
+func NewSession(transport io.ReadWriteCloser, keys *Keys, initiator bool, opts ...Option) (*Session, error) {
 	newAEAD := keys.aead
 	if newAEAD == nil {
 		newAEAD = NewAEAD
@@ -125,6 +149,9 @@ func NewSession(transport io.ReadWriteCloser, keys *Keys, initiator bool) (*Sess
 	} else {
 		s.nextID = 2 // disjoint id space, avoids collisions if both ever open
 	}
+	for _, o := range opts {
+		o(s)
+	}
 	go s.readLoop()
 	go s.keepalive()
 	return s, nil
@@ -135,6 +162,9 @@ func (s *Session) writeFrame(cmd byte, id uint32, data []byte, pad int) error {
 	defer s.wmu.Unlock()
 	if s.werr != nil {
 		return s.werr
+	}
+	if p := s.shapePad(hdrSize + len(data)); p > pad {
+		pad = p
 	}
 	plain := make([]byte, hdrSize+len(data)+pad)
 	plain[0] = cmd
@@ -154,6 +184,18 @@ func (s *Session) writeFrame(cmd byte, id uint32, data []byte, pad int) error {
 		return err
 	}
 	return nil
+}
+
+// shapePad returns how many pad bytes to add to a frame whose current plaintext
+// length is n, per the shaping profile (0 when disabled or n exceeds the top
+// bucket).
+func (s *Session) shapePad(n int) int {
+	for _, b := range s.buckets {
+		if n <= b {
+			return b - n
+		}
+	}
+	return 0
 }
 
 func (s *Session) readLoop() {
@@ -369,6 +411,11 @@ func (s *Session) teardown(err error) {
 	close(s.done)
 	s.mu.Unlock()
 
+	// Close the carrier FIRST: a writeFrame blocked on a stuck transport Write
+	// still holds wmu, so acquiring wmu before closing would deadlock teardown
+	// against it. Closing unblocks that Write; then we take wmu to latch werr.
+	s.transport.Close()
+
 	s.wmu.Lock()
 	if s.werr == nil {
 		s.werr = err
@@ -379,7 +426,6 @@ func (s *Session) teardown(err error) {
 		st.closeRead(err)
 		st.failWrite(err)
 	}
-	s.transport.Close()
 }
 
 // Close shuts the session and its carrier down.

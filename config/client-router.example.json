@@ -13,5 +13,6 @@
 
   "mode": "router",
   "socks_listen": "127.0.0.1:1080",
-  "pool_size": 4
+  "pool_size": 4,
+  "shaping": "none"
 }

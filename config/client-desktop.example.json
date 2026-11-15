@@ -16,5 +16,6 @@
   "http_listen": "127.0.0.1:1081",
   "panel_listen": "127.0.0.1:9797",
   "pool_size": 4,
+  "shaping": "none",
   "auto_connect": true
 }

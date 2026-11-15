@@ -28,6 +28,7 @@ type Dialer struct {
 	serverPub *ecdh.PublicKey
 	cred      prism.Credential
 	aead      prism.AEADFactory
+	shaping   string
 
 	pool []*carrier
 
@@ -60,6 +61,7 @@ func NewDialer(c *ClientConfig, cred *prism.Credential) (*Dialer, error) {
 		serverPub: pub,
 		cred:      *cred,
 		aead:      aead,
+		shaping:   c.Shaping,
 		pool:      pool,
 		// uTLS Config carries only the fields we steer (SNI/ALPN/verify); the
 		// ClientHello itself is dictated by the mimicked browser profile below,
@@ -110,7 +112,7 @@ func (d *Dialer) dialSession() (*prism.Session, error) {
 		return nil, err
 	}
 	tlsConn.SetDeadline(time.Time{})
-	return prism.NewSession(tlsConn, keys, true)
+	return prism.NewSession(tlsConn, keys, true, prism.WithShaping(d.shaping))
 }
 
 // nextSlot returns the next pool slot round-robin (brief lock, no dial).

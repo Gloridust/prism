@@ -63,6 +63,7 @@ func main() {
 		cover:        coverHandler(cfg),
 		aeads:        aeads,
 		allowPrivate: cfg.AllowPrivate,
+		shaping:      cfg.Shaping,
 	}
 
 	ln, err := net.Listen("tcp", cfg.Listen)
@@ -93,6 +94,7 @@ type server struct {
 	cover        http.Handler
 	aeads        []prism.AEADFactory // carrier ciphers to trial, in order
 	allowPrivate bool                // permit egress to private/loopback targets
+	shaping      string              // egress length-shaping profile
 }
 
 func (s *server) handle(raw net.Conn) {
@@ -119,7 +121,7 @@ func (s *server) handle(raw net.Conn) {
 	if cred != nil {
 		name = fmt.Sprintf("%x", cred.ID)
 	}
-	sess, err := prism.NewSession(tlsConn, keys, false)
+	sess, err := prism.NewSession(tlsConn, keys, false, prism.WithShaping(s.shaping))
 	if err != nil {
 		return
 	}
