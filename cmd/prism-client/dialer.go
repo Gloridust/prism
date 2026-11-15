@@ -16,6 +16,12 @@ import (
 // and hands out multiplexed streams over them. The mux has per-stream credit
 // flow control (no head-of-line blocking); the pool adds parallelism and
 // failover across carriers.
+//
+// Each pool slot carries its own mutex that serialises (re)dialing THAT slot,
+// so a dial (TCP+TLS+handshake, up to ~10s) never holds a pool-wide lock: a
+// burst of new connections at startup — or after a carrier drops — dials up to
+// PoolSize carriers in parallel instead of queuing behind one slow dial, while
+// two requests racing on the same dead slot still dial only once.
 type Dialer struct {
 	server    string
 	tlsCfg    *utls.Config
@@ -23,9 +29,16 @@ type Dialer struct {
 	cred      prism.Credential
 	aead      prism.AEADFactory
 
-	mu   sync.Mutex
-	pool []*prism.Session
+	pool []*carrier
+
+	rrMu sync.Mutex
 	rr   int
+}
+
+// carrier is one pool slot: a (lazily dialed) session guarded by its own mutex.
+type carrier struct {
+	mu   sync.Mutex // serialises (re)dial of this slot
+	sess *prism.Session
 }
 
 // NewDialer prepares the pool (connections are established lazily on first use).
@@ -38,12 +51,16 @@ func NewDialer(c *ClientConfig, cred *prism.Credential) (*Dialer, error) {
 	if err != nil {
 		return nil, err
 	}
+	pool := make([]*carrier, c.PoolSize)
+	for i := range pool {
+		pool[i] = &carrier{}
+	}
 	return &Dialer{
 		server:    c.Server,
 		serverPub: pub,
 		cred:      *cred,
 		aead:      aead,
-		pool:      make([]*prism.Session, c.PoolSize),
+		pool:      pool,
 		// uTLS Config carries only the fields we steer (SNI/ALPN/verify); the
 		// ClientHello itself is dictated by the mimicked browser profile below,
 		// which is the whole point — Go's native crypto/tls ClientHello is
@@ -96,37 +113,54 @@ func (d *Dialer) dialSession() (*prism.Session, error) {
 	return prism.NewSession(tlsConn, keys, true)
 }
 
-// Open returns a stream to target "host:port", redialing dead carriers.
+// nextSlot returns the next pool slot round-robin (brief lock, no dial).
+func (d *Dialer) nextSlot() *carrier {
+	d.rrMu.Lock()
+	c := d.pool[d.rr%len(d.pool)]
+	d.rr++
+	d.rrMu.Unlock()
+	return c
+}
+
+// ensure returns a live session for slot c, dialing one if needed. The dial
+// runs under c's own mutex only, so other slots dial concurrently and the
+// pool-wide round-robin lock is never held across a network round trip.
+func (d *Dialer) ensure(c *carrier) (*prism.Session, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !sessionDead(c.sess) {
+		return c.sess, nil
+	}
+	ns, err := d.dialSession()
+	if err != nil {
+		return nil, err
+	}
+	c.sess = ns
+	return ns, nil
+}
+
+// Open returns a stream to target "host:port", redialing dead carriers. It
+// tries each slot at most once per call before giving up.
 func (d *Dialer) Open(target string) (*prism.Stream, error) {
 	var lastErr error
-	n := len(d.pool)
-	for attempt := 0; attempt <= n; attempt++ {
-		d.mu.Lock()
-		i := d.rr % n
-		d.rr++
-		sess := d.pool[i]
-		if sessionDead(sess) {
-			ns, err := d.dialSession()
-			if err != nil {
-				d.mu.Unlock()
-				lastErr = err
-				continue
-			}
-			d.pool[i] = ns
-			sess = ns
+	for attempt := 0; attempt <= len(d.pool); attempt++ {
+		c := d.nextSlot()
+		sess, err := d.ensure(c)
+		if err != nil {
+			lastErr = err
+			continue
 		}
-		d.mu.Unlock()
-
 		st, err := sess.OpenStream(target)
 		if err == nil {
 			return st, nil
 		}
 		lastErr = err
-		d.mu.Lock()
-		if d.pool[i] == sess {
-			d.pool[i] = nil
+		// Session died between ensure and use: drop it so the slot redials.
+		c.mu.Lock()
+		if c.sess == sess {
+			c.sess = nil
 		}
-		d.mu.Unlock()
+		c.mu.Unlock()
 	}
 	if lastErr == nil {
 		lastErr = errors.New("prism: no carrier available")
@@ -143,14 +177,17 @@ func (d *Dialer) OpenConn(target string) (net.Conn, error) {
 	return &streamConn{st}, nil
 }
 
-// Live reports how many carriers are currently up (for the control panel).
+// Live reports how many carriers are currently up (for the control panel). It
+// skips slots that are mid-dial (TryLock) so a status poll never blocks on a
+// 10s dial.
 func (d *Dialer) Live() int {
-	d.mu.Lock()
-	defer d.mu.Unlock()
 	n := 0
-	for _, s := range d.pool {
-		if !sessionDead(s) {
-			n++
+	for _, c := range d.pool {
+		if c.mu.TryLock() {
+			if !sessionDead(c.sess) {
+				n++
+			}
+			c.mu.Unlock()
 		}
 	}
 	return n
@@ -158,13 +195,13 @@ func (d *Dialer) Live() int {
 
 // Close tears every carrier down.
 func (d *Dialer) Close() {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	for i, s := range d.pool {
-		if s != nil {
-			s.Close()
-			d.pool[i] = nil
+	for _, c := range d.pool {
+		c.mu.Lock()
+		if c.sess != nil {
+			c.sess.Close()
+			c.sess = nil
 		}
+		c.mu.Unlock()
 	}
 }
 
