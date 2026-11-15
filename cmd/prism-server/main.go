@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/ecdh"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -54,13 +55,14 @@ func main() {
 	}
 
 	s := &server{
-		tls:    tlsCfg,
-		priv:   priv,
-		creds:  creds,
-		replay: prism.NewReplayWindow(cfg.window()),
-		window: cfg.window(),
-		cover:  coverHandler(cfg),
-		aeads:  aeads,
+		tls:          tlsCfg,
+		priv:         priv,
+		creds:        creds,
+		replay:       prism.NewReplayWindow(cfg.window()),
+		window:       cfg.window(),
+		cover:        coverHandler(cfg),
+		aeads:        aeads,
+		allowPrivate: cfg.AllowPrivate,
 	}
 
 	ln, err := net.Listen("tcp", cfg.Listen)
@@ -83,13 +85,14 @@ func main() {
 }
 
 type server struct {
-	tls    *tls.Config
-	priv   *ecdh.PrivateKey
-	creds  []prism.Credential
-	replay *prism.ReplayWindow
-	window time.Duration
-	cover  http.Handler
-	aeads  []prism.AEADFactory // carrier ciphers to trial, in order
+	tls          *tls.Config
+	priv         *ecdh.PrivateKey
+	creds        []prism.Credential
+	replay       *prism.ReplayWindow
+	window       time.Duration
+	cover        http.Handler
+	aeads        []prism.AEADFactory // carrier ciphers to trial, in order
+	allowPrivate bool                // permit egress to private/loopback targets
 }
 
 func (s *server) handle(raw net.Conn) {
@@ -134,8 +137,11 @@ func (s *server) handle(raw net.Conn) {
 
 func (s *server) handleStream(st *prism.Stream) {
 	defer st.Close()
-	remote, err := net.DialTimeout("tcp", st.Target(), 10*time.Second)
+	remote, err := safeDial(st.Target(), s.allowPrivate, 10*time.Second)
 	if err != nil {
+		if errors.Is(err, errBlockedTarget) {
+			log.Printf("blocked egress to %s (private/loopback/metadata; set allow_private to permit)", st.Target())
+		}
 		return
 	}
 	defer remote.Close()

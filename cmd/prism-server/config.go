@@ -34,6 +34,13 @@ type Config struct {
 	// server-side policy with no handshake tell.
 	Ciphers []string `json:"ciphers"`
 
+	// AllowPrivate permits egress to private/loopback/link-local targets. Default
+	// false blocks them (anti-SSRF): a credentialed client otherwise could reach
+	// the egress box's own localhost, the internal network, or cloud metadata
+	// (169.254.169.254). Enable only if clients legitimately need the egress
+	// box's own network (e.g. an internal service behind it).
+	AllowPrivate bool `json:"allow_private"`
+
 	// Anti-replay / freshness.
 	WindowSeconds int `json:"window_seconds"` // default 120
 
