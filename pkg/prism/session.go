@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"time"
 )
 
 // Inner frame command bytes.
@@ -18,8 +19,25 @@ const (
 )
 
 const (
-	hdrSize    = 7     // cmd(1) + streamID(4) + dataLen(2)
-	maxPayload = 16384 // real bytes per DATA frame before padding
+	hdrSize = 7 // cmd(1) + streamID(4) + dataLen(2)
+	// maxPayload keeps one full DATA frame inside a single TLS record: the
+	// on-wire size is 2 (len prefix) + 16 (tag) + hdrSize + payload, which must
+	// stay <= 16384 (TLS max record) to avoid splitting every full frame across
+	// two records. 16000 leaves comfortable headroom.
+	maxPayload = 16000
+)
+
+// Liveness: both ends emit a PAD keepalive every keepaliveInterval, and a
+// session whose carrier delivers nothing for idleTimeout is torn down. This
+// detects a silently dropped carrier (common on long-haul links behind stateful
+// middleboxes) in bounded time instead of waiting minutes for TCP keepalive —
+// the WireGuard/QUIC persistent-keepalive + idle-timeout pattern. idleTimeout
+// is several keepalive intervals so a little jitter or loss never kills a live
+// session. They are package vars (not consts) so an operator can tune them and
+// tests can shorten them.
+var (
+	keepaliveInterval = 15 * time.Second
+	idleTimeout       = 60 * time.Second
 )
 
 // Per-stream credit-based flow control (see docs/PROTOCOL.md §6.2). Each stream
@@ -66,6 +84,11 @@ type Session struct {
 	closed    bool
 	closeErr  error
 	done      chan struct{}
+
+	// liveness timeouts captured at construction (from the package vars) so the
+	// readLoop/keepalive goroutines read fields, never shared globals.
+	keepEvery   time.Duration
+	idleTimeout time.Duration
 }
 
 // NewSession wraps a post-handshake carrier. initiator must be true on the
@@ -86,13 +109,15 @@ func NewSession(transport io.ReadWriteCloser, keys *Keys, initiator bool) (*Sess
 		return nil, err
 	}
 	s := &Session{
-		transport: transport,
-		sendAEAD:  sendAEAD,
-		recvAEAD:  recvAEAD,
-		streams:   make(map[uint32]*Stream),
-		initiator: initiator,
-		accept:    make(chan *Stream, 16),
-		done:      make(chan struct{}),
+		transport:   transport,
+		sendAEAD:    sendAEAD,
+		recvAEAD:    recvAEAD,
+		streams:     make(map[uint32]*Stream),
+		initiator:   initiator,
+		accept:      make(chan *Stream, 16),
+		done:        make(chan struct{}),
+		keepEvery:   keepaliveInterval,
+		idleTimeout: idleTimeout,
 	}
 	if initiator {
 		s.nextID = 1
@@ -100,6 +125,7 @@ func NewSession(transport io.ReadWriteCloser, keys *Keys, initiator bool) (*Sess
 		s.nextID = 2 // disjoint id space, avoids collisions if both ever open
 	}
 	go s.readLoop()
+	go s.keepalive()
 	return s, nil
 }
 
@@ -131,8 +157,14 @@ func (s *Session) writeFrame(cmd byte, id uint32, data []byte, pad int) error {
 
 func (s *Session) readLoop() {
 	defer s.teardown(ErrSessionClosed)
+	// If the carrier supports deadlines (TLS/TCP do), bound each frame read by
+	// idleTimeout so a dead peer is detected instead of blocking forever.
+	rd, _ := s.transport.(interface{ SetReadDeadline(time.Time) error })
 	hdr := make([]byte, 2)
 	for {
+		if rd != nil {
+			_ = rd.SetReadDeadline(time.Now().Add(s.idleTimeout))
+		}
 		if _, err := io.ReadFull(s.transport, hdr); err != nil {
 			return
 		}
@@ -153,6 +185,25 @@ func (s *Session) readLoop() {
 			return
 		}
 		s.dispatch(plain)
+	}
+}
+
+// keepalive emits an empty PAD frame every keepaliveInterval until the session
+// ends. Both ends run it, so each sees carrier activity well within idleTimeout
+// even when no stream is sending; PAD carries no stream data and is ignored on
+// receipt.
+func (s *Session) keepalive() {
+	t := time.NewTicker(s.keepEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-t.C:
+			if err := s.writeFrame(cmdPad, 0, nil, 0); err != nil {
+				return
+			}
+		}
 	}
 }
 
