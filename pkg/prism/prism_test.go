@@ -189,3 +189,42 @@ func TestSessionStreamTargetPropagation(t *testing.T) {
 		t.Fatalf("target = %q, want %q", st.Target(), want)
 	}
 }
+
+// A complete HTTP request shorter than a ClientInit must fall back to cover
+// immediately — not block until the handshake deadline, which would be a timing
+// tell under active probing — and hand back exactly the bytes consumed.
+func TestServerFallbackOnShortHTTPRequest(t *testing.T) {
+	kp, _ := GenerateServerKeypair()
+	cred := testCred(t)
+	cliConn, srvConn := net.Pipe()
+	defer cliConn.Close()
+	defer srvConn.Close()
+
+	req := []byte("GET / HTTP/1.1\r\nHost: sg.example.com\r\n\r\n")
+	if len(req) >= clientInitSize {
+		t.Fatalf("test request must be shorter than a ClientInit (%d)", len(req))
+	}
+	go func() { cliConn.Write(req) }() // peer then stays open and silent, like a browser awaiting a reply
+
+	type out struct {
+		consumed []byte
+		err      error
+	}
+	ch := make(chan out, 1)
+	go func() {
+		_, _, consumed, err := ServerHandshake(srvConn, kp.Private,
+			[]Credential{cred}, NewReplayWindow(time.Minute), time.Minute)
+		ch <- out{consumed, err}
+	}()
+	select {
+	case o := <-ch:
+		if o.err != ErrNotPrism {
+			t.Fatalf("expected ErrNotPrism, got %v", o.err)
+		}
+		if !bytes.Equal(o.consumed, req) {
+			t.Fatalf("consumed = %q, want the full request for cover replay", o.consumed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server blocked on a complete short HTTP request (probe timing tell)")
+	}
+}

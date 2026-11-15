@@ -1,6 +1,7 @@
 package prism
 
 import (
+	"bytes"
 	"crypto/ecdh"
 	"crypto/rand"
 	"crypto/subtle"
@@ -27,6 +28,9 @@ var (
 	labelC2S  = []byte("prism c2s v1")
 	labelS2C  = []byte("prism s2c v1")
 )
+
+// httpEndOfHeaders marks a complete HTTP/1.x request head. See ServerHandshake.
+var httpEndOfHeaders = []byte("\r\n\r\n")
 
 // ErrNotPrism is returned by ServerHandshake when the peer is not an
 // authenticated Prism client. The caller MUST then fall back to serving cover
@@ -168,11 +172,28 @@ func ServerHandshake(rw io.ReadWriter, serverPriv *ecdh.PrivateKey, creds []Cred
 	if len(aeads) == 0 {
 		aeads = []AEADFactory{NewAEAD}
 	}
+	// Read the fixed-size ClientInit incrementally rather than with one blocking
+	// ReadFull. A prober (or a plain browser) may send a COMPLETE HTTP request
+	// shorter than a ClientInit, e.g. "GET / HTTP/1.1\r\nHost: x\r\n\r\n". A real
+	// web server answers that at once; blocking for the remaining bytes until the
+	// handshake deadline would be a timing tell. So the moment the bytes read so
+	// far contain an end-of-headers marker we stop and fall back to cover. (A
+	// genuine ClientInit is uniformly random; the chance its first <80 bytes hold
+	// CRLFCRLF is ~2^-26, and it only matters if the carrier fragments the write,
+	// in which case the client simply redials.)
 	init := make([]byte, clientInitSize)
-	n, err := io.ReadFull(rw, init)
-	if err != nil {
-		// Too few bytes to even be a ClientInit — hand what we have to cover.
-		return nil, nil, init[:n], ErrNotPrism
+	n := 0
+	for n < clientInitSize {
+		m, err := rw.Read(init[n:])
+		n += m
+		if n >= clientInitSize {
+			break
+		}
+		if err != nil || bytes.Contains(init[:n], httpEndOfHeaders) {
+			// Too few bytes to be a ClientInit, or a complete short HTTP
+			// request — hand what we have to cover.
+			return nil, nil, init[:n], ErrNotPrism
+		}
 	}
 
 	ePubBytes := init[:keySize]

@@ -75,9 +75,12 @@ func (d *Dialer) dialSession() (*prism.Session, error) {
 		return nil, err
 	}
 	// Present a current-stable-Chrome ClientHello so the carrier handshake is
-	// fingerprint-indistinguishable from an ordinary browser; SNI and ALPN are
-	// exactly as configured (our own domain, http/1.1). The prism inner
-	// handshake then runs unchanged on top of the established TLS stream.
+	// fingerprint-indistinguishable from an ordinary browser. SNI is our own
+	// domain as configured; the ALPN list is Chrome's own (h2, http/1.1) since
+	// the preset dictates the extensions, and the server — which only offers
+	// http/1.1 — selects http/1.1, exactly as a real Chrome would experience
+	// against an HTTP/1.1-only site. The prism inner handshake then runs
+	// unchanged on top of the established TLS stream.
 	tlsConn := utls.UClient(raw, d.tlsCfg, utls.HelloChrome_Auto)
 	tlsConn.SetDeadline(time.Now().Add(10 * time.Second))
 	if err := tlsConn.Handshake(); err != nil {
