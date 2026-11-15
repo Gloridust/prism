@@ -44,6 +44,10 @@ type Config struct {
 	// Shaping enables egress length-shaping ("pad" or "none", default none).
 	Shaping string `json:"shaping"`
 
+	// MaxStreams caps concurrent streams per carrier (memory safety). 0 uses the
+	// built-in default (1024); a negative value means unlimited.
+	MaxStreams int `json:"max_streams"`
+
 	// Anti-replay / freshness.
 	WindowSeconds int `json:"window_seconds"` // default 120
 

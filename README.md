@@ -66,6 +66,8 @@ make client-windows-amd64    # Windows
 强烈建议把 `cover_backend` 指向一个**真实的网站/应用**（反代），这样主动探测看到的是真站。
 用 systemd 托管见 `scripts/prism-server.service`。
 
+> 吊销某客户端：从 server.json 的 `credentials` 删掉该条，然后 `kill -HUP <prism-server-pid>` 热加载——无需重启，且会**立即踢掉**该凭据正在用的连接。
+
 **载波算法**：服务端 `ciphers` 列出接受的 AEAD（默认 `["aes-256-gcm"]`）。要同时服务有 AES-NI 的桌面和无 AES-NI 的路由器，列上两者 `["aes-256-gcm","chacha20-poly1305"]`——同线格式、无明文选择符，服务端按配置试解密自动识别每个客户端用的算法。
 
 > 新增一个办公室/员工：`prism-keygen client <名字>` 生成一条 `{id, psk}`，加进服务器 `credentials`、把 `id/psk/server_public_key` 发给对方即可；删掉该条即吊销该客户端。

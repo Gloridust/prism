@@ -16,6 +16,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gloridust/prism/pkg/prism"
@@ -54,6 +57,13 @@ func main() {
 		log.Fatalf("ciphers: %v", err)
 	}
 
+	maxStreams := cfg.MaxStreams
+	if maxStreams == 0 {
+		maxStreams = 1024 // default per-carrier cap; set negative in config for unlimited
+	} else if maxStreams < 0 {
+		maxStreams = 0 // explicit unlimited
+	}
+
 	s := &server{
 		tls:          tlsCfg,
 		priv:         priv,
@@ -64,7 +74,20 @@ func main() {
 		aeads:        aeads,
 		allowPrivate: cfg.AllowPrivate,
 		shaping:      cfg.Shaping,
+		maxStreams:   maxStreams,
+		cfgPath:      *cfgPath,
+		active:       make(map[*sessConn]struct{}),
 	}
+
+	// SIGHUP hot-reloads credentials and kicks any session whose credential was
+	// removed — revoke a leaked client without dropping everyone else.
+	sigc := make(chan os.Signal, 1)
+	signal.Notify(sigc, syscall.SIGHUP)
+	go func() {
+		for range sigc {
+			s.reload()
+		}
+	}()
 
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
@@ -95,6 +118,62 @@ type server struct {
 	aeads        []prism.AEADFactory // carrier ciphers to trial, in order
 	allowPrivate bool                // permit egress to private/loopback targets
 	shaping      string              // egress length-shaping profile
+	maxStreams   int                 // per-carrier stream cap (0 = unlimited)
+	cfgPath      string              // for SIGHUP reload
+
+	credsMu sync.RWMutex // guards creds (reloadable)
+	actMu   sync.Mutex   // guards active
+	active  map[*sessConn]struct{}
+}
+
+// sessConn tracks a live authenticated session and the credential it used, so a
+// credential reload can close (kick) sessions whose credential was revoked.
+type sessConn struct {
+	sess *prism.Session
+	id   prism.ClientID
+}
+
+func (s *server) register(r *sessConn) {
+	s.actMu.Lock()
+	s.active[r] = struct{}{}
+	s.actMu.Unlock()
+}
+
+func (s *server) unregister(r *sessConn) {
+	s.actMu.Lock()
+	delete(s.active, r)
+	s.actMu.Unlock()
+}
+
+// reload re-reads the config file and swaps in its credentials, then closes any
+// live session whose credential is no longer present. Only credentials reload;
+// TLS cert, listener, ciphers and policy flags still need a restart.
+func (s *server) reload() {
+	_, _, creds, err := loadConfig(s.cfgPath)
+	if err != nil {
+		log.Printf("reload failed, keeping current config: %v", err)
+		return
+	}
+	s.credsMu.Lock()
+	s.creds = creds
+	s.credsMu.Unlock()
+
+	valid := make(map[prism.ClientID]bool, len(creds))
+	for _, c := range creds {
+		valid[c.ID] = true
+	}
+	s.actMu.Lock()
+	var kick []*sessConn
+	for r := range s.active {
+		if !valid[r.id] {
+			kick = append(kick, r)
+		}
+	}
+	s.actMu.Unlock()
+	for _, r := range kick {
+		r.sess.Close()
+	}
+	log.Printf("reloaded %d credential(s); kicked %d revoked session(s)", len(creds), len(kick))
 }
 
 func (s *server) handle(raw net.Conn) {
@@ -108,7 +187,10 @@ func (s *server) handle(raw net.Conn) {
 	}
 
 	_ = tlsConn.SetReadDeadline(time.Now().Add(handshakeTimeout))
-	keys, cred, consumed, err := prism.ServerHandshake(tlsConn, s.priv, s.creds, s.replay, s.window, s.aeads...)
+	s.credsMu.RLock()
+	creds := s.creds
+	s.credsMu.RUnlock()
+	keys, cred, consumed, err := prism.ServerHandshake(tlsConn, s.priv, creds, s.replay, s.window, s.aeads...)
 	if err != nil {
 		// Not an authenticated client -> behave exactly like a web server.
 		_ = tlsConn.SetReadDeadline(time.Time{})
@@ -121,11 +203,16 @@ func (s *server) handle(raw net.Conn) {
 	if cred != nil {
 		name = fmt.Sprintf("%x", cred.ID)
 	}
-	sess, err := prism.NewSession(tlsConn, keys, false, prism.WithShaping(s.shaping))
+	sess, err := prism.NewSession(tlsConn, keys, false, prism.WithShaping(s.shaping), prism.WithMaxStreams(s.maxStreams))
 	if err != nil {
 		return
 	}
 	defer sess.Close()
+	if cred != nil {
+		rec := &sessConn{sess: sess, id: cred.ID}
+		s.register(rec)
+		defer s.unregister(rec)
+	}
 	log.Printf("client %s connected from %s", name, raw.RemoteAddr())
 
 	for {

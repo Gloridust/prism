@@ -68,6 +68,8 @@ var (
 	ErrStreamClosed = errors.New("prism: stream closed")
 	// ErrStreamReset is returned when the peer aborts a stream.
 	ErrStreamReset = errors.New("prism: stream reset by peer")
+	// ErrTooManyStreams is returned when a session is at its stream cap.
+	ErrTooManyStreams = errors.New("prism: too many concurrent streams")
 )
 
 var be = binary.BigEndian
@@ -100,7 +102,8 @@ type Session struct {
 	keepEvery   time.Duration
 	idleTimeout time.Duration
 
-	buckets []int // egress length-shaping buckets; nil = no shaping
+	buckets    []int // egress length-shaping buckets; nil = no shaping
+	maxStreams int   // cap on concurrent streams; 0 = unlimited
 }
 
 // Option configures a Session at construction.
@@ -114,6 +117,14 @@ func WithShaping(mode string) Option {
 			s.buckets = shapeBuckets
 		}
 	}
+}
+
+// WithMaxStreams caps concurrent streams on a session (0 = unlimited). The
+// responder RSTs new streams past the cap; the initiator gets ErrTooManyStreams
+// from Open. It bounds per-carrier memory (each stream may buffer up to one
+// receive window) against a client that opens streams without bound.
+func WithMaxStreams(n int) Option {
+	return func(s *Session) { s.maxStreams = n }
 }
 
 // NewSession wraps a post-handshake carrier. initiator must be true on the
@@ -276,6 +287,11 @@ func (s *Session) dispatch(plain []byte) {
 			s.mu.Unlock()
 			return
 		}
+		if s.maxStreams > 0 && len(s.streams) >= s.maxStreams {
+			s.mu.Unlock()
+			s.writeFrame(cmdRST, id, nil, 0)
+			return
+		}
 		s.streams[id] = st
 		s.mu.Unlock()
 		select {
@@ -291,6 +307,11 @@ func (s *Session) dispatch(plain []byte) {
 		s.mu.Lock()
 		if _, exists := s.streams[id]; exists || s.closed {
 			s.mu.Unlock()
+			return
+		}
+		if s.maxStreams > 0 && len(s.streams) >= s.maxStreams {
+			s.mu.Unlock()
+			s.writeFrame(cmdRST, id, nil, 0)
 			return
 		}
 		s.streams[id] = st
@@ -346,6 +367,10 @@ func (s *Session) OpenStream(target string) (*Stream, error) {
 		s.mu.Unlock()
 		return nil, s.closeErr
 	}
+	if s.maxStreams > 0 && len(s.streams) >= s.maxStreams {
+		s.mu.Unlock()
+		return nil, ErrTooManyStreams
+	}
 	id := s.nextID
 	s.nextID += 2
 	st := s.newStream(id, target)
@@ -370,6 +395,10 @@ func (s *Session) OpenUDP() (*Stream, error) {
 	if s.closed {
 		s.mu.Unlock()
 		return nil, s.closeErr
+	}
+	if s.maxStreams > 0 && len(s.streams) >= s.maxStreams {
+		s.mu.Unlock()
+		return nil, ErrTooManyStreams
 	}
 	id := s.nextID
 	s.nextID += 2
@@ -436,6 +465,13 @@ func (s *Session) Close() error {
 
 // Done is closed when the session ends.
 func (s *Session) Done() <-chan struct{} { return s.done }
+
+// StreamCount returns the number of currently open streams on the session.
+func (s *Session) StreamCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.streams)
+}
 
 // --- Stream ---
 
