@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"net/url"
 )
 
 // panelHTML is the one-page control panel a non-technical employee opens in a
@@ -66,14 +67,43 @@ func (a *app) panelMux() *http.ServeMux {
 		writeJSON(w, a.status())
 	})
 	mux.HandleFunc("/api/connect", func(w http.ResponseWriter, r *http.Request) {
+		if !sameOrigin(r) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
 		a.Connect()
 		writeJSON(w, a.status())
 	})
 	mux.HandleFunc("/api/disconnect", func(w http.ResponseWriter, r *http.Request) {
+		if !sameOrigin(r) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
 		a.Disconnect()
 		writeJSON(w, a.status())
 	})
 	return mux
+}
+
+// sameOrigin guards the state-changing panel endpoints against CSRF. Without it
+// any web page the employee visits could POST (or GET) to the loopback panel
+// and toggle their proxy. We require POST and, when the browser supplies an
+// Origin/Referer, that it match the panel's own host; cross-site browser
+// requests always carry an Origin, so this blocks them while leaving the panel's
+// own same-origin fetch and local tooling (curl, no Origin) working.
+func sameOrigin(r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		return false
+	}
+	if o := r.Header.Get("Origin"); o != "" {
+		u, err := url.Parse(o)
+		return err == nil && u.Host == r.Host
+	}
+	if ref := r.Header.Get("Referer"); ref != "" {
+		u, err := url.Parse(ref)
+		return err == nil && u.Host == r.Host
+	}
+	return true // no Origin/Referer: not a browser cross-site request (e.g. curl)
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

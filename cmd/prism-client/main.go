@@ -115,10 +115,14 @@ func (a *app) status() map[string]any {
 	a.mu.Lock()
 	connected := a.connected
 	a.mu.Unlock()
+	live := 0
+	if a.d != nil {
+		live = a.d.Live()
+	}
 	return map[string]any{
 		"connected": connected,
 		"server":    a.cfg.Server,
-		"live":      a.d.Live(),
+		"live":      live,
 		"socks":     a.cfg.SocksListen,
 		"http":      a.cfg.HTTPListen,
 	}
