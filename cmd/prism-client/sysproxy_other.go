@@ -14,3 +14,10 @@ func setSystemProxy(httpAddr, socksAddr string) error {
 }
 
 func clearSystemProxy() error { return nil }
+
+func setSystemDNS(dnsAddr string) error {
+	log.Printf("note: automatic DNS config not supported on this OS; set DNS to %s manually or use TUN mode", dnsAddr)
+	return nil
+}
+
+func clearSystemDNS() error { return nil }

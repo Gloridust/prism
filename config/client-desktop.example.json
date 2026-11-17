@@ -41,6 +41,12 @@
 
   "_shaping_profiles": "整形画像：\"none\"(默认)、\"pad\"(长度档位)、\"web\"(网页浏览)、\"video\"(视频流)、\"download\"(大文件)。",
 
+  "_dns": "DNS 防泄漏：本地 DNS 代理拦截直连 DNS 查询，通过隧道转发到出口节点的上游 DNS。桌面模式下同时设置系统 DNS 指向本地代理。listen 默认 127.0.0.1:53，upstream 默认 1.1.1.1:53。设为 null 关闭。",
+  "dns": {
+    "listen": "127.0.0.1:53",
+    "upstream": "1.1.1.1:53"
+  },
+
   "_tun": "TUN 全局模式（需 root）。启用后创建 TUN 设备并路由所有流量。",
   "tun": null,
 

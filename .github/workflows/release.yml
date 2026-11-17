@@ -1,0 +1,153 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          # Server
+          - goos: linux
+            goarch: amd64
+            bin: prism-server
+            dir: cmd/prism-server
+          - goos: linux
+            goarch: arm64
+            bin: prism-server
+            dir: cmd/prism-server
+
+          # Client: routers
+          - goos: linux
+            goarch: arm64
+            bin: prism-client
+            dir: cmd/prism-client
+          - goos: linux
+            goarch: mipsle
+            bin: prism-client
+            dir: cmd/prism-client
+            gomips: softfloat
+          - goos: linux
+            goarch: mips
+            bin: prism-client
+            dir: cmd/prism-client
+            gomips: softfloat
+          - goos: linux
+            goarch: mipsle
+            bin: prism-client
+            dir: cmd/prism-client
+            gomips: softfloat
+            tags: prism_chacha
+            suffix: -chacha
+          - goos: linux
+            goarch: mips
+            bin: prism-client
+            dir: cmd/prism-client
+            gomips: softfloat
+            tags: prism_chacha
+            suffix: -chacha
+
+          # Client: desktops
+          - goos: linux
+            goarch: amd64
+            bin: prism-client
+            dir: cmd/prism-client
+          - goos: darwin
+            goarch: arm64
+            bin: prism-client
+            dir: cmd/prism-client
+          - goos: darwin
+            goarch: amd64
+            bin: prism-client
+            dir: cmd/prism-client
+          - goos: windows
+            goarch: amd64
+            bin: prism-client
+            dir: cmd/prism-client
+
+          # Keygen
+          - goos: linux
+            goarch: amd64
+            bin: prism-keygen
+            dir: cmd/prism-keygen
+          - goos: darwin
+            goarch: arm64
+            bin: prism-keygen
+            dir: cmd/prism-keygen
+          - goos: windows
+            goarch: amd64
+            bin: prism-keygen
+            dir: cmd/prism-keygen
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOMIPS: ${{ matrix.gomips }}
+          CGO_ENABLED: "0"
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          EXT=""
+          if [ "$GOOS" = "windows" ]; then EXT=".exe"; fi
+          TAGS=""
+          if [ -n "${{ matrix.tags }}" ]; then TAGS="-tags ${{ matrix.tags }}"; fi
+          SUFFIX="${{ matrix.suffix }}"
+          OUT="${{ matrix.bin }}-${GOOS}-${GOARCH}${SUFFIX}${EXT}"
+          go build $TAGS -ldflags "-s -w -X main.version=${VERSION}" -o "dist/${OUT}" ./${{ matrix.dir }}/
+          echo "artifact=dist/${OUT}" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.bin }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}
+          path: dist/
+
+  wintun:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download wintun.dll
+        run: |
+          curl -fsSL "https://www.wintun.net/builds/wintun-0.14.1.zip" -o wintun.zip
+          unzip -qo wintun.zip
+          cp wintun/bin/amd64/wintun.dll .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wintun-dll
+          path: wintun.dll
+
+  release:
+    needs: [build, wintun]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Collect release assets
+        run: |
+          mkdir -p release
+          find artifacts/ -type f \( -name 'prism-*' -o -name 'wintun.dll' \) -exec cp {} release/ \;
+          # Bundle configs and scripts
+          tar czf release/prism-configs-scripts.tar.gz config/ scripts/
+          ls -lh release/
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release/* \
+            --title "Prism $GITHUB_REF_NAME" \
+            --generate-notes

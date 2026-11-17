@@ -85,9 +85,21 @@ type ClientConfig struct {
 	// flynn/noise Noise_IKpsk2 implementation.
 	Handshake string `json:"handshake"`
 
+	// DNS configures DNS leak prevention. When enabled, a local DNS proxy
+	// intercepts queries and forwards them through the Prism tunnel.
+	DNS *DNSConfig `json:"dns"`
+
 	// TUN enables global (TUN device) mode. When set, a TUN device is created
 	// and all system traffic is routed through Prism. Requires root/admin.
 	TUN *TUNConfig `json:"tun"`
+}
+
+// DNSConfig configures the DNS leak prevention proxy.
+type DNSConfig struct {
+	// Listen is the local address for the DNS proxy (default "127.0.0.1:53").
+	Listen string `json:"listen"`
+	// Upstream is the DNS server on the exit node (default "1.1.1.1:53").
+	Upstream string `json:"upstream"`
 }
 
 // TUNConfig configures the TUN global mode.

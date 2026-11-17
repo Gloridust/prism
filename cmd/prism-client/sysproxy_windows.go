@@ -4,7 +4,9 @@ package main
 
 import (
 	"log"
+	"net"
 	"os/exec"
+	"strings"
 )
 
 const regKey = `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`
@@ -35,6 +37,47 @@ func refreshWinINet() {
 		`[void]$t::InternetSetOption([IntPtr]::Zero,39,[IntPtr]::Zero,0);` +
 		`[void]$t::InternetSetOption([IntPtr]::Zero,37,[IntPtr]::Zero,0)`
 	run("powershell", "-NoProfile", "-NonInteractive", "-Command", script)
+}
+
+func setSystemDNS(dnsAddr string) error {
+	host, _, _ := net.SplitHostPort(dnsAddr)
+	ifaces := activeInterfaces()
+	for _, iface := range ifaces {
+		run("netsh", "interface", "ip", "set", "dns", "name="+iface, "source=static", "addr="+host)
+	}
+	refreshWinINet()
+	log.Printf("system DNS set to %s", host)
+	return nil
+}
+
+func clearSystemDNS() error {
+	ifaces := activeInterfaces()
+	for _, iface := range ifaces {
+		run("netsh", "interface", "ip", "set", "dns", "name="+iface, "source=dhcp")
+	}
+	refreshWinINet()
+	log.Printf("system DNS restored to DHCP defaults")
+	return nil
+}
+
+func activeInterfaces() []string {
+	out, err := exec.Command("netsh", "interface", "show", "interface").Output()
+	if err != nil {
+		return []string{"Wi-Fi", "Ethernet"}
+	}
+	var ifaces []string
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.Contains(line, "Connected") && !strings.Contains(line, "Dedicated") {
+			fields := strings.Fields(line)
+			if len(fields) >= 4 {
+				ifaces = append(ifaces, strings.Join(fields[3:], " "))
+			}
+		}
+	}
+	if len(ifaces) == 0 {
+		return []string{"Wi-Fi", "Ethernet"}
+	}
+	return ifaces
 }
 
 func run(name string, args ...string) {

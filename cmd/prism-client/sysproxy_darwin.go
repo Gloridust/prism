@@ -50,6 +50,23 @@ func clearSystemProxy() error {
 	return nil
 }
 
+func setSystemDNS(dnsAddr string) error {
+	host, _, _ := net.SplitHostPort(dnsAddr)
+	for _, svc := range networkServices() {
+		run("networksetup", "-setdnsservers", svc, host)
+	}
+	log.Printf("system DNS set to %s", host)
+	return nil
+}
+
+func clearSystemDNS() error {
+	for _, svc := range networkServices() {
+		run("networksetup", "-setdnsservers", svc, "empty")
+	}
+	log.Printf("system DNS restored to DHCP defaults")
+	return nil
+}
+
 func run(name string, args ...string) {
 	if err := exec.Command(name, args...).Run(); err != nil {
 		log.Printf("warn: %s %s: %v", name, strings.Join(args, " "), err)

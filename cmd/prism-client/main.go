@@ -67,6 +67,23 @@ func main() {
 		log.Printf("router mode: configure Nikki/Mihomo to use SOCKS5 %s", cfg.SocksListen)
 	}
 
+	// DNS leak prevention: local DNS proxy forwards queries through Prism.
+	var dnsP *dnsProxy
+	if cfg.DNS != nil {
+		listen := cfg.DNS.Listen
+		if listen == "" {
+			listen = "127.0.0.1:53"
+		}
+		var dnsErr error
+		dnsP, dnsErr = newDNSProxy(d, listen, cfg.DNS.Upstream)
+		if dnsErr != nil {
+			log.Printf("dns proxy on %s: %v (continuing without DNS leak prevention)", listen, dnsErr)
+		} else {
+			go dnsP.Serve()
+			log.Printf("DNS leak prevention: forwarding %s -> %s via tunnel", dnsP.Addr(), cfg.DNS.Upstream)
+		}
+	}
+
 	// TUN global mode: create a TUN device and route all traffic through Prism.
 	var tunDev *tunDevice
 	if cfg.TUN != nil {
@@ -103,6 +120,9 @@ func main() {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 	log.Printf("shutting down")
+	if dnsP != nil {
+		dnsP.Close()
+	}
 	if tunDev != nil {
 		if cfg.TUN.SetRoutes == nil || *cfg.TUN.SetRoutes {
 			serverHost, _, _ := net.SplitHostPort(cfg.Server)
@@ -135,6 +155,13 @@ func (a *app) Connect() {
 	}
 	if a.cfg.Mode == "desktop" {
 		setSystemProxy(a.cfg.HTTPListen, a.cfg.SocksListen)
+		if a.cfg.DNS != nil {
+			listen := a.cfg.DNS.Listen
+			if listen == "" {
+				listen = "127.0.0.1:53"
+			}
+			setSystemDNS(listen)
+		}
 	}
 	a.connected = true
 }
@@ -148,6 +175,9 @@ func (a *app) Disconnect() {
 	}
 	if a.cfg.Mode == "desktop" {
 		clearSystemProxy()
+		if a.cfg.DNS != nil {
+			clearSystemDNS()
+		}
 	}
 	a.connected = false
 }

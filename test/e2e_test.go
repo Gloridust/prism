@@ -8,6 +8,7 @@ package e2e
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -24,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/quic-go/quic-go"
 	utls "github.com/refraction-networking/utls"
 
 	"github.com/gloridust/prism/pkg/prism"
@@ -666,6 +668,501 @@ func TestWebSocketTransportEndToEnd(t *testing.T) {
 		}
 		_ = uconn.SetDeadline(time.Time{})
 		sess, err := prism.NewSession(ws, keys, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer sess.Close()
+
+		var wg sync.WaitGroup
+		for i := 0; i < 8; i++ {
+			wg.Add(1)
+			go func(n int) {
+				defer wg.Done()
+				st, err := sess.OpenStream("target:80")
+				if err != nil {
+					t.Errorf("open %d: %v", n, err)
+					return
+				}
+				defer st.Close()
+				msg := bytes.Repeat([]byte{byte(n)}, 3000+n*500)
+				go func() { st.Write(msg); st.CloseWrite() }()
+				got := make([]byte, len(msg))
+				if _, err := io.ReadFull(st, got); err != nil {
+					t.Errorf("stream %d read: %v", n, err)
+					return
+				}
+				if !bytes.Equal(got, msg) {
+					t.Errorf("stream %d mismatch", n)
+				}
+			}(i)
+		}
+		wg.Wait()
+	})
+}
+
+// --- Noise_IKpsk2 handshake e2e ---
+
+func serveNoiseCarrier(raw net.Conn, tlsCfg *tls.Config, priv *ecdh.PrivateKey, creds []prism.Credential, aeads []prism.AEADFactory) {
+	defer raw.Close()
+	tc := tls.Server(raw, tlsCfg)
+	_ = tc.SetDeadline(time.Now().Add(10 * time.Second))
+	if err := tc.Handshake(); err != nil {
+		return
+	}
+	keys, _, _, err := prism.NoiseServerHandshake(tc, priv, creds, prism.NewReplayWindow(2*time.Minute), 2*time.Minute, aeads...)
+	if err != nil {
+		return
+	}
+	_ = tc.SetDeadline(time.Time{})
+	runEchoSession(tc, keys)
+}
+
+func TestNoiseHandshakeEndToEnd(t *testing.T) {
+	kp, err := prism.GenerateServerKeypair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	psk, err := prism.NewPSK()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred := prism.Credential{ID: prism.ClientID{0xAA, 0xBB, 0xCC, 0xDD}, PSK: psk}
+	serverAEADs, _ := prism.AEADFactoriesByName([]string{prism.CipherAES256GCM})
+
+	tlsCfg := &tls.Config{
+		Certificates: []tls.Certificate{selfSignedCert(t)},
+		MinVersion:   tls.VersionTLS12,
+		NextProtos:   []string{"http/1.1"},
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go serveNoiseCarrier(conn, tlsCfg, kp.Private, []prism.Credential{cred}, serverAEADs)
+		}
+	}()
+
+	t.Run("noise-echo", func(t *testing.T) {
+		raw, err := net.DialTimeout("tcp", ln.Addr().String(), 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		uconn := utls.UClient(raw, &utls.Config{
+			ServerName:         "localhost",
+			InsecureSkipVerify: true,
+			MinVersion:         utls.VersionTLS12,
+			NextProtos:         []string{"http/1.1"},
+		}, utls.HelloChrome_Auto)
+		_ = uconn.SetDeadline(time.Now().Add(10 * time.Second))
+		if err := uconn.Handshake(); err != nil {
+			t.Fatalf("uTLS handshake: %v", err)
+		}
+
+		keys, err := prism.NoiseClientHandshake(uconn, kp.Public, cred, prism.NewAEAD)
+		if err != nil {
+			t.Fatalf("Noise handshake: %v", err)
+		}
+		_ = uconn.SetDeadline(time.Time{})
+		sess, err := prism.NewSession(uconn, keys, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer sess.Close()
+
+		st, err := sess.OpenStream("echo:80")
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload := bytes.Repeat([]byte("noise-ik-"), 5000)
+		go func() { st.Write(payload); st.CloseWrite() }()
+		got, err := io.ReadAll(st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("echo mismatch over Noise: got %d bytes want %d", len(got), len(payload))
+		}
+	})
+
+	t.Run("noise-wrong-psk-rejected", func(t *testing.T) {
+		raw, err := net.DialTimeout("tcp", ln.Addr().String(), 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		uconn := utls.UClient(raw, &utls.Config{
+			ServerName:         "localhost",
+			InsecureSkipVerify: true,
+			MinVersion:         utls.VersionTLS12,
+			NextProtos:         []string{"http/1.1"},
+		}, utls.HelloChrome_Auto)
+		_ = uconn.SetDeadline(time.Now().Add(10 * time.Second))
+		if err := uconn.Handshake(); err != nil {
+			t.Fatalf("uTLS handshake: %v", err)
+		}
+
+		badPSK, _ := prism.NewPSK()
+		badCred := prism.Credential{ID: prism.ClientID{0xAA, 0xBB, 0xCC, 0xDD}, PSK: badPSK}
+		_, err = prism.NoiseClientHandshake(uconn, kp.Public, badCred, prism.NewAEAD)
+		if err == nil {
+			t.Fatal("expected Noise handshake to fail with wrong PSK")
+		}
+	})
+
+	t.Run("noise-concurrent-streams", func(t *testing.T) {
+		raw, err := net.DialTimeout("tcp", ln.Addr().String(), 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		uconn := utls.UClient(raw, &utls.Config{
+			ServerName:         "localhost",
+			InsecureSkipVerify: true,
+			MinVersion:         utls.VersionTLS12,
+			NextProtos:         []string{"http/1.1"},
+		}, utls.HelloChrome_Auto)
+		_ = uconn.SetDeadline(time.Now().Add(10 * time.Second))
+		if err := uconn.Handshake(); err != nil {
+			t.Fatalf("uTLS handshake: %v", err)
+		}
+		keys, err := prism.NoiseClientHandshake(uconn, kp.Public, cred, prism.NewAEAD)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = uconn.SetDeadline(time.Time{})
+		sess, err := prism.NewSession(uconn, keys, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer sess.Close()
+
+		var wg sync.WaitGroup
+		for i := 0; i < 8; i++ {
+			wg.Add(1)
+			go func(n int) {
+				defer wg.Done()
+				st, err := sess.OpenStream("target:80")
+				if err != nil {
+					t.Errorf("open %d: %v", n, err)
+					return
+				}
+				defer st.Close()
+				msg := bytes.Repeat([]byte{byte(n)}, 2000+n*300)
+				go func() { st.Write(msg); st.CloseWrite() }()
+				got := make([]byte, len(msg))
+				if _, err := io.ReadFull(st, got); err != nil {
+					t.Errorf("stream %d read: %v", n, err)
+					return
+				}
+				if !bytes.Equal(got, msg) {
+					t.Errorf("stream %d mismatch", n)
+				}
+			}(i)
+		}
+		wg.Wait()
+	})
+}
+
+// --- UDP relay e2e ---
+
+func serveUDPEchoCarrier(raw net.Conn, tlsCfg *tls.Config, priv *ecdh.PrivateKey, creds []prism.Credential, aeads []prism.AEADFactory) {
+	defer raw.Close()
+	tc := tls.Server(raw, tlsCfg)
+	_ = tc.SetDeadline(time.Now().Add(10 * time.Second))
+	if err := tc.Handshake(); err != nil {
+		return
+	}
+	keys, _, _, err := prism.ServerHandshake(tc, priv, creds, prism.NewReplayWindow(2*time.Minute), 2*time.Minute, aeads...)
+	if err != nil {
+		return
+	}
+	_ = tc.SetDeadline(time.Time{})
+	sess, err := prism.NewSession(tc, keys, false)
+	if err != nil {
+		return
+	}
+	defer sess.Close()
+	for {
+		st, err := sess.Accept()
+		if err != nil {
+			return
+		}
+		if st.IsUDP() {
+			go func(st *prism.Stream) {
+				defer st.Close()
+				for {
+					addr, data, err := prism.ReadDatagram(st)
+					if err != nil {
+						return
+					}
+					if err := prism.WriteDatagram(st, addr, data); err != nil {
+						return
+					}
+				}
+			}(st)
+		} else {
+			go func(st *prism.Stream) {
+				io.Copy(st, st)
+				st.CloseWrite()
+			}(st)
+		}
+	}
+}
+
+func TestUDPRelayEndToEnd(t *testing.T) {
+	kp, err := prism.GenerateServerKeypair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	psk, err := prism.NewPSK()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred := prism.Credential{ID: prism.ClientID{0xDA, 0x7A, 0x01, 0x02}, PSK: psk}
+	serverAEADs, _ := prism.AEADFactoriesByName([]string{prism.CipherAES256GCM})
+
+	tlsCfg := &tls.Config{
+		Certificates: []tls.Certificate{selfSignedCert(t)},
+		MinVersion:   tls.VersionTLS12,
+		NextProtos:   []string{"http/1.1"},
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go serveUDPEchoCarrier(conn, tlsCfg, kp.Private, []prism.Credential{cred}, serverAEADs)
+		}
+	}()
+
+	raw, err := net.DialTimeout("tcp", ln.Addr().String(), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uconn := utls.UClient(raw, &utls.Config{
+		ServerName:         "localhost",
+		InsecureSkipVerify: true,
+		MinVersion:         utls.VersionTLS12,
+		NextProtos:         []string{"http/1.1"},
+	}, utls.HelloChrome_Auto)
+	_ = uconn.SetDeadline(time.Now().Add(10 * time.Second))
+	if err := uconn.Handshake(); err != nil {
+		t.Fatalf("uTLS handshake: %v", err)
+	}
+	keys, err := prism.ClientHandshake(uconn, kp.Public, cred, prism.NewAEAD)
+	if err != nil {
+		t.Fatalf("prism handshake: %v", err)
+	}
+	_ = uconn.SetDeadline(time.Time{})
+	sess, err := prism.NewSession(uconn, keys, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+
+	t.Run("single-datagram", func(t *testing.T) {
+		st, err := sess.OpenUDP()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer st.Close()
+
+		payload := []byte("hello-udp-relay")
+		target := "8.8.8.8:53"
+		if err := prism.WriteDatagram(st, target, payload); err != nil {
+			t.Fatal(err)
+		}
+		gotAddr, gotData, err := prism.ReadDatagram(st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gotAddr != target {
+			t.Fatalf("addr mismatch: got %q want %q", gotAddr, target)
+		}
+		if !bytes.Equal(gotData, payload) {
+			t.Fatalf("data mismatch: got %q want %q", gotData, payload)
+		}
+	})
+
+	t.Run("multiple-datagrams", func(t *testing.T) {
+		st, err := sess.OpenUDP()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer st.Close()
+
+		targets := []string{"1.1.1.1:53", "8.8.4.4:443", "192.0.2.1:1234"}
+		for i, tgt := range targets {
+			payload := bytes.Repeat([]byte{byte(i + 0x41)}, 100+i*50)
+			if err := prism.WriteDatagram(st, tgt, payload); err != nil {
+				t.Fatalf("write dgram %d: %v", i, err)
+			}
+			gotAddr, gotData, err := prism.ReadDatagram(st)
+			if err != nil {
+				t.Fatalf("read dgram %d: %v", i, err)
+			}
+			if gotAddr != tgt {
+				t.Fatalf("dgram %d addr: got %q want %q", i, gotAddr, tgt)
+			}
+			if !bytes.Equal(gotData, payload) {
+				t.Fatalf("dgram %d data mismatch", i)
+			}
+		}
+	})
+
+	t.Run("large-datagram", func(t *testing.T) {
+		st, err := sess.OpenUDP()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer st.Close()
+
+		payload := make([]byte, 8000)
+		rand.Read(payload)
+		target := "10.0.0.1:9999"
+		if err := prism.WriteDatagram(st, target, payload); err != nil {
+			t.Fatal(err)
+		}
+		gotAddr, gotData, err := prism.ReadDatagram(st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gotAddr != target {
+			t.Fatalf("addr: got %q want %q", gotAddr, target)
+		}
+		if !bytes.Equal(gotData, payload) {
+			t.Fatal("large datagram mismatch")
+		}
+	})
+}
+
+// --- QUIC/H3 transport e2e ---
+
+func serveQUICCarrier(ctx context.Context, addr string, tlsCfg *tls.Config, priv *ecdh.PrivateKey, creds []prism.Credential, aeads []prism.AEADFactory) (*prism.QUICListener, error) {
+	ql, err := prism.NewQUICListener(addr, tlsCfg)
+	if err != nil {
+		return nil, err
+	}
+
+	go func() {
+		for {
+			conn, err := ql.Accept(ctx)
+			if err != nil {
+				return
+			}
+			go func(conn *quic.Conn) {
+				qc, err := prism.QUICServerAccept(conn, 10*time.Second)
+				if err != nil {
+					return
+				}
+				_ = qc.SetDeadline(time.Now().Add(10 * time.Second))
+				keys, _, _, err := prism.ServerHandshake(qc, priv, creds, prism.NewReplayWindow(2*time.Minute), 2*time.Minute, aeads...)
+				if err != nil {
+					qc.Close()
+					return
+				}
+				_ = qc.SetDeadline(time.Time{})
+				runEchoSession(qc, keys)
+			}(conn)
+		}
+	}()
+
+	return ql, nil
+}
+
+func TestQUICTransportEndToEnd(t *testing.T) {
+	kp, err := prism.GenerateServerKeypair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	psk, err := prism.NewPSK()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred := prism.Credential{ID: prism.ClientID{0xC0, 0x1C, 0xE0, 0x01}, PSK: psk}
+	serverAEADs, _ := prism.AEADFactoriesByName([]string{prism.CipherAES256GCM})
+
+	tlsCfg := &tls.Config{
+		Certificates: []tls.Certificate{selfSignedCert(t)},
+		MinVersion:   tls.VersionTLS13,
+		NextProtos:   []string{"h3", "prism-quic"},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ql, err := serveQUICCarrier(ctx, "127.0.0.1:0", tlsCfg, kp.Private, []prism.Credential{cred}, serverAEADs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ql.Close()
+	t.Logf("QUIC listener on %s", ql.Addr())
+
+	t.Run("quic-echo", func(t *testing.T) {
+		clientTLS := &tls.Config{
+			InsecureSkipVerify: true,
+			NextProtos:         []string{"h3", "prism-quic"},
+		}
+		qc, err := prism.QUICClientDial(ql.Addr().String(), clientTLS, 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer qc.Close()
+
+		keys, err := prism.ClientHandshake(qc, kp.Public, cred, prism.NewAEAD)
+		if err != nil {
+			t.Fatalf("prism handshake over QUIC: %v", err)
+		}
+		sess, err := prism.NewSession(qc, keys, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer sess.Close()
+
+		st, err := sess.OpenStream("echo:443")
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload := bytes.Repeat([]byte("quic-"), 10000)
+		go func() { st.Write(payload); st.CloseWrite() }()
+		got, err := io.ReadAll(st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("echo mismatch over QUIC: got %d bytes want %d", len(got), len(payload))
+		}
+	})
+
+	t.Run("quic-concurrent-streams", func(t *testing.T) {
+		clientTLS := &tls.Config{
+			InsecureSkipVerify: true,
+			NextProtos:         []string{"h3", "prism-quic"},
+		}
+		qc, err := prism.QUICClientDial(ql.Addr().String(), clientTLS, 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer qc.Close()
+
+		keys, err := prism.ClientHandshake(qc, kp.Public, cred, prism.NewAEAD)
+		if err != nil {
+			t.Fatalf("prism handshake over QUIC: %v", err)
+		}
+		sess, err := prism.NewSession(qc, keys, true)
 		if err != nil {
 			t.Fatal(err)
 		}
