@@ -68,6 +68,20 @@ type Config struct {
 	// upgrade. Leave empty to disable.
 	WSPath string `json:"ws_path"`
 
+	// Handshake selects the inner handshake protocol: "" / "legacy" uses the
+	// hand-rolled handshake; "noise" uses the audited flynn/noise Noise_IKpsk2.
+	// Both ends must use the same handshake.
+	Handshake string `json:"handshake"`
+
+	// Admin enables the management API for credential CRUD, key rotation,
+	// per-CID quota and traffic stats.
+	Admin *AdminConfig `json:"admin"`
+
+	// QUICListen enables a QUIC/H3 listener on this address (e.g. ":443").
+	// QUIC runs over UDP on the same port as TLS/TCP, giving clients an HTTP/3
+	// carrier with per-stream congestion control. Leave empty to disable.
+	QUICListen string `json:"quic_listen"`
+
 	// Cover: what an unauthenticated visitor (or active prober) sees.
 	// Exactly one is used, in this order: Backend, then StaticDir, then a
 	// built-in placeholder page.
@@ -136,7 +150,7 @@ func loadConfig(path string) (*Config, *ecdh.PrivateKey, []prism.Credential, err
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("credentials[%d].psk: %w", i, err)
 		}
-		creds = append(creds, prism.Credential{ID: id, PSK: psk})
+		creds = append(creds, prism.Credential{ID: id, PSK: psk, Name: cc.Name})
 	}
 	if len(creds) == 0 {
 		return nil, nil, nil, fmt.Errorf("no credentials configured")

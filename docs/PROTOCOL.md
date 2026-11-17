@@ -316,8 +316,9 @@ TLS 终止始终在 Prism 侧完成。这避免了 REALITY 的 MITM 透传设计
 
 ## 9. 安全局限与诚实告警（务必读）
 
-1. **握手是自研、未经审计的构造**。它刻意对齐 Noise_IKpsk2 的形态，便于生产替换为经过验证的 Noise 库
-   （如 flynn/noise）。**面对高风险对手上线前，请做独立密码学评审**，或直接换成成熟 Noise 实现。
+1. **默认握手是自研、未经审计的构造**。它刻意对齐 Noise_IKpsk2 的形态。
+   **现已支持经审计的 Noise 实现**：配置 `handshake: "noise"` 即可使用 `flynn/noise`
+   的 Noise_IKpsk2 握手（需两端同时开启）。**面对高风险对手建议启用 `noise` 模式**。
 2. **TLS 指纹**：已接 uTLS（`cmd/prism-client/dialer.go`，`utls.HelloChrome_Auto`）让客户端载波握手对齐
    Chrome 的 ClientHello，SNI/ALPN 不变（http/1.1）；服务端 ALPN 已启用 h2（§7.9），用标准 `crypto/tls` 终止（指纹是客户端侧问题）。
    残留风险：`HelloChrome_Auto` 只对齐到 uTLS 打包时的某个稳定版 Chrome，需随浏览器版本升级 uTLS；uTLS 指纹本身
@@ -337,7 +338,7 @@ TLS 终止始终在 Prism 侧完成。这避免了 REALITY 的 MITM 透传设计
 
 ## 10. 路线图
 
-- [ ] `quic-h3` 载波（原生 HTTP/3 伪装 + 按流拥塞控制）
+- [x] `quic-h3` 载波（`transport: "quic"`，quic-go，原生 HTTP/3 伪装 + 按流拥塞控制）
 - [x] uTLS 指纹对齐（Chrome ClientHello）；ECH 待做
 - [x] ChaCha20-Poly1305 可选算法（路由器无 AES-NI）
 - [x] ACME/Let's Encrypt 证书自动签发（TLS-ALPN-01）
@@ -347,8 +348,8 @@ TLS 终止始终在 Prism 侧完成。这避免了 REALITY 的 MITM 透传设计
 - [x] 载波会话最大存活时间 + 渐次排空（`max_lifetime_sec`）
 - [x] 帧间到达时间抖动（`iat_max_ms`，模糊时序指纹）
 - [x] 会话级 buffer pool（消除每帧堆分配）
-- [ ] profile 整形库（网页/视频/下载画像）
-- [ ] 握手替换为经审计的 Noise_IKpsk2 实现
+- [x] profile 整形库（web/video/download 画像 + 概率性 cover 注入）
+- [x] 握手替换为经审计的 Noise_IKpsk2 实现（`handshake: "noise"`，flynn/noise）
 - [x] UDP relay（SOCKS UDP ASSOCIATE + UDP over stream）
-- [ ] 订阅分发与密钥轮换、per-CID 配额与审计
-- [ ] 桌面原生 TUN 全局模式
+- [x] 订阅分发与密钥轮换、per-CID 配额与审计（管理 API `admin.listen`）
+- [x] 桌面原生 TUN 全局模式（Linux utun / macOS utun，`tun` 配置块）

@@ -106,7 +106,8 @@ type Session struct {
 	keepEvery   time.Duration
 	idleTimeout time.Duration
 
-	buckets    []int // egress length-shaping buckets; nil = no shaping
+	buckets    []int     // egress length-shaping buckets; nil = no shaping
+	profile    *Profile  // traffic profile (superset of buckets; nil = no profile)
 	maxStreams int   // cap on concurrent streams; 0 = unlimited
 	maxLife    time.Duration
 	draining   chan struct{} // closed when the session starts draining (max lifetime)
@@ -122,11 +123,15 @@ type Session struct {
 // Option configures a Session at construction.
 type Option func(*Session)
 
-// WithShaping enables an egress length-shaping profile: "pad" rounds each frame
-// up to the next shapeBuckets size; "none" (or "") disables it (the default).
+// WithShaping enables an egress traffic-shaping profile by name. Built-in
+// profiles: "none" (default), "pad" (length bucketing only), "web" (browsing
+// pattern), "video" (streaming pattern), "download" (bulk transfer pattern).
 func WithShaping(mode string) Option {
 	return func(s *Session) {
-		if mode == "pad" {
+		if p := LookupProfile(mode); p != nil {
+			s.profile = p
+			s.buckets = p.Buckets
+		} else if mode == "pad" {
 			s.buckets = shapeBuckets
 		}
 	}
@@ -709,6 +714,9 @@ func (st *Stream) Write(p []byte) (int, error) {
 
 		if err := st.s.writeFrame(cmdData, st.id, p[:n], 0); err != nil {
 			return total, err
+		}
+		if sz := st.s.profile.ShouldCover(); sz > 0 {
+			_ = st.s.writeFrame(cmdPad, 0, nil, sz)
 		}
 		total += n
 		p = p[n:]

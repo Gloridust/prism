@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/gloridust/prism/pkg/prism"
+	"github.com/quic-go/quic-go"
 )
 
 const handshakeTimeout = 10 * time.Second
@@ -106,10 +107,21 @@ func main() {
 		maxStreams:   maxStreams,
 		cfgPath:      *cfgPath,
 		wsPath:       cfg.WSPath,
+		useNoise:     cfg.Handshake == "noise",
 		active:       make(map[*sessConn]struct{}),
 	}
 	if stealMode {
 		s.stealDest = cfg.Steal.Dest
+	}
+
+	if cfg.Admin != nil && cfg.Admin.Listen != "" {
+		admin := newAdminAPI(s, cfg.Admin.Token)
+		s.admin = admin
+		go func() {
+			if err := admin.listenAndServe(cfg.Admin.Listen); err != nil {
+				log.Printf("admin API: %v", err)
+			}
+		}()
 	}
 
 	// SIGHUP hot-reloads credentials and kicks any session whose credential was
@@ -121,6 +133,16 @@ func main() {
 			s.reload()
 		}
 	}()
+
+	// Start optional QUIC/H3 listener.
+	if cfg.QUICListen != "" {
+		ql, err := prism.NewQUICListener(cfg.QUICListen, tlsCfg)
+		if err != nil {
+			log.Fatalf("quic listen %s: %v", cfg.QUICListen, err)
+		}
+		go s.serveQUIC(ql)
+		log.Printf("QUIC listening on %s", cfg.QUICListen)
+	}
 
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
@@ -160,6 +182,8 @@ type server struct {
 	cfgPath      string              // for SIGHUP reload
 	stealDest    string              // steal mode: relay destination (e.g. "www.microsoft.com:443")
 	wsPath       string              // WebSocket upgrade path (e.g. "/_prism/ws"); empty = disabled
+	useNoise     bool                // use audited Noise_IKpsk2 handshake
+	admin        *adminAPI           // optional management API
 
 	credsMu sync.RWMutex // guards creds (reloadable)
 	actMu   sync.Mutex   // guards active
@@ -230,8 +254,18 @@ func (s *server) handle(raw net.Conn) {
 	s.credsMu.RLock()
 	creds := s.creds
 	s.credsMu.RUnlock()
-	keys, cred, consumed, err := prism.ServerHandshake(tlsConn, s.priv, creds, s.replay, s.window, s.aeads...)
-	if err != nil {
+	var (
+		keys     *prism.Keys
+		cred     *prism.Credential
+		consumed []byte
+		hsErr    error
+	)
+	if s.useNoise {
+		keys, cred, consumed, hsErr = prism.NoiseServerHandshake(tlsConn, s.priv, creds, s.replay, s.window, s.aeads...)
+	} else {
+		keys, cred, consumed, hsErr = prism.ServerHandshake(tlsConn, s.priv, creds, s.replay, s.window, s.aeads...)
+	}
+	if hsErr != nil {
 		_ = tlsConn.SetReadDeadline(time.Time{})
 		if s.wsPath != "" {
 			s.serveCoverOrWS(tlsConn, consumed)
@@ -255,8 +289,77 @@ func (s *server) handle(raw net.Conn) {
 		rec := &sessConn{sess: sess, id: cred.ID}
 		s.register(rec)
 		defer s.unregister(rec)
+		if s.admin != nil {
+			s.admin.recordConnect(cred.ID)
+		}
 	}
 	log.Printf("client %s connected from %s", name, raw.RemoteAddr())
+
+	for {
+		st, err := sess.Accept()
+		if err != nil {
+			return
+		}
+		go s.handleStream(st)
+	}
+}
+
+func (s *server) serveQUIC(ql *prism.QUICListener) {
+	for {
+		conn, err := ql.Accept(context.Background())
+		if err != nil {
+			log.Printf("quic accept: %v", err)
+			return
+		}
+		go s.handleQUICConn(conn)
+	}
+}
+
+func (s *server) handleQUICConn(qconn *quic.Conn) {
+	qc, err := prism.QUICServerAccept(qconn, handshakeTimeout)
+	if err != nil {
+		return
+	}
+	defer qc.Close()
+
+	qc.SetDeadline(time.Now().Add(handshakeTimeout))
+	s.credsMu.RLock()
+	creds := s.creds
+	s.credsMu.RUnlock()
+
+	var (
+		keys  *prism.Keys
+		cred  *prism.Credential
+		hsErr error
+	)
+	if s.useNoise {
+		keys, cred, _, hsErr = prism.NoiseServerHandshake(qc, s.priv, creds, s.replay, s.window, s.aeads...)
+	} else {
+		keys, cred, _, hsErr = prism.ServerHandshake(qc, s.priv, creds, s.replay, s.window, s.aeads...)
+	}
+	if hsErr != nil {
+		return
+	}
+	qc.SetDeadline(time.Time{})
+
+	name := "?"
+	if cred != nil {
+		name = fmt.Sprintf("%x", cred.ID)
+	}
+	sess, err := prism.NewSession(qc, keys, false, prism.WithShaping(s.shaping), prism.WithMaxStreams(s.maxStreams))
+	if err != nil {
+		return
+	}
+	defer sess.Close()
+	if cred != nil {
+		rec := &sessConn{sess: sess, id: cred.ID}
+		s.register(rec)
+		defer s.unregister(rec)
+		if s.admin != nil {
+			s.admin.recordConnect(cred.ID)
+		}
+	}
+	log.Printf("QUIC client %s connected from %s", name, qconn.RemoteAddr())
 
 	for {
 		st, err := sess.Accept()

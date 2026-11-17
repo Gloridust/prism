@@ -29,6 +29,8 @@ type ClientConfig struct {
 	//   "ws"         : WebSocket over TLS — the Prism handshake runs inside a
 	//                  WS binary stream, letting the carrier traverse CDN infra
 	//                  (Cloudflare, etc.) that only proxies HTTP.
+	//   "quic"       : QUIC/H3 — native HTTP/3 disguise + per-stream congestion
+	//                  control at the transport layer.
 	Transport string `json:"transport"`
 
 	// WSPath is the HTTP path the server exposes for WebSocket upgrade (must
@@ -68,6 +70,24 @@ type ClientConfig struct {
 	// set of session keys and masks long-lived connection patterns. 0 (default)
 	// means no limit.
 	MaxLifetimeSec int `json:"max_lifetime_sec"`
+
+	// Handshake selects the inner handshake protocol: "" / "legacy" uses the
+	// hand-rolled Noise-IK-flavoured handshake; "noise" uses the audited
+	// flynn/noise Noise_IKpsk2 implementation.
+	Handshake string `json:"handshake"`
+
+	// TUN enables global (TUN device) mode. When set, a TUN device is created
+	// and all system traffic is routed through Prism. Requires root/admin.
+	TUN *TUNConfig `json:"tun"`
+}
+
+// TUNConfig configures the TUN global mode.
+type TUNConfig struct {
+	DeviceName  string `json:"device_name"`  // e.g. "prism0" (default)
+	Address     string `json:"address"`      // TUN IP, e.g. "10.0.85.1/24"
+	Gateway     string `json:"gateway"`      // peer IP for point-to-point, e.g. "10.0.85.2"
+	OrigGateway string `json:"orig_gateway"` // original default gateway for server route
+	SetRoutes   *bool  `json:"set_routes"`   // auto-configure default route (default true)
 }
 
 func (c *ClientConfig) defaults() {

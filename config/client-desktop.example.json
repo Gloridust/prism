@@ -21,7 +21,7 @@
   "_steal": "REALITY 风格主动探测抗性。服务端也需开启 steal。",
   "steal": false,
 
-  "_transport": "载波传输层：\"\"(默认)=裸 TLS，\"ws\"=WebSocket over TLS（穿 CDN 时用）。ws_path 须与服务端 ws_path 一致。",
+  "_transport": "载波传输层：\"\"(默认)=裸 TLS，\"ws\"=WebSocket over TLS（穿 CDN 时用），\"quic\"=QUIC/H3（原生 HTTP/3 伪装）。ws_path 须与服务端 ws_path 一致。",
   "transport": "",
   "ws_path": "",
 
@@ -30,6 +30,14 @@
 
   "_max_lifetime_sec": "载波会话最大存活秒数。到期后旧会话渐次排空、新流用新会话。0=不限。",
   "max_lifetime_sec": 0,
+
+  "_handshake": "内层握手协议：\"\"=自研(默认)，\"noise\"=经审计的 flynn/noise Noise_IKpsk2。需两端一致。",
+  "handshake": "",
+
+  "_shaping_profiles": "整形画像：\"none\"(默认)、\"pad\"(长度档位)、\"web\"(网页浏览)、\"video\"(视频流)、\"download\"(大文件)。",
+
+  "_tun": "TUN 全局模式（需 root）。启用后创建 TUN 设备并路由所有流量。",
+  "tun": null,
 
   "auto_connect": true
 }

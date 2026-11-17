@@ -46,6 +46,15 @@
   "_ws_path": "WebSocket 传输路径。设置后，客户端可通过 wss://…/该路径 升级 WebSocket 在 WS 内跑 Prism，以穿透只代理 HTTP 的 CDN（如 Cloudflare）。留空则不开启。",
   "ws_path": "",
 
+  "_handshake": "内层握手协议：\"\"(默认)=自研 Noise-IK 风格，\"noise\"=经审计的 flynn/noise Noise_IKpsk2。建议高风险场景用 noise。需两端一致。",
+  "handshake": "",
+
+  "_admin": "管理 API（可选）：凭据 CRUD、密钥轮换、per-CID 配额与流量统计、订阅分发。listen 绑 127.0.0.1 确保不暴露。",
+  "admin": null,
+
+  "_quic_listen": "QUIC/H3 监听地址（可选）。启用后客户端可用 transport:quic 经 QUIC 连接，获得 HTTP/3 伪装 + 按流拥塞控制。留空不启用。",
+  "quic_listen": "",
+
   "_cover": "未通过鉴权的访问者（含主动探测）看到的内容。三选一，优先级 Backend > StaticDir > 内置占位页。强烈建议反代到一个真实网站。cover 现已支持 HTTP/2（h2 ALPN）。",
   "cover_backend": "http://127.0.0.1:8080",
   "cover_static_dir": ""

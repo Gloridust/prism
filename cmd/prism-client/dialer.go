@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/ecdh"
+	"crypto/tls"
 	"errors"
 	"io"
 	"net"
@@ -35,6 +36,8 @@ type Dialer struct {
 	wsPath      string // non-empty = WebSocket transport
 	maxLifetime time.Duration
 	iatMaxMs    int
+	useNoise    bool   // use audited Noise_IKpsk2 handshake
+	useQUIC     bool   // use QUIC/H3 transport
 
 	pool []*carrier
 
@@ -90,6 +93,8 @@ func NewDialer(c *ClientConfig, cred *prism.Credential) (*Dialer, error) {
 		wsPath:      wsPath,
 		maxLifetime: maxLife,
 		iatMaxMs:    c.IATMaxMs,
+		useNoise:    c.Handshake == "noise",
+		useQUIC:     c.Transport == "quic",
 		pool:        pool,
 		// uTLS Config carries only the fields we steer (SNI/ALPN/verify); the
 		// ClientHello itself is dictated by the mimicked browser profile below,
@@ -117,6 +122,9 @@ func sessionDead(s *prism.Session) bool {
 }
 
 func (d *Dialer) dialSession() (*prism.Session, error) {
+	if d.useQUIC {
+		return d.dialQUICSession()
+	}
 	raw, err := net.DialTimeout("tcp", d.server, 10*time.Second)
 	if err != nil {
 		return nil, err
@@ -159,7 +167,12 @@ func (d *Dialer) dialSession() (*prism.Session, error) {
 		transport = ws
 	}
 
-	keys, err := prism.ClientHandshake(transport, d.serverPub, d.cred, d.aead)
+	var keys *prism.Keys
+	if d.useNoise {
+		keys, err = prism.NoiseClientHandshake(transport, d.serverPub, d.cred, d.aead)
+	} else {
+		keys, err = prism.ClientHandshake(transport, d.serverPub, d.cred, d.aead)
+	}
 	if err != nil {
 		raw.Close()
 		return nil, err
@@ -173,6 +186,37 @@ func (d *Dialer) dialSession() (*prism.Session, error) {
 		opts = append(opts, prism.WithIAT(d.iatMaxMs))
 	}
 	return prism.NewSession(transport, keys, true, opts...)
+}
+
+func (d *Dialer) dialQUICSession() (*prism.Session, error) {
+	tlsCfg := &tls.Config{
+		ServerName:         d.sni,
+		InsecureSkipVerify: d.stealKey != nil,
+		MinVersion:         tls.VersionTLS12,
+		NextProtos:         []string{"h3", "prism-quic"},
+	}
+	qc, err := prism.QUICClientDial(d.server, tlsCfg, 10*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	var keys *prism.Keys
+	if d.useNoise {
+		keys, err = prism.NoiseClientHandshake(qc, d.serverPub, d.cred, d.aead)
+	} else {
+		keys, err = prism.ClientHandshake(qc, d.serverPub, d.cred, d.aead)
+	}
+	if err != nil {
+		qc.Close()
+		return nil, err
+	}
+	opts := []prism.Option{prism.WithShaping(d.shaping)}
+	if d.maxLifetime > 0 {
+		opts = append(opts, prism.WithMaxLifetime(d.maxLifetime))
+	}
+	if d.iatMaxMs > 0 {
+		opts = append(opts, prism.WithIAT(d.iatMaxMs))
+	}
+	return prism.NewSession(qc, keys, true, opts...)
 }
 
 // nextSlot returns the next pool slot round-robin (brief lock, no dial).

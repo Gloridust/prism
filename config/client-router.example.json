@@ -19,5 +19,6 @@
   "transport": "",
   "ws_path": "",
   "iat_max_ms": 0,
-  "max_lifetime_sec": 0
+  "max_lifetime_sec": 0,
+  "handshake": ""
 }
