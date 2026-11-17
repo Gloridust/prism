@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
 	"crypto/ecdh"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"io"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -36,8 +39,9 @@ type Dialer struct {
 	wsPath      string // non-empty = WebSocket transport
 	maxLifetime time.Duration
 	iatMaxMs    int
-	useNoise    bool   // use audited Noise_IKpsk2 handshake
-	useQUIC     bool   // use QUIC/H3 transport
+	useNoise      bool   // use audited Noise_IKpsk2 handshake
+	useQUIC       bool   // use QUIC/H3 transport
+	echConfigList []byte // ECH config for QUIC transport
 
 	pool []*carrier
 
@@ -82,6 +86,32 @@ func NewDialer(c *ClientConfig, cred *prism.Credential) (*Dialer, error) {
 	if c.MaxLifetimeSec > 0 {
 		maxLife = time.Duration(c.MaxLifetimeSec) * time.Second
 	}
+	// Resolve ECH config list (Encrypted Client Hello).
+	var echConfigList []byte
+	switch {
+	case c.ECH == "auto":
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		var fetchErr error
+		echConfigList, fetchErr = prism.FetchECHConfigList(ctx, c.SNI, c.ECHDoH)
+		cancel()
+		if fetchErr != nil {
+			log.Printf("ECH auto-fetch failed, continuing without ECH: %v", fetchErr)
+		} else if echConfigList != nil {
+			log.Printf("ECH config fetched from DNS (%d bytes)", len(echConfigList))
+		}
+	case c.ECH != "":
+		var decErr error
+		echConfigList, decErr = base64.StdEncoding.DecodeString(c.ECH)
+		if decErr != nil {
+			return nil, errors.New("ech: invalid base64 config list")
+		}
+	}
+
+	minVersion := uint16(utls.VersionTLS12)
+	if len(echConfigList) > 0 {
+		minVersion = utls.VersionTLS13
+	}
+
 	return &Dialer{
 		server:    c.Server,
 		sni:       c.SNI,
@@ -95,16 +125,20 @@ func NewDialer(c *ClientConfig, cred *prism.Credential) (*Dialer, error) {
 		iatMaxMs:    c.IATMaxMs,
 		useNoise:    c.Handshake == "noise",
 		useQUIC:     c.Transport == "quic",
+		echConfigList: echConfigList,
 		pool:        pool,
 		// uTLS Config carries only the fields we steer (SNI/ALPN/verify); the
 		// ClientHello itself is dictated by the mimicked browser profile below,
 		// which is the whole point — Go's native crypto/tls ClientHello is
 		// fingerprintable, so we present Chrome's instead.
+		// When ECH is set, ServerName is the inner (real) name; uTLS uses the
+		// ECH config's public_name as the outer SNI.
 		tlsCfg: &utls.Config{
-			ServerName:         c.SNI,
-			InsecureSkipVerify: skipVerify, // #nosec G402 - gated by config or steal mode
-			MinVersion:         utls.VersionTLS12,
-			NextProtos:         []string{"http/1.1"},
+			ServerName:                     c.SNI,
+			InsecureSkipVerify:             skipVerify, // #nosec G402 - gated by config or steal mode
+			MinVersion:                     minVersion,
+			NextProtos:                     []string{"http/1.1"},
+			EncryptedClientHelloConfigList: echConfigList,
 		},
 	}, nil
 }
@@ -190,10 +224,11 @@ func (d *Dialer) dialSession() (*prism.Session, error) {
 
 func (d *Dialer) dialQUICSession() (*prism.Session, error) {
 	tlsCfg := &tls.Config{
-		ServerName:         d.sni,
-		InsecureSkipVerify: d.stealKey != nil,
-		MinVersion:         tls.VersionTLS12,
-		NextProtos:         []string{"h3", "prism-quic"},
+		ServerName:                     d.sni,
+		InsecureSkipVerify:             d.stealKey != nil,
+		MinVersion:                     tls.VersionTLS13,
+		NextProtos:                     []string{"h3", "prism-quic"},
+		EncryptedClientHelloConfigList: d.echConfigList,
 	}
 	qc, err := prism.QUICClientDial(d.server, tlsCfg, 10*time.Second)
 	if err != nil {

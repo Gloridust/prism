@@ -67,11 +67,52 @@ func main() {
 		log.Printf("router mode: configure Nikki/Mihomo to use SOCKS5 %s", cfg.SocksListen)
 	}
 
+	// TUN global mode: create a TUN device and route all traffic through Prism.
+	var tunDev *tunDevice
+	if cfg.TUN != nil {
+		devName := cfg.TUN.DeviceName
+		if devName == "" {
+			devName = "prism0"
+		}
+		var tunErr error
+		tunDev, tunErr = openTUN(devName)
+		if tunErr != nil {
+			log.Fatalf("tun: %v", tunErr)
+		}
+		if tunErr = configureTUN(tunDev, cfg.TUN.Address, cfg.TUN.Gateway); tunErr != nil {
+			tunDev.Close()
+			log.Fatalf("tun configure: %v", tunErr)
+		}
+		setRoutes := cfg.TUN.SetRoutes == nil || *cfg.TUN.SetRoutes
+		if setRoutes {
+			serverHost, _, _ := net.SplitHostPort(cfg.Server)
+			if serverHost == "" {
+				serverHost = cfg.Server
+			}
+			if tunErr = addDefaultRoute(tunDev, serverHost, cfg.TUN.OrigGateway); tunErr != nil {
+				tunDev.Close()
+				log.Fatalf("tun routes: %v", tunErr)
+			}
+		}
+		go tunRouter(tunDev, d)
+		log.Printf("TUN device %s up, routing all traffic through Prism", tunDev.Name())
+	}
+
 	// Clean up the system proxy on exit so we never strand the machine offline.
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 	log.Printf("shutting down")
+	if tunDev != nil {
+		if cfg.TUN.SetRoutes == nil || *cfg.TUN.SetRoutes {
+			serverHost, _, _ := net.SplitHostPort(cfg.Server)
+			if serverHost == "" {
+				serverHost = cfg.Server
+			}
+			removeDefaultRoute(serverHost, cfg.TUN.OrigGateway)
+		}
+		tunDev.Close()
+	}
 	a.Disconnect()
 	d.Close()
 }

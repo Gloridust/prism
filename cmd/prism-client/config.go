@@ -71,6 +71,15 @@ type ClientConfig struct {
 	// means no limit.
 	MaxLifetimeSec int `json:"max_lifetime_sec"`
 
+	// ECH enables Encrypted Client Hello. Set to "auto" to fetch the ECH
+	// config list from DNS HTTPS records via DoH at startup, or to a base64
+	// ECHConfigList to use a fixed config. Empty (default) disables ECH.
+	ECH string `json:"ech"`
+
+	// ECHDoH overrides the DNS-over-HTTPS resolver used when ECH is "auto".
+	// Default: "https://1.1.1.1/dns-query".
+	ECHDoH string `json:"ech_doh"`
+
 	// Handshake selects the inner handshake protocol: "" / "legacy" uses the
 	// hand-rolled Noise-IK-flavoured handshake; "noise" uses the audited
 	// flynn/noise Noise_IKpsk2 implementation.

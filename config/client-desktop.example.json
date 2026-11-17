@@ -31,6 +31,11 @@
   "_max_lifetime_sec": "载波会话最大存活秒数。到期后旧会话渐次排空、新流用新会话。0=不限。",
   "max_lifetime_sec": 0,
 
+  "_ech": "Encrypted Client Hello：加密 TLS 握手中的 SNI 字段，网络观察者无法看到你连的是哪个域名。\"auto\"=从 DNS HTTPS 记录自动获取 ECH 配置(通过 DoH)；也可填 base64 编码的 ECHConfigList。留空=关闭。",
+  "ech": "",
+  "_ech_doh": "ECH 自动获取所用的 DoH 解析器。默认 https://1.1.1.1/dns-query。",
+  "ech_doh": "",
+
   "_handshake": "内层握手协议：\"\"=自研(默认)，\"noise\"=经审计的 flynn/noise Noise_IKpsk2。需两端一致。",
   "handshake": "",
 

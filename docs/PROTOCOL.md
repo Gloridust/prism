@@ -305,7 +305,7 @@ TLS 终止始终在 Prism 侧完成。这避免了 REALITY 的 MITM 透传设计
 |---|---|
 | T1 被动 DPI | 外层是对自有域名的真实 TLS 1.3；Prism 首包无明文结构 |
 | T2 主动探测 | 无有效凭据 → 同机真实 Web 回落；steal 模式下 TCP 透传到真实目标站（§7.7） |
-| T3 SNI/证书 | 用**自有域名 + 真实证书**，SNI 就是你自己的正常域名；可叠加 ECH |
+| T3 SNI/证书 | 用**自有域名 + 真实证书**，SNI 就是你自己的正常域名；**ECH 已实现**（`ech: "auto"` 加密 SNI） |
 | T4 TLS-in-TLS | 数据面不套内层 TLS，用自有 AEAD 分帧 + 整形，无内层握手突发 |
 | T5 熵分析 | 高熵字节只出现在载波本就期望高熵处（TLS 记录体）；无裸随机段 |
 | T6 流量分析 | profile 整形 + IAT 时序抖动（§7.3）+ 多路复用长连接 + 载波轮换（§7.10），贴近真实应用的长度/时序/连接分布 |
@@ -322,7 +322,9 @@ TLS 终止始终在 Prism 侧完成。这避免了 REALITY 的 MITM 透传设计
 2. **TLS 指纹**：已接 uTLS（`cmd/prism-client/dialer.go`，`utls.HelloChrome_Auto`）让客户端载波握手对齐
    Chrome 的 ClientHello，SNI/ALPN 不变（http/1.1）；服务端 ALPN 已启用 h2（§7.9），用标准 `crypto/tls` 终止（指纹是客户端侧问题）。
    残留风险：`HelloChrome_Auto` 只对齐到 uTLS 打包时的某个稳定版 Chrome，需随浏览器版本升级 uTLS；uTLS 指纹本身
-   也在被研究。ECH 尚未实现。
+   也在被研究。**ECH 已实现**：客户端配置 `ech: "auto"` 通过 DoH 自动获取 DNS HTTPS 记录中的
+   ECHConfigList，或手动填写 base64 编码的配置。启用后 TLS 握手的 SNI 字段加密，网络观察者无法
+   看到连接的真实域名。
 3. **自有域名会被枚举/封锁**：一旦域名/IP 被发现即可被墙。运维上要做到域名不复用、不公开关联，必要时上 CDN/域前置。
 4. **UDP 为 over-stream**：UDP（DNS/QUIC/实时音视频）经 §7.6 的 UDP-over-stream 转发，附带了 TCP 的有序可靠语义，故对 QUIC 这类自带拥塞控制的协议并非最优（相当于在可靠流里再跑一层）。够用但非理想；原生数据报传输见 `quic-h3` 规划。
 5. **队头阻塞**：mux 层已用逐流信用流控消除（§7.2/§7.4）；连接池用于并行度与容灾，`quic-h3` 可在传输层再加按流拥塞控制。
@@ -339,7 +341,7 @@ TLS 终止始终在 Prism 侧完成。这避免了 REALITY 的 MITM 透传设计
 ## 10. 路线图
 
 - [x] `quic-h3` 载波（`transport: "quic"`，quic-go，原生 HTTP/3 伪装 + 按流拥塞控制）
-- [x] uTLS 指纹对齐（Chrome ClientHello）；ECH 待做
+- [x] uTLS 指纹对齐（Chrome ClientHello）+ ECH（`ech: "auto"` 自动获取 / 手动配置）
 - [x] ChaCha20-Poly1305 可选算法（路由器无 AES-NI）
 - [x] ACME/Let's Encrypt 证书自动签发（TLS-ALPN-01）
 - [x] REALITY 风格主动探测抗性（steal 模式，session_id HMAC 标记）
@@ -352,4 +354,4 @@ TLS 终止始终在 Prism 侧完成。这避免了 REALITY 的 MITM 透传设计
 - [x] 握手替换为经审计的 Noise_IKpsk2 实现（`handshake: "noise"`，flynn/noise）
 - [x] UDP relay（SOCKS UDP ASSOCIATE + UDP over stream）
 - [x] 订阅分发与密钥轮换、per-CID 配额与审计（管理 API `admin.listen`）
-- [x] 桌面原生 TUN 全局模式（Linux utun / macOS utun，`tun` 配置块）
+- [x] 桌面原生 TUN 全局模式（Linux /dev/net/tun + macOS utun + Windows wintun，`tun` 配置块）
