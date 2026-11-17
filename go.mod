@@ -1,6 +1,6 @@
 module github.com/gloridust/prism
 
-go 1.26.0
+go 1.27.3
 
 // DEPENDENCY TRADEOFF (production hardening, see README "依赖与取舍"):
 // Prism started zero-third-party-dependency (pure Go stdlib). These two direct
@@ -13,16 +13,19 @@ go 1.26.0
 // All of pkg/prism except the ChaCha cipher remains stdlib-only. Vendor these
 // (go mod vendor) if your build host lacks module access.
 require (
+	github.com/flynn/noise v1.1.0
+	github.com/quic-go/quic-go v0.65.0
 	github.com/refraction-networking/utls v1.8.2
-	golang.org/x/crypto v0.54.0
+	github.com/sagernet/gvisor v0.0.0-20250811-sing-box-mod.1
+	golang.org/x/crypto v0.57.0
+	golang.org/x/net v0.60.0
+	golang.org/x/sys v0.48.0
 )
 
 require (
 	github.com/andybalholm/brotli v1.0.6 // indirect
-	github.com/flynn/noise v1.1.0 // indirect
+	github.com/google/btree v1.1.2 // indirect
 	github.com/klauspost/compress v1.17.4 // indirect
-	github.com/quic-go/quic-go v0.65.0 // indirect
-	golang.org/x/net v0.56.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.40.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
+	golang.org/x/time v0.15.0 // indirect
 )

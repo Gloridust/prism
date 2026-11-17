@@ -3,10 +3,8 @@ package main
 import (
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"os/exec"
-	"strconv"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -175,46 +173,4 @@ func removeDefaultRoute(serverHost, _ string) {
 	exec.Command("route", "delete", "0.0.0.0", "mask", "128.0.0.0").Run()
 	exec.Command("route", "delete", "128.0.0.0", "mask", "128.0.0.0").Run()
 	exec.Command("route", "delete", serverHost).Run()
-}
-
-func tunRouter(dev *tunDevice, dialer *Dialer) {
-	buf := make([]byte, tunMTU+4)
-	for {
-		n, err := dev.Read(buf)
-		if err != nil {
-			if err == io.EOF {
-				return
-			}
-			log.Printf("tun read: %v", err)
-			return
-		}
-		if n < 20 {
-			continue
-		}
-		pkt := buf[:n]
-		if pkt[0]>>4 != 4 {
-			continue
-		}
-		ihl := int(pkt[0]&0x0f) * 4
-		proto := pkt[9]
-		dstIP := net.IP(pkt[16:20])
-
-		switch proto {
-		case 6: // TCP
-			if len(pkt) < ihl+4 {
-				continue
-			}
-			dstPort := int(pkt[ihl+2])<<8 | int(pkt[ihl+3])
-			target := net.JoinHostPort(dstIP.String(), strconv.Itoa(dstPort))
-			go func(t string) {
-				st, err := dialer.Open(t)
-				if err != nil {
-					return
-				}
-				defer st.Close()
-				io.Copy(st, st)
-			}(target)
-		case 17: // UDP — handled via UDP relay
-		}
-	}
 }

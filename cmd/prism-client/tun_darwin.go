@@ -2,8 +2,6 @@ package main
 
 import (
 	"fmt"
-	"io"
-	"log"
 	"net"
 	"os/exec"
 	"strconv"
@@ -16,6 +14,7 @@ const tunMTU = 1500
 type tunDevice struct {
 	fd   int
 	name string
+	rbuf []byte // persistent read buffer (avoids alloc per packet)
 }
 
 func openTUN(_ string) (*tunDevice, error) {
@@ -59,19 +58,32 @@ func openTUN(_ string) (*tunDevice, error) {
 	}
 
 	ifName := "utun" + strconv.Itoa(int(sc.unit-1))
-	return &tunDevice{fd: fd, name: ifName}, nil
+	return &tunDevice{fd: fd, name: ifName, rbuf: make([]byte, tunMTU+4)}, nil
 }
 
+// Read returns a raw IPv4 packet with the macOS utun 4-byte AF header stripped.
 func (t *tunDevice) Read(buf []byte) (int, error) {
-	n, err := syscall.Read(t.fd, buf)
-	if n <= 0 && err != nil {
-		return 0, err
+	n, err := syscall.Read(t.fd, t.rbuf)
+	if n <= 4 {
+		if err != nil {
+			return 0, err
+		}
+		return 0, nil
 	}
-	return n, nil
+	return copy(buf, t.rbuf[4:n]), nil
 }
 
+// Write prepends the macOS utun 4-byte AF_INET header and writes a raw IPv4
+// packet to the TUN device.
 func (t *tunDevice) Write(buf []byte) (int, error) {
-	return syscall.Write(t.fd, buf)
+	wbuf := make([]byte, 4+len(buf))
+	wbuf[0], wbuf[1], wbuf[2], wbuf[3] = 0, 0, 0, syscall.AF_INET
+	copy(wbuf[4:], buf)
+	n, err := syscall.Write(t.fd, wbuf)
+	if n > 4 {
+		return n - 4, err
+	}
+	return 0, err
 }
 
 func (t *tunDevice) Close() error {
@@ -81,8 +93,15 @@ func (t *tunDevice) Close() error {
 func (t *tunDevice) Name() string { return t.name }
 
 func configureTUN(dev *tunDevice, addr, peerAddr string) error {
+	ip, _, err := net.ParseCIDR(addr)
+	if err != nil {
+		ip = net.ParseIP(addr)
+		if ip == nil {
+			return fmt.Errorf("invalid TUN address: %s", addr)
+		}
+	}
 	cmds := [][]string{
-		{"ifconfig", dev.Name(), "inet", addr, peerAddr, "up"},
+		{"ifconfig", dev.Name(), "inet", ip.String(), peerAddr, "up"},
 		{"ifconfig", dev.Name(), "mtu", strconv.Itoa(tunMTU)},
 	}
 	for _, cmd := range cmds {
@@ -111,47 +130,4 @@ func removeDefaultRoute(serverHost, origGateway string) {
 	exec.Command("route", "delete", "-net", "0.0.0.0/1").Run()
 	exec.Command("route", "delete", "-net", "128.0.0.0/1").Run()
 	exec.Command("route", "delete", "-host", serverHost, origGateway).Run()
-}
-
-func tunRouter(dev *tunDevice, dialer *Dialer) {
-	buf := make([]byte, tunMTU+4)
-	for {
-		n, err := dev.Read(buf)
-		if err != nil {
-			if err == io.EOF {
-				return
-			}
-			log.Printf("tun read: %v", err)
-			return
-		}
-		// macOS utun prepends a 4-byte protocol family header.
-		if n < 24 {
-			continue
-		}
-		pkt := buf[4:n] // skip 4-byte AF header
-		if pkt[0]>>4 != 4 {
-			continue
-		}
-		ihl := int(pkt[0]&0x0f) * 4
-		proto := pkt[9]
-		dstIP := net.IP(pkt[16:20])
-
-		switch proto {
-		case 6:
-			if len(pkt) < ihl+4 {
-				continue
-			}
-			dstPort := int(pkt[ihl+2])<<8 | int(pkt[ihl+3])
-			target := net.JoinHostPort(dstIP.String(), strconv.Itoa(dstPort))
-			go func(t string) {
-				st, err := dialer.Open(t)
-				if err != nil {
-					return
-				}
-				defer st.Close()
-				io.Copy(st, st)
-			}(target)
-		case 17:
-		}
-	}
 }

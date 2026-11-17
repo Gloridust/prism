@@ -2,8 +2,6 @@ package main
 
 import (
 	"fmt"
-	"io"
-	"log"
 	"net"
 	"os/exec"
 	"strconv"
@@ -76,6 +74,13 @@ func (t *tunDevice) Close() error {
 func (t *tunDevice) Name() string { return t.name }
 
 func configureTUN(dev *tunDevice, addr, _ string) error {
+	ip, _, err := net.ParseCIDR(addr)
+	if err != nil {
+		ip = net.ParseIP(addr)
+		if ip == nil {
+			return fmt.Errorf("invalid TUN address: %s", addr)
+		}
+	}
 	cmds := [][]string{
 		{"ip", "addr", "add", addr, "dev", dev.Name()},
 		{"ip", "link", "set", dev.Name(), "up"},
@@ -86,6 +91,7 @@ func configureTUN(dev *tunDevice, addr, _ string) error {
 			return fmt.Errorf("%s: %s: %w", cmd[0], out, err)
 		}
 	}
+	_ = ip
 	return nil
 }
 
@@ -107,46 +113,4 @@ func removeDefaultRoute(serverHost, _ string) {
 	exec.Command("ip", "route", "del", "0.0.0.0/1").Run()
 	exec.Command("ip", "route", "del", "128.0.0.0/1").Run()
 	exec.Command("ip", "route", "del", serverHost+"/32").Run()
-}
-
-func tunRouter(dev *tunDevice, dialer *Dialer) {
-	buf := make([]byte, tunMTU+4)
-	for {
-		n, err := dev.Read(buf)
-		if err != nil {
-			if err == io.EOF {
-				return
-			}
-			log.Printf("tun read: %v", err)
-			return
-		}
-		if n < 20 {
-			continue
-		}
-		pkt := buf[:n]
-		if pkt[0]>>4 != 4 {
-			continue
-		}
-		ihl := int(pkt[0]&0x0f) * 4
-		proto := pkt[9]
-		dstIP := net.IP(pkt[16:20])
-
-		switch proto {
-		case 6: // TCP
-			if len(pkt) < ihl+4 {
-				continue
-			}
-			dstPort := int(pkt[ihl+2])<<8 | int(pkt[ihl+3])
-			target := net.JoinHostPort(dstIP.String(), strconv.Itoa(dstPort))
-			go func(t string) {
-				st, err := dialer.Open(t)
-				if err != nil {
-					return
-				}
-				defer st.Close()
-				io.Copy(st, st)
-			}(target)
-		case 17: // UDP — handled via UDP relay
-		}
-	}
 }
