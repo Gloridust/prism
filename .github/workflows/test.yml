@@ -25,8 +25,9 @@ jobs:
             'PRISM_ROOT_TEST=1 qemu-mipsel /tmp/prism-test-mipsle -test.v -test.run "TestLinuxTUNDevice|TestRealTUNWithRealPrism" -test.timeout 120s'
       - name: Real /dev/net/tun + real Prism e2e (native x86-64)
         run: |
+          go test -c -o /tmp/prism-test-amd64 ./test/
           sudo unshare --net bash -c \
-            'PRISM_ROOT_TEST=1 go test -v -run "TestLinuxTUNDevice|TestRealTUNWithRealPrism" -count=1 -timeout 60s ./test/'
+            'PRISM_ROOT_TEST=1 /tmp/prism-test-amd64 -test.v -test.run "TestLinuxTUNDevice|TestRealTUNWithRealPrism" -test.timeout 60s'
       - name: ECH live tests
         run: PRISM_LIVE_TEST=1 go test -v -run "TestECHHandshakeLive|TestECHWithPrismSession" -count=1 -timeout 60s ./test/ ./pkg/prism/
       - name: Cross-compile router (mipsle)
@@ -64,5 +65,6 @@ jobs:
       - name: Wintun adapter test (real Windows)
         shell: pwsh
         run: |
+          Copy-Item wintun.dll cmd\prism-client\
           $env:PRISM_ROOT_TEST="1"
           go test -v -run "TestWintunAdapterCreate|TestWintunOpenTUN" -count=1 -timeout 60s ./cmd/prism-client/
