@@ -330,7 +330,6 @@ func relayTCP(clientConn net.Conn, buffered []byte, dest string) {
 	go func() { io.Copy(d, clientConn); done <- struct{}{} }()
 	go func() { io.Copy(clientConn, d); done <- struct{}{} }()
 	<-done
-	<-done
 }
 
 // TestStealModeEndToEnd verifies that:
@@ -371,6 +370,10 @@ func TestStealModeEndToEnd(t *testing.T) {
 			go func() {
 				defer c.Close()
 				c.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nSTOLEN!"))
+				if tc, ok := c.(*net.TCPConn); ok {
+					tc.CloseWrite()
+				}
+				io.Copy(io.Discard, c)
 			}()
 		}
 	}()
