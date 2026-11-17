@@ -1,0 +1,67 @@
+name: Cross-platform TUN + Prism tests
+
+on:
+  push:
+    branches: [main, feat/*]
+  pull_request:
+    branches: [main]
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+      - name: Unit tests with race detector
+        run: go test -race -count=1 -timeout 120s ./...
+      - name: Real /dev/net/tun + real Prism e2e (mipsle via QEMU)
+        run: |
+          sudo apt-get install -y qemu-user
+          GOOS=linux GOARCH=mipsle GOMIPS=softfloat go test -c -o /tmp/prism-test-mipsle ./test/
+          unshare --net --map-root-user bash -c \
+            'PRISM_ROOT_TEST=1 qemu-mipsel /tmp/prism-test-mipsle -test.v -test.run "TestLinuxTUNDevice|TestRealTUNWithRealPrism" -test.timeout 120s'
+      - name: Real /dev/net/tun + real Prism e2e (native x86-64)
+        run: |
+          unshare --net --map-root-user bash -c \
+            'PRISM_ROOT_TEST=1 go test -v -run "TestLinuxTUNDevice|TestRealTUNWithRealPrism" -count=1 -timeout 60s ./test/'
+      - name: ECH live tests
+        run: PRISM_LIVE_TEST=1 go test -v -run "TestECHHandshakeLive|TestECHWithPrismSession" -count=1 -timeout 60s ./test/ ./pkg/prism/
+      - name: Cross-compile router (mipsle)
+        run: GOOS=linux GOARCH=mipsle GOMIPS=softfloat go build -o /dev/null ./cmd/prism-client/
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+      - name: Unit tests
+        run: go test -race -count=1 -timeout 120s ./...
+      - name: Real macOS utun device test
+        run: sudo PRISM_ROOT_TEST=1 go test -v -run "TestDarwinUTunDevice" -count=1 -timeout 60s ./test/
+      - name: Real macOS utun + real Prism e2e
+        run: sudo PRISM_ROOT_TEST=1 go test -v -run "TestDarwinUTunWithRealPrism" -count=1 -timeout 60s ./test/
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+      - name: Download wintun.dll
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile wintun.zip
+          Expand-Archive wintun.zip -DestinationPath wintun
+          Copy-Item wintun\wintun\bin\amd64\wintun.dll .
+      - name: Unit tests
+        run: go test -race -count=1 -timeout 120s ./...
+      - name: Wintun adapter test (real Windows)
+        shell: pwsh
+        run: |
+          $env:PRISM_ROOT_TEST="1"
+          go test -v -run "TestWintunAdapterCreate|TestWintunOpenTUN" -count=1 -timeout 60s ./cmd/prism-client/
