@@ -17,5 +17,19 @@
   "panel_listen": "127.0.0.1:9797",
   "pool_size": 4,
   "shaping": "none",
+
+  "_steal": "REALITY 风格主动探测抗性。服务端也需开启 steal。",
+  "steal": false,
+
+  "_transport": "载波传输层：\"\"(默认)=裸 TLS，\"ws\"=WebSocket over TLS（穿 CDN 时用）。ws_path 须与服务端 ws_path 一致。",
+  "transport": "",
+  "ws_path": "",
+
+  "_iat_max_ms": "帧间到达时间抖动(毫秒)，模糊时序指纹。0=关闭。建议 20-50。",
+  "iat_max_ms": 0,
+
+  "_max_lifetime_sec": "载波会话最大存活秒数。到期后旧会话渐次排空、新流用新会话。0=不限。",
+  "max_lifetime_sec": 0,
+
   "auto_connect": true
 }

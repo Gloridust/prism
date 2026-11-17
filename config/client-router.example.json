@@ -14,5 +14,10 @@
   "mode": "router",
   "socks_listen": "127.0.0.1:1080",
   "pool_size": 4,
-  "shaping": "none"
+  "shaping": "none",
+  "steal": false,
+  "transport": "",
+  "ws_path": "",
+  "iat_max_ms": 0,
+  "max_lifetime_sec": 0
 }

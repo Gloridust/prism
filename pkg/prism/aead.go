@@ -48,22 +48,30 @@ func NewAEAD(key []byte) (AEAD, error) {
 
 // aeadCipher adapts any stdlib-style cipher.AEAD (AES-GCM or ChaCha20-Poly1305,
 // both 12-byte nonce / 16-byte tag) to prism's counter-nonce AEAD interface.
-type aeadCipher struct{ g cipher.AEAD }
+// The nonce field is reused across calls to avoid a 12-byte heap escape per
+// frame; callers MUST ensure single-threaded access per instance (the Session
+// guarantees this: sendAEAD is under wmu, recvAEAD is readLoop-only).
+type aeadCipher struct {
+	g     cipher.AEAD
+	nonce [nonceSize]byte
+}
 
-func nonceOf(counter uint64) []byte {
-	var n [nonceSize]byte
-	// 4 leading zero bytes + 64-bit big-endian counter. Each direction uses a
-	// unique key, so starting every stream's counter at 0 is safe.
-	binary.BigEndian.PutUint64(n[4:], counter)
-	return n[:]
+func (a *aeadCipher) setNonce(counter uint64) {
+	a.nonce[0] = 0
+	a.nonce[1] = 0
+	a.nonce[2] = 0
+	a.nonce[3] = 0
+	binary.BigEndian.PutUint64(a.nonce[4:], counter)
 }
 
 func (a *aeadCipher) Seal(counter uint64, plaintext, ad []byte) []byte {
-	return a.g.Seal(nil, nonceOf(counter), plaintext, ad)
+	a.setNonce(counter)
+	return a.g.Seal(nil, a.nonce[:], plaintext, ad)
 }
 
 func (a *aeadCipher) Open(counter uint64, ciphertext, ad []byte) ([]byte, error) {
-	return a.g.Open(nil, nonceOf(counter), ciphertext, ad)
+	a.setNonce(counter)
+	return a.g.Open(nil, a.nonce[:], ciphertext, ad)
 }
 
 func (a *aeadCipher) Overhead() int { return a.g.Overhead() }

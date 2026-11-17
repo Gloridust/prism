@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/ecdh"
 	"errors"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -24,11 +25,16 @@ import (
 // two requests racing on the same dead slot still dial only once.
 type Dialer struct {
 	server    string
+	sni       string
 	tlsCfg    *utls.Config
 	serverPub *ecdh.PublicKey
 	cred      prism.Credential
 	aead      prism.AEADFactory
-	shaping   string
+	shaping     string
+	stealKey    []byte // non-nil in steal mode
+	wsPath      string // non-empty = WebSocket transport
+	maxLifetime time.Duration
+	iatMaxMs    int
 
 	pool []*carrier
 
@@ -56,20 +62,42 @@ func NewDialer(c *ClientConfig, cred *prism.Credential) (*Dialer, error) {
 	for i := range pool {
 		pool[i] = &carrier{}
 	}
+	var stealKey []byte
+	skipVerify := c.AllowInsecure
+	if c.Steal {
+		stealKey = prism.StealKey(cred.PSK)
+		skipVerify = true // outer TLS cert is ephemeral; real auth is the inner Prism handshake
+	}
+	var wsPath string
+	if c.Transport == "ws" {
+		wsPath = c.WSPath
+		if wsPath == "" {
+			wsPath = "/_prism/ws"
+		}
+	}
+	var maxLife time.Duration
+	if c.MaxLifetimeSec > 0 {
+		maxLife = time.Duration(c.MaxLifetimeSec) * time.Second
+	}
 	return &Dialer{
 		server:    c.Server,
+		sni:       c.SNI,
 		serverPub: pub,
 		cred:      *cred,
 		aead:      aead,
 		shaping:   c.Shaping,
-		pool:      pool,
+		stealKey:    stealKey,
+		wsPath:      wsPath,
+		maxLifetime: maxLife,
+		iatMaxMs:    c.IATMaxMs,
+		pool:        pool,
 		// uTLS Config carries only the fields we steer (SNI/ALPN/verify); the
 		// ClientHello itself is dictated by the mimicked browser profile below,
 		// which is the whole point — Go's native crypto/tls ClientHello is
 		// fingerprintable, so we present Chrome's instead.
 		tlsCfg: &utls.Config{
 			ServerName:         c.SNI,
-			InsecureSkipVerify: c.AllowInsecure, // #nosec G402 - gated by config, testing/self-signed
+			InsecureSkipVerify: skipVerify, // #nosec G402 - gated by config or steal mode
 			MinVersion:         utls.VersionTLS12,
 			NextProtos:         []string{"http/1.1"},
 		},
@@ -84,7 +112,7 @@ func sessionDead(s *prism.Session) bool {
 	case <-s.Done():
 		return true
 	default:
-		return false
+		return s.Draining()
 	}
 }
 
@@ -101,18 +129,50 @@ func (d *Dialer) dialSession() (*prism.Session, error) {
 	// against an HTTP/1.1-only site. The prism inner handshake then runs
 	// unchanged on top of the established TLS stream.
 	tlsConn := utls.UClient(raw, d.tlsCfg, utls.HelloChrome_Auto)
+	if d.stealKey != nil {
+		// Steal mode: embed an HMAC tag in the TLS session_id so the server
+		// can distinguish us from probers before completing TLS. Build the
+		// ClientHello first, inject the marker, then send it.
+		if err := tlsConn.BuildHandshakeState(); err != nil {
+			raw.Close()
+			return nil, err
+		}
+		sid := tlsConn.HandshakeState.Hello.SessionId
+		if len(sid) >= 32 {
+			prism.EmbedStealMarker(sid, d.stealKey)
+		}
+	}
 	tlsConn.SetDeadline(time.Now().Add(10 * time.Second))
 	if err := tlsConn.Handshake(); err != nil {
 		raw.Close()
 		return nil, err
 	}
-	keys, err := prism.ClientHandshake(tlsConn, d.serverPub, d.cred, d.aead)
+
+	// Choose transport: raw TLS stream or WebSocket inside TLS.
+	var transport io.ReadWriteCloser = tlsConn
+	if d.wsPath != "" {
+		ws, err := prism.WSClientUpgrade(tlsConn, d.sni, d.wsPath)
+		if err != nil {
+			raw.Close()
+			return nil, err
+		}
+		transport = ws
+	}
+
+	keys, err := prism.ClientHandshake(transport, d.serverPub, d.cred, d.aead)
 	if err != nil {
 		raw.Close()
 		return nil, err
 	}
 	tlsConn.SetDeadline(time.Time{})
-	return prism.NewSession(tlsConn, keys, true, prism.WithShaping(d.shaping))
+	opts := []prism.Option{prism.WithShaping(d.shaping)}
+	if d.maxLifetime > 0 {
+		opts = append(opts, prism.WithMaxLifetime(d.maxLifetime))
+	}
+	if d.iatMaxMs > 0 {
+		opts = append(opts, prism.WithIAT(d.iatMaxMs))
+	}
+	return prism.NewSession(transport, keys, true, opts...)
 }
 
 // nextSlot returns the next pool slot round-robin (brief lock, no dial).

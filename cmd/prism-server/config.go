@@ -48,8 +48,25 @@ type Config struct {
 	// built-in default (1024); a negative value means unlimited.
 	MaxStreams int `json:"max_streams"`
 
+	// Steal enables REALITY-style active probing resistance. When set, the
+	// server inspects raw ClientHellos: authenticated clients (HMAC tag in
+	// session_id derived from PSK) are handled as Prism carriers; everyone
+	// else has their TCP connection relayed transparently to Dest, so a prober
+	// sees the real site's certificate. Mutually exclusive with ACME/cert_file
+	// (steal generates an ephemeral cert for authenticated clients; the real
+	// target's cert is what probers see).
+	Steal *StealConfig `json:"steal"`
+
 	// Anti-replay / freshness.
 	WindowSeconds int `json:"window_seconds"` // default 120
+
+	// WSPath enables WebSocket transport at the given path (e.g. "/_prism/ws").
+	// When set, clients that upgrade to WebSocket on this path run the Prism
+	// handshake inside the WS stream, letting the carrier traverse CDN infra
+	// (Cloudflare, etc.) that only proxies HTTP. Regular TLS carriers and cover
+	// traffic coexist on the same port — only the exact path triggers the
+	// upgrade. Leave empty to disable.
+	WSPath string `json:"ws_path"`
 
 	// Cover: what an unauthenticated visitor (or active prober) sees.
 	// Exactly one is used, in this order: Backend, then StaticDir, then a

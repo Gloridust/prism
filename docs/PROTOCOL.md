@@ -218,8 +218,11 @@ inner（解密后的内层帧）：
   {64,256,576,1280,4096,16000}，掩盖内层小记录（隧道内的 TLS ClientHello、DNS 查询、
   ACK 等）的真实长度，削弱 **T4/T6** 的长度相关性。填充字节在 AEAD 之内、收到即忽略，
   故整形是**纯本地、按方向**的选择，无需两端协商；满载帧超过最大档位不填充，不损吞吐。
-- **时序整形（IAT）**：发送时序抖动尚未实现（吞吐代价大），列为后续。
-- 默认 `shaping:"none"`（直通）。
+- **时序整形（IAT，已实现，`iat_max_ms`）**：对小于 1280 字节的 DATA 帧，在获取写锁
+  之前注入一个 `[0, iat_max_ms)` 毫秒的随机延迟，模糊帧间到达时间的周期性特征，
+  削弱 **T6** 的时序相关性。大帧（≥1280B，即批量传输）不受影响，仅对交互式小包
+  生效，实际吞吐代价可忽略。建议值 20–50 ms。
+- 默认 `shaping:"none"`（直通），IAT 默认关闭（`iat_max_ms:0`）。
 
 ### 7.4 队头阻塞的消除
 
@@ -248,6 +251,52 @@ keepalive 可能数分钟才感知）。这是 WireGuard/QUIC 的持久保活 + 
 ——给原本无连接的 UDP 附加了有序可靠性，是把数据报塞进单条载波的通行取舍；对
 DNS、QUIC、实时音视频等足够可用。空闲 60s 的 UDP 关联自动回收。
 
+### 7.7 REALITY 风格主动探测抗性（steal 模式）
+
+启用 steal 后，服务器**不终止 TLS**，而是在 TCP 层窥视原始 ClientHello：
+
+1. 服务器从 PSK 派生 `stealKey = HKDF-SHA256(psk, "prism-steal")`。
+2. 客户端构建 Chrome ClientHello（uTLS），取 `session_id[0:32]`，把 `HMAC-SHA256(stealKey, session_id[0:24])[0:8]` 写入 `session_id[24:32]`。
+3. 服务器读前 512 字节，解析出 session_id，用每个合法凭据对应的 stealKey 逐一验证 HMAC 标记。
+4. **匹配** → 自行完成 TLS（用内存中的临时自签证书）→ 正常进入 Prism 握手。
+5. **不匹配** → TCP 透明转发到配置的真实目标站（`steal.dest`），探测者看到的是**真实目标站点的证书和内容**。
+
+与 REALITY 的区别：REALITY 借用第三方站点的 TLS，Prism steal 只借其 TCP 流量做回落，
+TLS 终止始终在 Prism 侧完成。这避免了 REALITY 的 MITM 透传设计，同时保持了相同级别的
+主动探测抗性——非法客户端看到的就是一个正常的第三方网站。
+
+### 7.8 WebSocket 载波传输
+
+配置 `transport:"ws"` + `ws_path` 后，客户端在 TLS 之上先完成 RFC 6455 升级握手
+（HTTP/1.1 101 Switching Protocols），然后在 WebSocket 二进制帧内运行 Prism 握手与数据面。
+
+- 实现为最小 RFC 6455（仅二进制帧、ping/pong、close），约 250 行，无外部依赖。
+- 客户端帧按规范做掩码（mask），服务端帧不掩码。
+- 用途：穿透 Cloudflare 等只代理 HTTP 的 CDN——对 CDN 来说这只是一个普通的 WebSocket 长连接。
+- 未启用 WS 时，载波直接在 TLS 流上运行，无额外开销。
+
+### 7.9 HTTP/2 cover
+
+服务端 TLS 配置的 ALPN 列表为 `["h2", "http/1.1"]`。当 TLS 协商到 h2 时：
+
+- **非 Prism 访客（浏览器/探测器）**：使用 `x/net/http2.Server.ServeConn()` 提供完整 HTTP/2 cover 页面，
+  与真实网站无异。
+- **Prism 客户端**：uTLS 以 `http/1.1` ALPN 连接，不走 h2，直接进入 Prism 握手。
+- **WebSocket 客户端**：WS 升级是 HTTP/1.1，同样不走 h2。
+
+效果：主动探测器用浏览器（默认 h2）访问时看到的是一个支持 HTTP/2 的真实网站，
+更难与仅支持 HTTP/1.1 的代理区分。
+
+### 7.10 载波会话轮换
+
+配置 `max_lifetime_sec` 后，每条载波会话在存活超过指定时间后进入「排空」状态：
+
+- 新建流（`OpenStream`/`OpenUDP`）返回 `ErrSessionDraining`，客户端的连接池自动在下一个池槽重拨新会话。
+- 已有流继续运行直到自然结束，不被强制中断。
+- `sessionDead()` 把 draining 的会话视为不可用，触发重拨。
+
+目的：定期轮换 TLS 连接，避免单条连接存活过久成为统计特征；与真实浏览器的连接行为更一致。
+
 ---
 
 ## 8. 各威胁如何被应对
@@ -255,11 +304,11 @@ DNS、QUIC、实时音视频等足够可用。空闲 60s 的 UDP 关联自动回
 | 威胁 | 机制 |
 |---|---|
 | T1 被动 DPI | 外层是对自有域名的真实 TLS 1.3；Prism 首包无明文结构 |
-| T2 主动探测 | 无有效凭据 → 同机真实 Web 回落，探测者只见一个正常网站 |
+| T2 主动探测 | 无有效凭据 → 同机真实 Web 回落；steal 模式下 TCP 透传到真实目标站（§7.7） |
 | T3 SNI/证书 | 用**自有域名 + 真实证书**，SNI 就是你自己的正常域名；可叠加 ECH |
 | T4 TLS-in-TLS | 数据面不套内层 TLS，用自有 AEAD 分帧 + 整形，无内层握手突发 |
 | T5 熵分析 | 高熵字节只出现在载波本就期望高熵处（TLS 记录体）；无裸随机段 |
-| T6 流量分析 | profile 整形 + 多路复用长连接，贴近真实应用的长度/时序分布 |
+| T6 流量分析 | profile 整形 + IAT 时序抖动（§7.3）+ 多路复用长连接 + 载波轮换（§7.10），贴近真实应用的长度/时序/连接分布 |
 | T7 重放 | 一次性 `E_pub` + 新鲜度窗口 + 重放集合 |
 | T8 内网 SSRF | 出口默认拒绝私网/环回/链路本地(含云元数据)/CGNAT 目标；解析后只连已放行公网 IP，杜绝 DNS 重绑定 |
 
@@ -270,7 +319,7 @@ DNS、QUIC、实时音视频等足够可用。空闲 60s 的 UDP 关联自动回
 1. **握手是自研、未经审计的构造**。它刻意对齐 Noise_IKpsk2 的形态，便于生产替换为经过验证的 Noise 库
    （如 flynn/noise）。**面对高风险对手上线前，请做独立密码学评审**，或直接换成成熟 Noise 实现。
 2. **TLS 指纹**：已接 uTLS（`cmd/prism-client/dialer.go`，`utls.HelloChrome_Auto`）让客户端载波握手对齐
-   Chrome 的 ClientHello，SNI/ALPN 不变（http/1.1）；服务端仍用标准 `crypto/tls` 终止（指纹是客户端侧问题）。
+   Chrome 的 ClientHello，SNI/ALPN 不变（http/1.1）；服务端 ALPN 已启用 h2（§7.9），用标准 `crypto/tls` 终止（指纹是客户端侧问题）。
    残留风险：`HelloChrome_Auto` 只对齐到 uTLS 打包时的某个稳定版 Chrome，需随浏览器版本升级 uTLS；uTLS 指纹本身
    也在被研究。ECH 尚未实现。
 3. **自有域名会被枚举/封锁**：一旦域名/IP 被发现即可被墙。运维上要做到域名不复用、不公开关联，必要时上 CDN/域前置。
@@ -292,8 +341,14 @@ DNS、QUIC、实时音视频等足够可用。空闲 60s 的 UDP 关联自动回
 - [x] uTLS 指纹对齐（Chrome ClientHello）；ECH 待做
 - [x] ChaCha20-Poly1305 可选算法（路由器无 AES-NI）
 - [x] ACME/Let's Encrypt 证书自动签发（TLS-ALPN-01）
+- [x] REALITY 风格主动探测抗性（steal 模式，session_id HMAC 标记）
+- [x] WebSocket 载波传输（穿透 Cloudflare 等 CDN，`transport: "ws"`）
+- [x] HTTP/2 cover（h2 ALPN + `x/net/http2.ServeConn`）
+- [x] 载波会话最大存活时间 + 渐次排空（`max_lifetime_sec`）
+- [x] 帧间到达时间抖动（`iat_max_ms`，模糊时序指纹）
+- [x] 会话级 buffer pool（消除每帧堆分配）
 - [ ] profile 整形库（网页/视频/下载画像）
 - [ ] 握手替换为经审计的 Noise_IKpsk2 实现
-- [ ] UDP relay（SOCKS UDP ASSOCIATE / QUIC 直穿）
+- [x] UDP relay（SOCKS UDP ASSOCIATE + UDP over stream）
 - [ ] 订阅分发与密钥轮换、per-CID 配额与审计
 - [ ] 桌面原生 TUN 全局模式

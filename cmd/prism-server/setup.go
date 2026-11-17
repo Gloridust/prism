@@ -48,10 +48,7 @@ func buildTLSConfig(c *Config) (*tls.Config, error) {
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS12,
-		// Advertise only HTTP/1.1: the cover fallback is an HTTP/1.1 server, and
-		// a consistent ALPN avoids the "ALPN says h2 but traffic isn't h2" tell.
-		// Production hardening: serve real h2/h3 cover and match it here.
-		NextProtos: []string{"http/1.1"},
+		NextProtos:   []string{"h2", "http/1.1"},
 	}, nil
 }
 
@@ -82,10 +79,7 @@ func acmeTLSConfig(a *ACMEConfig) (*tls.Config, error) {
 		m.Client = &acme.Client{DirectoryURL: a.DirectoryURL}
 	}
 	tc := m.TLSConfig()
-	// autocert advertises h2+http/1.1+acme-tls/1; we serve only HTTP/1.1 cover,
-	// so drop h2 to keep ALPN consistent with the carrier/cover while preserving
-	// the acme-tls/1 entry autocert needs to answer the challenge handshake.
-	tc.NextProtos = []string{"http/1.1", acme.ALPNProto}
+	tc.NextProtos = []string{"h2", "http/1.1", acme.ALPNProto}
 	tc.MinVersion = tls.VersionTLS12
 	log.Printf("ACME enabled for %v (cache %s); first handshake per domain fetches a cert via TLS-ALPN-01", a.Domains, cacheDir)
 	return tc, nil

@@ -48,10 +48,39 @@ func main() {
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
-	tlsCfg, err := buildTLSConfig(cfg)
-	if err != nil {
-		log.Fatalf("tls: %v", err)
+
+	stealMode := cfg.Steal != nil && cfg.Steal.Dest != ""
+	var tlsCfg *tls.Config
+	if stealMode {
+		// In steal mode the server presents an ephemeral self-signed cert only
+		// to authenticated clients (they skip verification; real auth is the
+		// inner Prism handshake). Probers never see it — their connection is
+		// relayed to the real target site.
+		sni := cfg.Steal.Dest
+		if len(cfg.Steal.ServerNames) > 0 {
+			sni = cfg.Steal.ServerNames[0]
+		}
+		// Strip port from SNI if present.
+		if h, _, err := net.SplitHostPort(sni); err == nil {
+			sni = h
+		}
+		cert, err := selfSigned(sni)
+		if err != nil {
+			log.Fatalf("steal self-signed cert: %v", err)
+		}
+		tlsCfg = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+			NextProtos:   []string{"h2", "http/1.1"},
+		}
+	} else {
+		var err error
+		tlsCfg, err = buildTLSConfig(cfg)
+		if err != nil {
+			log.Fatalf("tls: %v", err)
+		}
 	}
+
 	aeads, err := prism.AEADFactoriesByName(cfg.Ciphers)
 	if err != nil {
 		log.Fatalf("ciphers: %v", err)
@@ -76,7 +105,11 @@ func main() {
 		shaping:      cfg.Shaping,
 		maxStreams:   maxStreams,
 		cfgPath:      *cfgPath,
+		wsPath:       cfg.WSPath,
 		active:       make(map[*sessConn]struct{}),
+	}
+	if stealMode {
+		s.stealDest = cfg.Steal.Dest
 	}
 
 	// SIGHUP hot-reloads credentials and kicks any session whose credential was
@@ -97,6 +130,11 @@ func main() {
 	if len(ciphers) == 0 {
 		ciphers = []string{prism.CipherAES256GCM}
 	}
+	handler := s.handle
+	if stealMode {
+		handler = s.handleSteal
+		log.Printf("STEAL mode: authenticated → Prism, others → %s", s.stealDest)
+	}
 	log.Printf("listening on %s with %d credential(s), ciphers %v", cfg.Listen, len(creds), ciphers)
 	for {
 		conn, err := ln.Accept()
@@ -104,7 +142,7 @@ func main() {
 			log.Printf("accept: %v", err)
 			continue
 		}
-		go s.handle(conn)
+		go handler(conn)
 	}
 }
 
@@ -120,6 +158,8 @@ type server struct {
 	shaping      string              // egress length-shaping profile
 	maxStreams   int                 // per-carrier stream cap (0 = unlimited)
 	cfgPath      string              // for SIGHUP reload
+	stealDest    string              // steal mode: relay destination (e.g. "www.microsoft.com:443")
+	wsPath       string              // WebSocket upgrade path (e.g. "/_prism/ws"); empty = disabled
 
 	credsMu sync.RWMutex // guards creds (reloadable)
 	actMu   sync.Mutex   // guards active
@@ -192,9 +232,12 @@ func (s *server) handle(raw net.Conn) {
 	s.credsMu.RUnlock()
 	keys, cred, consumed, err := prism.ServerHandshake(tlsConn, s.priv, creds, s.replay, s.window, s.aeads...)
 	if err != nil {
-		// Not an authenticated client -> behave exactly like a web server.
 		_ = tlsConn.SetReadDeadline(time.Time{})
-		serveCover(tlsConn, consumed, s.cover)
+		if s.wsPath != "" {
+			s.serveCoverOrWS(tlsConn, consumed)
+		} else {
+			serveCover(tlsConn, consumed, s.cover)
+		}
 		return
 	}
 	_ = tlsConn.SetReadDeadline(time.Time{})

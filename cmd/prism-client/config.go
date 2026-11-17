@@ -15,7 +15,25 @@ type ClientConfig struct {
 	ServerPublicKey string `json:"server_public_key"` // base64 X25519
 	ID              string `json:"id"`                // base64 4 bytes
 	PSK             string `json:"psk"`               // base64 32 bytes
-	AllowInsecure   bool   `json:"allow_insecure"`    // skip cert verify (testing/self-signed)
+	AllowInsecure bool `json:"allow_insecure"` // skip cert verify (testing/self-signed)
+
+	// Steal enables REALITY-style active probing resistance. When true, the
+	// client embeds an HMAC tag (derived from the PSK) in the TLS session_id
+	// so the server can distinguish it from probers before completing TLS.
+	// Implies allow_insecure (the outer TLS cert is ephemeral; real auth is
+	// the Prism inner handshake).
+	Steal bool `json:"steal"`
+
+	// Transport selects the carrier transport layer:
+	//   ""    / "tls" : raw TLS (default, current behaviour).
+	//   "ws"         : WebSocket over TLS — the Prism handshake runs inside a
+	//                  WS binary stream, letting the carrier traverse CDN infra
+	//                  (Cloudflare, etc.) that only proxies HTTP.
+	Transport string `json:"transport"`
+
+	// WSPath is the HTTP path the server exposes for WebSocket upgrade (must
+	// match the server's ws_path). Only used when transport="ws".
+	WSPath string `json:"ws_path"`
 
 	// Cipher selects the carrier AEAD: "aes-256-gcm" (default) or
 	// "chacha20-poly1305". Routers without AES-NI (MIPS / older ARM) should use
@@ -28,6 +46,11 @@ type ClientConfig struct {
 	// fixed sizes to mask inner record lengths; "" / "none" disables it (default).
 	Shaping string `json:"shaping"`
 
+	// IATMaxMs enables inter-arrival time shaping: each small outgoing frame is
+	// preceded by a random delay of 0–IATMaxMs milliseconds. This blurs per-frame
+	// timing patterns that could distinguish Prism from ordinary HTTPS. 0 disables.
+	IATMaxMs int `json:"iat_max_ms"`
+
 	// Mode selects the deployment shape:
 	//   "router"  : SOCKS5 only, for OpenWrt + Nikki to route into.
 	//   "desktop" : SOCKS5 + HTTP proxy + auto system proxy + control panel.
@@ -38,6 +61,13 @@ type ClientConfig struct {
 	PanelListen string `json:"panel_listen"` // default 127.0.0.1:9797 (desktop)
 	PoolSize    int    `json:"pool_size"`    // carrier connections, default 4
 	AutoConnect *bool  `json:"auto_connect"` // desktop: set system proxy on start (default true)
+
+	// MaxLifetimeSec caps each carrier session's lifetime in seconds. After this
+	// duration the session drains: existing streams continue, but new streams use
+	// a fresh session. Rotating carriers limits the amount of traffic under one
+	// set of session keys and masks long-lived connection patterns. 0 (default)
+	// means no limit.
+	MaxLifetimeSec int `json:"max_lifetime_sec"`
 }
 
 func (c *ClientConfig) defaults() {

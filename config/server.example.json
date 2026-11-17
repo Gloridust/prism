@@ -40,7 +40,13 @@
 
   "window_seconds": 120,
 
-  "_cover": "未通过鉴权的访问者（含主动探测）看到的内容。三选一，优先级 Backend > StaticDir > 内置占位页。强烈建议反代到一个真实网站。",
+  "_steal": "REALITY 风格的主动探测抗性。启用后，服务器检查原始 ClientHello 中的 HMAC 标记：匹配则走 Prism，不匹配则将 TCP 透明转发到 dest。探测者看到的是真实目标站点的证书。与 acme/cert_file 互斥。",
+  "steal": null,
+
+  "_ws_path": "WebSocket 传输路径。设置后，客户端可通过 wss://…/该路径 升级 WebSocket 在 WS 内跑 Prism，以穿透只代理 HTTP 的 CDN（如 Cloudflare）。留空则不开启。",
+  "ws_path": "",
+
+  "_cover": "未通过鉴权的访问者（含主动探测）看到的内容。三选一，优先级 Backend > StaticDir > 内置占位页。强烈建议反代到一个真实网站。cover 现已支持 HTTP/2（h2 ALPN）。",
   "cover_backend": "http://127.0.0.1:8080",
   "cover_static_dir": ""
 }

@@ -1,11 +1,18 @@
 package main
 
 import (
+	"crypto/tls"
+	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"time"
+
+	"golang.org/x/net/http2"
+
+	"github.com/gloridust/prism/pkg/prism"
 )
 
 // prefixConn re-attaches bytes already consumed during the failed Prism
@@ -71,15 +78,92 @@ func coverHandler(c *Config) http.Handler {
 	})
 }
 
-// serveCover hands a fallen-back connection to a throwaway HTTP server.
+// serveCover hands a fallen-back connection to a throwaway HTTP server. If the
+// TLS ALPN negotiated "h2" it speaks HTTP/2 (via x/net/http2) so the cover site
+// looks like a modern web server to browsers and CDN health-checks.
 func serveCover(conn net.Conn, consumed []byte, h http.Handler) {
 	pc := &prefixConn{Conn: conn, pre: consumed}
+	if tc, ok := conn.(*tls.Conn); ok && tc.ConnectionState().NegotiatedProtocol == "h2" {
+		h2s := &http2.Server{}
+		h2s.ServeConn(pc, &http2.ServeConnOpts{Handler: h})
+		return
+	}
 	srv := &http.Server{
 		Handler:      h,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 60 * time.Second,
 	}
 	l := newOneShotListener(pc)
-	// Serve returns when the connection is closed/idle; it blocks until then.
 	srv.Serve(l)
+}
+
+// serveCoverOrWS is like serveCover but intercepts WebSocket upgrades to
+// wsPath and runs a Prism session on the WebSocket stream. HTTP/2 connections
+// are served via http2.Server.ServeConn (WS upgrades only come over HTTP/1.1).
+func (s *server) serveCoverOrWS(conn net.Conn, consumed []byte) {
+	pc := &prefixConn{Conn: conn, pre: consumed}
+
+	// HTTP/2 connections cannot carry WebSocket upgrades (the WS handshake is
+	// HTTP/1.1-only), so serve cover directly.
+	if tc, ok := conn.(*tls.Conn); ok && tc.ConnectionState().NegotiatedProtocol == "h2" {
+		h2s := &http2.Server{}
+		h2s.ServeConn(pc, &http2.ServeConnOpts{Handler: s.cover})
+		return
+	}
+
+	l := newOneShotListener(pc)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws := prism.WSServerUpgrade(w, r, s.wsPath)
+		if ws == nil {
+			s.cover.ServeHTTP(w, r)
+			return
+		}
+		l.Close()
+		defer ws.Close()
+		s.handleWSSession(ws)
+	})
+
+	srv := &http.Server{
+		Handler:      handler,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 60 * time.Second,
+	}
+	srv.Serve(l)
+}
+
+// handleWSSession runs the full Prism handshake and session on a WebSocket.
+func (s *server) handleWSSession(ws *prism.WSConn) {
+	_ = ws.SetReadDeadline(time.Now().Add(handshakeTimeout))
+	s.credsMu.RLock()
+	creds := s.creds
+	s.credsMu.RUnlock()
+	keys, cred, _, err := prism.ServerHandshake(ws, s.priv, creds, s.replay, s.window, s.aeads...)
+	if err != nil {
+		return
+	}
+	_ = ws.SetReadDeadline(time.Time{})
+
+	name := "?"
+	if cred != nil {
+		name = fmt.Sprintf("%x", cred.ID)
+	}
+	sess, err := prism.NewSession(ws, keys, false, prism.WithShaping(s.shaping), prism.WithMaxStreams(s.maxStreams))
+	if err != nil {
+		return
+	}
+	defer sess.Close()
+	if cred != nil {
+		rec := &sessConn{sess: sess, id: cred.ID}
+		s.register(rec)
+		defer s.unregister(rec)
+	}
+	log.Printf("client %s connected via WebSocket from %s", name, ws.RemoteAddr())
+
+	for {
+		st, err := sess.Accept()
+		if err != nil {
+			return
+		}
+		go s.handleStream(st)
+	}
 }

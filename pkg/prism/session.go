@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"math/rand"
 	"sync"
 	"time"
 )
@@ -70,6 +71,9 @@ var (
 	ErrStreamReset = errors.New("prism: stream reset by peer")
 	// ErrTooManyStreams is returned when a session is at its stream cap.
 	ErrTooManyStreams = errors.New("prism: too many concurrent streams")
+	// ErrSessionDraining is returned when new streams are rejected because
+	// the session's max lifetime has been reached and it is draining.
+	ErrSessionDraining = errors.New("prism: session draining (max lifetime reached)")
 )
 
 var be = binary.BigEndian
@@ -104,6 +108,15 @@ type Session struct {
 
 	buckets    []int // egress length-shaping buckets; nil = no shaping
 	maxStreams int   // cap on concurrent streams; 0 = unlimited
+	maxLife    time.Duration
+	draining   chan struct{} // closed when the session starts draining (max lifetime)
+	iatMaxMs   int          // inter-arrival time shaping: max random delay in ms (0 = off)
+
+	// Reusable buffers — eliminate per-frame heap allocations on the hot path.
+	// wplain/wout are protected by wmu; rct is readLoop-only.
+	wplain []byte // plaintext frame assembly
+	wout   []byte // wire output: [2-byte len][ciphertext]
+	rct    []byte // ciphertext read from wire
 }
 
 // Option configures a Session at construction.
@@ -125,6 +138,24 @@ func WithShaping(mode string) Option {
 // receive window) against a client that opens streams without bound.
 func WithMaxStreams(n int) Option {
 	return func(s *Session) { s.maxStreams = n }
+}
+
+// WithMaxLifetime sets a carrier session max lifetime. After d elapses, the
+// session enters a "draining" state: OpenStream/OpenUDP return
+// ErrSessionDraining, but existing streams continue until they close naturally.
+// The client dialer sees Draining() and redials a fresh session for new streams.
+// 0 means no limit (the default).
+func WithMaxLifetime(d time.Duration) Option {
+	return func(s *Session) { s.maxLife = d }
+}
+
+// WithIAT enables inter-arrival time shaping: each outgoing DATA frame is
+// preceded by a random delay of 0–maxMs milliseconds. Only frames whose
+// plaintext payload (before padding) is smaller than 1280 bytes are delayed,
+// so bulk throughput is unaffected. The jitter blurs per-frame timing patterns
+// that could distinguish Prism from ordinary HTTPS browsing. 0 disables it.
+func WithIAT(maxMs int) Option {
+	return func(s *Session) { s.iatMaxMs = maxMs }
 }
 
 // NewSession wraps a post-handshake carrier. initiator must be true on the
@@ -160,15 +191,23 @@ func NewSession(transport io.ReadWriteCloser, keys *Keys, initiator bool, opts .
 	} else {
 		s.nextID = 2 // disjoint id space, avoids collisions if both ever open
 	}
+	s.draining = make(chan struct{})
 	for _, o := range opts {
 		o(s)
 	}
 	go s.readLoop()
 	go s.keepalive()
+	if s.maxLife > 0 {
+		go s.drainTimer()
+	}
 	return s, nil
 }
 
 func (s *Session) writeFrame(cmd byte, id uint32, data []byte, pad int) error {
+	// IAT shaping: delay small DATA frames by a random interval to blur timing.
+	if s.iatMaxMs > 0 && cmd == cmdData && len(data) < 1280 {
+		time.Sleep(time.Duration(rand.Intn(s.iatMaxMs)) * time.Millisecond)
+	}
 	s.wmu.Lock()
 	defer s.wmu.Unlock()
 	if s.werr != nil {
@@ -177,17 +216,23 @@ func (s *Session) writeFrame(cmd byte, id uint32, data []byte, pad int) error {
 	if p := s.shapePad(hdrSize + len(data)); p > pad {
 		pad = p
 	}
-	plain := make([]byte, hdrSize+len(data)+pad)
+	plainLen := hdrSize + len(data) + pad
+	s.wplain = growBuf(s.wplain, plainLen)
+	plain := s.wplain[:plainLen]
 	plain[0] = cmd
 	be.PutUint32(plain[1:5], id)
 	be.PutUint16(plain[5:7], uint16(len(data)))
 	copy(plain[7:], data)
-	// Padding bytes stay zero; they are inside the AEAD so an observer cannot
-	// tell padding from payload. The length prefix below is the only cleartext.
+	// Zero the padding region; bytes are inside the AEAD so an observer cannot
+	// tell padding from payload.
+	clear(plain[hdrSize+len(data):])
+
 	ct := s.sendAEAD.Seal(s.sendCtr, plain, nil)
 	s.sendCtr++
 
-	out := make([]byte, 2+len(ct))
+	wireLen := 2 + len(ct)
+	s.wout = growBuf(s.wout, wireLen)
+	out := s.wout[:wireLen]
 	be.PutUint16(out[:2], uint16(len(ct)))
 	copy(out[2:], ct)
 	if _, err := s.transport.Write(out); err != nil {
@@ -195,6 +240,14 @@ func (s *Session) writeFrame(cmd byte, id uint32, data []byte, pad int) error {
 		return err
 	}
 	return nil
+}
+
+// growBuf returns b resized to n, reusing its backing array when possible.
+func growBuf(b []byte, n int) []byte {
+	if cap(b) >= n {
+		return b[:n]
+	}
+	return make([]byte, n)
 }
 
 // shapePad returns how many pad bytes to add to a frame whose current plaintext
@@ -226,7 +279,8 @@ func (s *Session) readLoop() {
 		if n < tagSize {
 			return // malformed
 		}
-		ct := make([]byte, n)
+		s.rct = growBuf(s.rct, n)
+		ct := s.rct[:n]
 		if _, err := io.ReadFull(s.transport, ct); err != nil {
 			return
 		}
@@ -258,6 +312,34 @@ func (s *Session) keepalive() {
 				return
 			}
 		}
+	}
+}
+
+// drainTimer closes the draining channel after maxLife, signalling that no new
+// streams should be opened. Existing streams are unaffected.
+func (s *Session) drainTimer() {
+	t := time.NewTimer(s.maxLife)
+	defer t.Stop()
+	select {
+	case <-s.done:
+		return
+	case <-t.C:
+		select {
+		case <-s.draining:
+		default:
+			close(s.draining)
+		}
+	}
+}
+
+// Draining reports whether the session has exceeded its max lifetime and is
+// refusing new streams. The client dialer should open a fresh session.
+func (s *Session) Draining() bool {
+	select {
+	case <-s.draining:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -358,6 +440,9 @@ func (s *Session) OpenStream(target string) (*Stream, error) {
 	if !s.initiator {
 		return nil, errors.New("prism: only the initiator may open streams")
 	}
+	if s.Draining() {
+		return nil, ErrSessionDraining
+	}
 	enc, err := EncodeAddr(target)
 	if err != nil {
 		return nil, err
@@ -390,6 +475,9 @@ func (s *Session) OpenStream(target string) (*Stream, error) {
 func (s *Session) OpenUDP() (*Stream, error) {
 	if !s.initiator {
 		return nil, errors.New("prism: only the initiator may open streams")
+	}
+	if s.Draining() {
+		return nil, ErrSessionDraining
 	}
 	s.mu.Lock()
 	if s.closed {
