@@ -63,8 +63,8 @@ jobs:
       - name: Unit tests
         run: go test -race -count=1 -timeout 120s ./...
       - name: Wintun adapter test (real Windows)
-        shell: pwsh
+        shell: cmd
         run: |
           go test -c -o wintun-test.exe ./cmd/prism-client/
-          $env:PRISM_ROOT_TEST="1"
-          .\wintun-test.exe -test.v -test.run "TestWintunAdapterCreate|TestWintunOpenTUN" -test.timeout 60s
+          set PRISM_ROOT_TEST=1
+          wintun-test.exe -test.v -test.run "TestWintunAdapterCreate|TestWintunOpenTUN" -test.timeout 60s
