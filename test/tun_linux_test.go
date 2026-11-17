@@ -23,10 +23,7 @@ import (
 // Requires root (CAP_NET_ADMIN). Set PRISM_ROOT_TEST=1 to run.
 func TestLinuxTUNDevice(t *testing.T) {
 	if os.Getenv("PRISM_ROOT_TEST") == "" {
-		t.Skip("set PRISM_ROOT_TEST=1 to run TUN device test (requires root)")
-	}
-	if os.Getuid() != 0 {
-		t.Skip("must run as root for TUN device test")
+		t.Skip("set PRISM_ROOT_TEST=1 to run TUN device test (requires CAP_NET_ADMIN)")
 	}
 
 	// Open /dev/net/tun.
@@ -105,10 +102,22 @@ func TestLinuxTUNDevice(t *testing.T) {
 		t.Fatalf("packet too short: %d bytes", nRead)
 	}
 
-	// Verify it's an IPv4 packet.
+	// Read packets until we get IPv4, or exhaust attempts (ping may send IPv6 first).
 	version := buf[0] >> 4
+	for attempt := 0; version != 4 && attempt < 5; attempt++ {
+		pfd[0].Events = unix.POLLIN
+		n, err = unix.Poll(pfd, 2000)
+		if err != nil || n == 0 {
+			break
+		}
+		nRead, err = syscall.Read(fd, buf)
+		if err != nil || nRead < 20 {
+			break
+		}
+		version = buf[0] >> 4
+	}
 	if version != 4 {
-		t.Fatalf("expected IPv4 (version 4), got %d", version)
+		t.Fatalf("never received an IPv4 packet (last version=%d)", version)
 	}
 
 	proto := buf[9]
@@ -117,9 +126,6 @@ func TestLinuxTUNDevice(t *testing.T) {
 	t.Logf("step 3: read %d-byte packet from TUN: IPv4 proto=%d src=%s dst=%s",
 		nRead, proto, srcIP, dstIP)
 
-	if proto != 1 { // ICMP
-		t.Logf("warning: expected ICMP (proto 1), got proto %d", proto)
-	}
 	if dstIP.String() != "10.99.99.2" {
 		t.Fatalf("expected dst 10.99.99.2, got %s", dstIP)
 	}
@@ -129,7 +135,6 @@ func TestLinuxTUNDevice(t *testing.T) {
 	copy(reply, buf[:nRead])
 	copy(reply[12:16], dstIP.To4())
 	copy(reply[16:20], srcIP.To4())
-	// Fix IP checksum (zero it, recompute).
 	reply[10], reply[11] = 0, 0
 	var csum uint32
 	ihl := int(reply[0]&0x0f) * 4
