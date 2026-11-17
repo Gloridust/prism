@@ -354,4 +354,4 @@ TLS 终止始终在 Prism 侧完成。这避免了 REALITY 的 MITM 透传设计
 - [x] 握手替换为经审计的 Noise_IKpsk2 实现（`handshake: "noise"`，flynn/noise）
 - [x] UDP relay（SOCKS UDP ASSOCIATE + UDP over stream）
 - [x] 订阅分发与密钥轮换、per-CID 配额与审计（管理 API `admin.listen`）
-- [x] 桌面原生 TUN 全局模式（Linux /dev/net/tun + macOS utun + Windows wintun，`tun` 配置块）
+- [x] 桌面原生 TUN 全局模式（Linux /dev/net/tun + macOS utun + Windows wintun，gVisor netstack 用户态 TCP/IP 栈，`tun` 配置块）
