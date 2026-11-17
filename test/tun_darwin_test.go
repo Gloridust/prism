@@ -82,8 +82,22 @@ func openDarwinTUN(t *testing.T) *darwinTUN {
 		t.Fatalf("connect utun: %v", errno)
 	}
 
-	name := "utun" + strconv.Itoa(int(sc.unit-1))
-	return &darwinTUN{fd: fd, name: name, rbuf: make([]byte, darwinMTU+4)}
+	var ifname [16]byte
+	ifnameLen := uint32(len(ifname))
+	_, _, errno = syscall.Syscall6(syscall.SYS_GETSOCKOPT, uintptr(fd),
+		2, 2, // SYSPROTO_CONTROL, UTUN_OPT_IFNAME
+		uintptr(unsafe.Pointer(&ifname[0])),
+		uintptr(unsafe.Pointer(&ifnameLen)),
+		0)
+	if errno != 0 {
+		syscall.Close(fd)
+		t.Fatalf("getsockopt UTUN_OPT_IFNAME: %v", errno)
+	}
+	n := ifnameLen
+	for n > 0 && ifname[n-1] == 0 {
+		n--
+	}
+	return &darwinTUN{fd: fd, name: string(ifname[:n]), rbuf: make([]byte, darwinMTU+4)}
 }
 
 func (t *darwinTUN) Read(buf []byte) (int, error) {

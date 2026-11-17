@@ -21,11 +21,11 @@ jobs:
         run: |
           sudo apt-get install -y qemu-user
           GOOS=linux GOARCH=mipsle GOMIPS=softfloat go test -c -o /tmp/prism-test-mipsle ./test/
-          unshare --net --map-root-user bash -c \
+          sudo unshare --net bash -c \
             'PRISM_ROOT_TEST=1 qemu-mipsel /tmp/prism-test-mipsle -test.v -test.run "TestLinuxTUNDevice|TestRealTUNWithRealPrism" -test.timeout 120s'
       - name: Real /dev/net/tun + real Prism e2e (native x86-64)
         run: |
-          unshare --net --map-root-user bash -c \
+          sudo unshare --net bash -c \
             'PRISM_ROOT_TEST=1 go test -v -run "TestLinuxTUNDevice|TestRealTUNWithRealPrism" -count=1 -timeout 60s ./test/'
       - name: ECH live tests
         run: PRISM_LIVE_TEST=1 go test -v -run "TestECHHandshakeLive|TestECHWithPrismSession" -count=1 -timeout 60s ./test/ ./pkg/prism/

@@ -330,6 +330,7 @@ func relayTCP(clientConn net.Conn, buffered []byte, dest string) {
 	go func() { io.Copy(d, clientConn); done <- struct{}{} }()
 	go func() { io.Copy(clientConn, d); done <- struct{}{} }()
 	<-done
+	<-done
 }
 
 // TestStealModeEndToEnd verifies that:

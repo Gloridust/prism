@@ -57,8 +57,22 @@ func openTUN(_ string) (*tunDevice, error) {
 		return nil, fmt.Errorf("connect utun: %w", errno)
 	}
 
-	ifName := "utun" + strconv.Itoa(int(sc.unit-1))
-	return &tunDevice{fd: fd, name: ifName, rbuf: make([]byte, tunMTU+4)}, nil
+	var ifname [16]byte
+	ifnameLen := uint32(len(ifname))
+	_, _, errno = syscall.Syscall6(syscall.SYS_GETSOCKOPT, uintptr(fd),
+		2, 2, // SYSPROTO_CONTROL, UTUN_OPT_IFNAME
+		uintptr(unsafe.Pointer(&ifname[0])),
+		uintptr(unsafe.Pointer(&ifnameLen)),
+		0)
+	if errno != 0 {
+		syscall.Close(fd)
+		return nil, fmt.Errorf("getsockopt UTUN_OPT_IFNAME: %w", errno)
+	}
+	n := ifnameLen
+	for n > 0 && ifname[n-1] == 0 {
+		n--
+	}
+	return &tunDevice{fd: fd, name: string(ifname[:n]), rbuf: make([]byte, tunMTU+4)}, nil
 }
 
 // Read returns a raw IPv4 packet with the macOS utun 4-byte AF header stripped.
