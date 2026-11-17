@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 const tunMTU = 1500
@@ -29,16 +31,15 @@ func openTUN(name string) (*tunDevice, error) {
 	}
 
 	const (
-		tunSetIff = 0x400454ca
-		iffTun    = 0x0001
-		iffNoPi   = 0x1000
+		iffTun = 0x0001
+		iffNoPi = 0x1000
 	)
 
 	var req ifReq
 	copy(req.name[:], name)
 	req.flags = iffTun | iffNoPi
 
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), tunSetIff, uintptr(unsafe.Pointer(&req)))
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), unix.TUNSETIFF, uintptr(unsafe.Pointer(&req)))
 	if errno != 0 {
 		syscall.Close(fd)
 		return nil, fmt.Errorf("TUNSETIFF: %w", errno)

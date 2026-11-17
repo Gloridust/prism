@@ -34,10 +34,9 @@ import (
 )
 
 const (
-	tunSetIff = 0x400454ca
-	iffTun    = 0x0001
-	iffNoPi   = 0x1000
-	testMTU   = 1500
+	iffTun  = 0x0001
+	iffNoPi = 0x1000
+	testMTU = 1500
 )
 
 type ifReq struct {
@@ -61,7 +60,7 @@ func openRealTUN(t *testing.T, name string) *realTUN {
 	var req ifReq
 	copy(req.name[:], name)
 	req.flags = iffTun | iffNoPi
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), tunSetIff, uintptr(unsafe.Pointer(&req)))
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), unix.TUNSETIFF, uintptr(unsafe.Pointer(&req)))
 	if errno != 0 {
 		syscall.Close(fd)
 		t.Fatalf("TUNSETIFF: %v", errno)
