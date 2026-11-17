@@ -8,7 +8,9 @@ VERSION ?= 0.1.0
 LDFLAGS := -s -w -X main.version=$(VERSION)
 OUT := dist
 
-.PHONY: all test server client keygen clean \
+WINTUN_VERSION := 0.14.1
+
+.PHONY: all test server client keygen clean wintun \
         client-linux-amd64 client-linux-arm64 client-linux-mipsle client-linux-mips \
         client-linux-mipsle-chacha client-linux-mips-chacha \
         client-darwin-arm64 client-darwin-amd64 client-windows-amd64 \
@@ -55,8 +57,19 @@ client-darwin-arm64:
 	GOOS=darwin GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o $(OUT)/prism-client-macos-arm64 ./cmd/prism-client
 client-darwin-amd64:
 	GOOS=darwin GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(OUT)/prism-client-macos-amd64 ./cmd/prism-client
-client-windows-amd64:
+client-windows-amd64: wintun
 	GOOS=windows GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(OUT)/prism-client-windows-amd64.exe ./cmd/prism-client
+	cp $(OUT)/wintun/bin/amd64/wintun.dll $(OUT)/wintun.dll
+
+# Download and extract wintun.dll (MIT-licensed, https://www.wintun.net).
+# Ships alongside the Windows client binary.
+wintun: $(OUT)/wintun/bin/amd64/wintun.dll
+
+$(OUT)/wintun/bin/amd64/wintun.dll:
+	@mkdir -p $(OUT)
+	curl -fsSL "https://www.wintun.net/builds/wintun-$(WINTUN_VERSION).zip" -o $(OUT)/wintun.zip
+	unzip -qo $(OUT)/wintun.zip -d $(OUT)
+	rm $(OUT)/wintun.zip
 
 clean:
 	rm -rf $(OUT)

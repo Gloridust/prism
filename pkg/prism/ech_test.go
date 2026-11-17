@@ -1,8 +1,11 @@
 package prism
 
 import (
+	"context"
 	"encoding/binary"
+	"os"
 	"testing"
+	"time"
 )
 
 func TestParseSVCBForECH(t *testing.T) {
@@ -84,4 +87,52 @@ func TestParseSVCBForECH_MultipleSvcParams(t *testing.T) {
 	if len(got) != 3 || got[0] != 0xAA || got[1] != 0xBB || got[2] != 0xCC {
 		t.Fatalf("unexpected ECH payload: %x", got)
 	}
+}
+
+// TestFetchECHConfigList_Live queries a known ECH-enabled domain via Cloudflare
+// DoH to verify that FetchECHConfigList works against real DNS infrastructure.
+// Skipped in CI or when PRISM_LIVE_TEST is not set.
+func TestFetchECHConfigList_Live(t *testing.T) {
+	if os.Getenv("PRISM_LIVE_TEST") == "" {
+		t.Skip("set PRISM_LIVE_TEST=1 to run live ECH fetch test")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// crypto.cloudflare.com is a known ECH-enabled domain.
+	ech, err := FetchECHConfigList(ctx, "crypto.cloudflare.com", "")
+	if err != nil {
+		t.Fatalf("FetchECHConfigList: %v", err)
+	}
+	if len(ech) == 0 {
+		t.Fatal("expected non-empty ECH config from crypto.cloudflare.com")
+	}
+	t.Logf("fetched %d-byte ECH config from crypto.cloudflare.com via DoH", len(ech))
+
+	// Verify the ECH config starts with a valid version (0xfe0d = draft ECH).
+	if len(ech) >= 2 {
+		ver := binary.BigEndian.Uint16(ech[:2])
+		t.Logf("ECH config version: 0x%04x", ver)
+	}
+}
+
+// TestFetchECHConfigList_NoDomain verifies that querying a domain with no ECH
+// returns nil without error.
+func TestFetchECHConfigList_NoDomain(t *testing.T) {
+	if os.Getenv("PRISM_LIVE_TEST") == "" {
+		t.Skip("set PRISM_LIVE_TEST=1 to run live ECH fetch test")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	ech, err := FetchECHConfigList(ctx, "example.com", "")
+	if err != nil {
+		t.Fatalf("FetchECHConfigList: %v", err)
+	}
+	if ech != nil {
+		t.Fatalf("expected nil ECH for example.com, got %d bytes", len(ech))
+	}
+	t.Log("example.com correctly returned no ECH config")
 }

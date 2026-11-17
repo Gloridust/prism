@@ -94,7 +94,7 @@ func main() {
 				log.Fatalf("tun routes: %v", tunErr)
 			}
 		}
-		go tunRouter(tunDev, d)
+		go tunRouter(tunDev, &realDialerAdapter{d: d})
 		log.Printf("TUN device %s up, routing all traffic through Prism", tunDev.Name())
 	}
 

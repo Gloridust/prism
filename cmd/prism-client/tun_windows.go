@@ -6,72 +6,43 @@ import (
 	"net"
 	"os/exec"
 	"sync"
-	"syscall"
-	"unsafe"
 
 	"golang.org/x/sys/windows"
+	"golang.zx2c4.com/wintun"
 )
 
 const tunMTU = 1500
 
-var (
-	wintunDLL                      = windows.NewLazyDLL("wintun.dll")
-	procWintunCreateAdapter        = wintunDLL.NewProc("WintunCreateAdapter")
-	procWintunCloseAdapter         = wintunDLL.NewProc("WintunCloseAdapter")
-	procWintunStartSession         = wintunDLL.NewProc("WintunStartSession")
-	procWintunEndSession           = wintunDLL.NewProc("WintunEndSession")
-	procWintunGetReadWaitEvent     = wintunDLL.NewProc("WintunGetReadWaitEvent")
-	procWintunReceivePacket        = wintunDLL.NewProc("WintunReceivePacket")
-	procWintunReleaseReceivePacket = wintunDLL.NewProc("WintunReleaseReceivePacket")
-	procWintunAllocateSendPacket   = wintunDLL.NewProc("WintunAllocateSendPacket")
-	procWintunSendPacket           = wintunDLL.NewProc("WintunSendPacket")
-)
-
 type tunDevice struct {
-	name     string
-	adapter  uintptr
-	session  uintptr
-	readWait windows.Handle
-	tunGW    string // TUN gateway IP for routing
-	closed   chan struct{}
+	name      string
+	adapter   *wintun.Adapter
+	session   wintun.Session
+	tunGW     string // TUN gateway IP for routing
+	closed    chan struct{}
 	closeOnce sync.Once
 }
 
 func openTUN(name string) (*tunDevice, error) {
-	if err := wintunDLL.Load(); err != nil {
-		return nil, fmt.Errorf("wintun.dll not found: %w (download from https://www.wintun.net)", err)
-	}
 	if name == "" {
 		name = "Prism"
 	}
 
-	nameUTF16, _ := windows.UTF16PtrFromString(name)
-	typeUTF16, _ := windows.UTF16PtrFromString("Prism")
-
-	adapter, _, err := procWintunCreateAdapter.Call(
-		uintptr(unsafe.Pointer(nameUTF16)),
-		uintptr(unsafe.Pointer(typeUTF16)),
-		0,
-	)
-	if adapter == 0 {
-		return nil, fmt.Errorf("WintunCreateAdapter: %w", err)
+	adapter, err := wintun.CreateAdapter(name, "Prism", nil)
+	if err != nil {
+		return nil, fmt.Errorf("WintunCreateAdapter: %w (download wintun.dll from https://www.wintun.net)", err)
 	}
 
-	// 8 MiB ring buffer (must be power of 2, range 128 KiB – 64 MiB).
-	session, _, err := procWintunStartSession.Call(adapter, 0x800000)
-	if session == 0 {
-		procWintunCloseAdapter.Call(adapter)
+	session, err := adapter.StartSession(0x800000) // 8 MiB ring
+	if err != nil {
+		adapter.Close()
 		return nil, fmt.Errorf("WintunStartSession: %w", err)
 	}
 
-	readWait, _, _ := procWintunGetReadWaitEvent.Call(session)
-
 	return &tunDevice{
-		name:     name,
-		adapter:  adapter,
-		session:  session,
-		readWait: windows.Handle(readWait),
-		closed:   make(chan struct{}),
+		name:    name,
+		adapter: adapter,
+		session: session,
+		closed:  make(chan struct{}),
 	}, nil
 }
 
@@ -83,22 +54,14 @@ func (t *tunDevice) Read(buf []byte) (int, error) {
 		default:
 		}
 
-		var packetSize uint32
-		packet, _, err := procWintunReceivePacket.Call(
-			t.session,
-			uintptr(unsafe.Pointer(&packetSize)),
-		)
-		if packet == 0 {
-			if errno, ok := err.(syscall.Errno); ok && errno == 259 {
-				// ERROR_NO_MORE_ITEMS — wait for the read event.
-				windows.WaitForSingleObject(t.readWait, 1000)
-				continue
-			}
-			return 0, fmt.Errorf("WintunReceivePacket: %w", err)
+		pkt, err := t.session.ReceivePacket()
+		if err != nil {
+			// ERROR_NO_MORE_ITEMS (259) — wait for data.
+			windows.WaitForSingleObject(t.session.ReadWaitEvent(), 1000)
+			continue
 		}
-
-		n := copy(buf, unsafe.Slice((*byte)(unsafe.Pointer(packet)), packetSize))
-		procWintunReleaseReceivePacket.Call(t.session, packet)
+		n := copy(buf, pkt)
+		t.session.ReleaseReceivePacket(pkt)
 		return n, nil
 	}
 }
@@ -110,25 +73,20 @@ func (t *tunDevice) Write(buf []byte) (int, error) {
 	default:
 	}
 
-	n := len(buf)
-	packet, _, err := procWintunAllocateSendPacket.Call(t.session, uintptr(n))
-	if packet == 0 {
-		return 0, fmt.Errorf("WintunAllocateSendPacket: %w", err)
+	pkt, err := t.session.AllocateSendPacket(len(buf))
+	if err != nil {
+		return 0, fmt.Errorf("AllocateSendPacket: %w", err)
 	}
-	copy(unsafe.Slice((*byte)(unsafe.Pointer(packet)), n), buf)
-	procWintunSendPacket.Call(t.session, packet)
-	return n, nil
+	copy(pkt, buf)
+	t.session.SendPacket(pkt)
+	return len(buf), nil
 }
 
 func (t *tunDevice) Close() error {
 	t.closeOnce.Do(func() {
 		close(t.closed)
-		if t.session != 0 {
-			procWintunEndSession.Call(t.session)
-		}
-		if t.adapter != 0 {
-			procWintunCloseAdapter.Call(t.adapter)
-		}
+		t.session.End()
+		t.adapter.Close()
 	})
 	return nil
 }

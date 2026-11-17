@@ -21,13 +21,27 @@ import (
 
 const channelSize = 512
 
-// tunRouter bridges a TUN device to the Prism dialer using a gVisor userspace
-// TCP/IP stack. Raw IP packets from the TUN device are injected into the
-// netstack; the TCP forwarder opens a Prism stream for each new connection and
-// relays data bidirectionally. UDP datagrams are forwarded through the Prism UDP
-// relay. This replaces the broken echo-to-self approach that tried to pipe raw
-// IP packets into application-level proxy streams.
-func tunRouter(dev *tunDevice, dialer *Dialer) {
+type tunDev interface {
+	Read([]byte) (int, error)
+	Write([]byte) (int, error)
+}
+
+type proxyStream interface {
+	io.ReadWriteCloser
+	CloseWrite() error
+}
+
+type proxyDialer interface {
+	Open(target string) (proxyStream, error)
+	OpenUDP() (proxyStream, error)
+}
+
+type realDialerAdapter struct{ d *Dialer }
+
+func (a *realDialerAdapter) Open(target string) (proxyStream, error) { return a.d.Open(target) }
+func (a *realDialerAdapter) OpenUDP() (proxyStream, error)           { return a.d.OpenUDP() }
+
+func tunRouter(dev tunDev, dialer proxyDialer) {
 	ep := channel.New(channelSize, uint32(tunMTU), "")
 
 	s := stack.New(stack.Options{
@@ -124,7 +138,7 @@ func tunRouter(dev *tunDevice, dialer *Dialer) {
 	}
 }
 
-func relayTCP(local net.Conn, dialer *Dialer, target string) {
+func relayTCP(local net.Conn, dialer proxyDialer, target string) {
 	defer local.Close()
 
 	st, err := dialer.Open(target)
@@ -147,7 +161,7 @@ func relayTCP(local net.Conn, dialer *Dialer, target string) {
 	<-done
 }
 
-func relayUDP(local net.Conn, dialer *Dialer, target string) {
+func relayUDP(local net.Conn, dialer proxyDialer, target string) {
 	defer local.Close()
 
 	st, err := dialer.OpenUDP()
