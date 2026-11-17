@@ -65,6 +65,6 @@ jobs:
       - name: Wintun adapter test (real Windows)
         shell: pwsh
         run: |
-          Copy-Item wintun.dll cmd\prism-client\
+          go test -c -o wintun-test.exe ./cmd/prism-client/
           $env:PRISM_ROOT_TEST="1"
-          go test -v -run "TestWintunAdapterCreate|TestWintunOpenTUN" -count=1 -timeout 60s ./cmd/prism-client/
+          .\wintun-test.exe -test.v -test.run "TestWintunAdapterCreate|TestWintunOpenTUN" -test.timeout 60s
