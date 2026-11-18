@@ -42,8 +42,8 @@ func EncodeAddr(hostport string) ([]byte, error) {
 			out = append(out, ip.To16()...)
 		}
 	} else {
-		if len(host) > 255 {
-			return nil, errors.New("prism: domain too long")
+		if !validDomain(host) {
+			return nil, fmt.Errorf("prism: invalid host %q", host)
 		}
 		out = append(out, atypDomain, byte(len(host)))
 		out = append(out, host...)
@@ -82,10 +82,32 @@ func DecodeAddr(b []byte) (string, error) {
 			return "", errors.New("prism: truncated domain address")
 		}
 		host = string(b[2 : 2+n])
+		if !validDomain(host) {
+			return "", errors.New("prism: invalid domain in address")
+		}
 		rest = b[2+n:]
 	default:
 		return "", fmt.Errorf("prism: unknown atyp 0x%02x", b[0])
 	}
 	port := binary.BigEndian.Uint16(rest[:2])
 	return net.JoinHostPort(host, strconv.Itoa(int(port))), nil
+}
+
+// validDomain reports whether host is a plausible DNS name: 1-253 bytes of
+// letters, digits, '-', '_' and '.'. The address arrives from the peer and is
+// later resolved and logged, so anything else (brackets, colons, whitespace,
+// control bytes) is rejected at the boundary.
+func validDomain(host string) bool {
+	if len(host) == 0 || len(host) > 253 {
+		return false
+	}
+	for i := 0; i < len(host); i++ {
+		c := host[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '-', c == '_', c == '.':
+		default:
+			return false
+		}
+	}
+	return true
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"math/rand"
 	"sync"
 	"time"
 )
@@ -70,6 +71,11 @@ var (
 	ErrStreamReset = errors.New("prism: stream reset by peer")
 	// ErrTooManyStreams is returned when a session is at its stream cap.
 	ErrTooManyStreams = errors.New("prism: too many concurrent streams")
+	// ErrSessionDraining is returned when new streams are rejected because
+	// the session's max lifetime has been reached and it is draining.
+	ErrSessionDraining = errors.New("prism: session draining (max lifetime reached)")
+	// ErrFlowControl ends a session whose peer sent more than its window allows.
+	ErrFlowControl = errors.New("prism: peer violated stream flow control")
 )
 
 var be = binary.BigEndian
@@ -102,18 +108,33 @@ type Session struct {
 	keepEvery   time.Duration
 	idleTimeout time.Duration
 
-	buckets    []int // egress length-shaping buckets; nil = no shaping
-	maxStreams int   // cap on concurrent streams; 0 = unlimited
+	buckets    []int    // egress length-shaping buckets; nil = no shaping
+	profile    *Profile // traffic profile (superset of buckets; nil = no profile)
+	maxStreams int      // cap on concurrent streams; 0 = unlimited
+	maxLife    time.Duration
+	draining   chan struct{} // closed when the session starts draining (max lifetime)
+	iatMaxMs   int           // inter-arrival time shaping: max random delay in ms (0 = off)
+	headFrames int           // per-stream head frames to length-randomise (0 = off)
+
+	// Reusable buffers — eliminate per-frame heap allocations on the hot path.
+	// wplain/wout are protected by wmu; rct is readLoop-only.
+	wplain []byte // plaintext frame assembly
+	wout   []byte // wire output: [2-byte len][ciphertext]
+	rct    []byte // ciphertext read from wire
 }
 
 // Option configures a Session at construction.
 type Option func(*Session)
 
-// WithShaping enables an egress length-shaping profile: "pad" rounds each frame
-// up to the next shapeBuckets size; "none" (or "") disables it (the default).
+// WithShaping enables an egress traffic-shaping profile by name. Built-in
+// profiles: "none" (default), "pad" (length bucketing only), "web" (browsing
+// pattern), "video" (streaming pattern), "download" (bulk transfer pattern).
 func WithShaping(mode string) Option {
 	return func(s *Session) {
-		if mode == "pad" {
+		if p := LookupProfile(mode); p != nil {
+			s.profile = p
+			s.buckets = p.Buckets
+		} else if mode == "pad" {
 			s.buckets = shapeBuckets
 		}
 	}
@@ -125,6 +146,52 @@ func WithShaping(mode string) Option {
 // receive window) against a client that opens streams without bound.
 func WithMaxStreams(n int) Option {
 	return func(s *Session) { s.maxStreams = n }
+}
+
+// WithMaxLifetime sets a carrier session max lifetime. After d elapses, the
+// session enters a "draining" state: OpenStream/OpenUDP return
+// ErrSessionDraining, but existing streams continue until they close naturally.
+// The client dialer sees Draining() and redials a fresh session for new streams.
+// 0 means no limit (the default).
+func WithMaxLifetime(d time.Duration) Option {
+	return func(s *Session) { s.maxLife = d }
+}
+
+// WithIAT enables inter-arrival time shaping: each outgoing DATA frame is
+// preceded by a random delay of 0–maxMs milliseconds. Only frames whose
+// plaintext payload (before padding) is smaller than 1280 bytes are delayed,
+// so bulk throughput is unaffected. The jitter blurs per-frame timing patterns
+// that could distinguish Prism from ordinary HTTPS browsing. 0 disables it.
+func WithIAT(maxMs int) Option {
+	return func(s *Session) { s.iatMaxMs = maxMs }
+}
+
+// DefaultHeadFrames is how many frames per stream the commands pad by default:
+// enough to cover a TLS 1.3 handshake in both directions.
+const DefaultHeadFrames = 8
+
+// WithHeadPadding randomises the length of the first n DATA frames of every
+// stream (and of the SYN that opens it). Those frames carry the tunnelled
+// connection's own handshake — typically a TLS ClientHello/ServerHello whose
+// sizes are a well-known TLS-in-TLS signature — so hiding their lengths removes
+// the signature while leaving bulk transfer untouched. Padding sits inside the
+// AEAD and is ignored on receipt, so each side enables it independently.
+func WithHeadPadding(n int) Option {
+	return func(s *Session) { s.headFrames = n }
+}
+
+// headPad picks the padding for a head frame carrying n payload bytes: short
+// frames are lifted to a random length in [900, 1400), longer ones get up to
+// 255 bytes, and near-full frames are left alone to stay inside one TLS record.
+func headPad(n int) int {
+	switch {
+	case n < 900:
+		return 900 + rand.Intn(500) - n
+	case n+255 <= maxPayload-64:
+		return rand.Intn(256)
+	default:
+		return 0
+	}
 }
 
 // NewSession wraps a post-handshake carrier. initiator must be true on the
@@ -160,15 +227,23 @@ func NewSession(transport io.ReadWriteCloser, keys *Keys, initiator bool, opts .
 	} else {
 		s.nextID = 2 // disjoint id space, avoids collisions if both ever open
 	}
+	s.draining = make(chan struct{})
 	for _, o := range opts {
 		o(s)
 	}
 	go s.readLoop()
 	go s.keepalive()
+	if s.maxLife > 0 {
+		go s.drainTimer()
+	}
 	return s, nil
 }
 
 func (s *Session) writeFrame(cmd byte, id uint32, data []byte, pad int) error {
+	// IAT shaping: delay small DATA frames by a random interval to blur timing.
+	if s.iatMaxMs > 0 && cmd == cmdData && len(data) < 1280 {
+		time.Sleep(time.Duration(rand.Intn(s.iatMaxMs)) * time.Millisecond)
+	}
 	s.wmu.Lock()
 	defer s.wmu.Unlock()
 	if s.werr != nil {
@@ -177,17 +252,23 @@ func (s *Session) writeFrame(cmd byte, id uint32, data []byte, pad int) error {
 	if p := s.shapePad(hdrSize + len(data)); p > pad {
 		pad = p
 	}
-	plain := make([]byte, hdrSize+len(data)+pad)
+	plainLen := hdrSize + len(data) + pad
+	s.wplain = growBuf(s.wplain, plainLen)
+	plain := s.wplain[:plainLen]
 	plain[0] = cmd
 	be.PutUint32(plain[1:5], id)
 	be.PutUint16(plain[5:7], uint16(len(data)))
 	copy(plain[7:], data)
-	// Padding bytes stay zero; they are inside the AEAD so an observer cannot
-	// tell padding from payload. The length prefix below is the only cleartext.
+	// Zero the padding region; bytes are inside the AEAD so an observer cannot
+	// tell padding from payload.
+	clear(plain[hdrSize+len(data):])
+
 	ct := s.sendAEAD.Seal(s.sendCtr, plain, nil)
 	s.sendCtr++
 
-	out := make([]byte, 2+len(ct))
+	wireLen := 2 + len(ct)
+	s.wout = growBuf(s.wout, wireLen)
+	out := s.wout[:wireLen]
 	be.PutUint16(out[:2], uint16(len(ct)))
 	copy(out[2:], ct)
 	if _, err := s.transport.Write(out); err != nil {
@@ -195,6 +276,14 @@ func (s *Session) writeFrame(cmd byte, id uint32, data []byte, pad int) error {
 		return err
 	}
 	return nil
+}
+
+// growBuf returns b resized to n, reusing its backing array when possible.
+func growBuf(b []byte, n int) []byte {
+	if cap(b) >= n {
+		return b[:n]
+	}
+	return make([]byte, n)
 }
 
 // shapePad returns how many pad bytes to add to a frame whose current plaintext
@@ -226,7 +315,8 @@ func (s *Session) readLoop() {
 		if n < tagSize {
 			return // malformed
 		}
-		ct := make([]byte, n)
+		s.rct = growBuf(s.rct, n)
+		ct := s.rct[:n]
 		if _, err := io.ReadFull(s.transport, ct); err != nil {
 			return
 		}
@@ -258,6 +348,34 @@ func (s *Session) keepalive() {
 				return
 			}
 		}
+	}
+}
+
+// drainTimer closes the draining channel after maxLife, signalling that no new
+// streams should be opened. Existing streams are unaffected.
+func (s *Session) drainTimer() {
+	t := time.NewTimer(s.maxLife)
+	defer t.Stop()
+	select {
+	case <-s.done:
+		return
+	case <-t.C:
+		select {
+		case <-s.draining:
+		default:
+			close(s.draining)
+		}
+	}
+}
+
+// Draining reports whether the session has exceeded its max lifetime and is
+// refusing new streams. The client dialer should open a fresh session.
+func (s *Session) Draining() bool {
+	select {
+	case <-s.draining:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -322,11 +440,16 @@ func (s *Session) dispatch(plain []byte) {
 		}
 	case cmdData:
 		if st := s.lookup(id); st != nil {
-			st.deliver(append([]byte(nil), data...))
+			if !st.deliver(append([]byte(nil), data...)) {
+				// The peer sent past the window it was granted. A conforming
+				// sender cannot do this, so treat it as hostile: buffering it
+				// would let one stream exhaust memory.
+				s.teardown(ErrFlowControl)
+			}
 		}
 	case cmdWnd:
 		if st := s.lookup(id); st != nil && len(data) >= 4 {
-			st.addCredit(int(be.Uint32(data)))
+			st.addCredit(be.Uint32(data))
 		}
 	case cmdFIN:
 		if st := s.lookup(id); st != nil {
@@ -358,6 +481,9 @@ func (s *Session) OpenStream(target string) (*Stream, error) {
 	if !s.initiator {
 		return nil, errors.New("prism: only the initiator may open streams")
 	}
+	if s.Draining() {
+		return nil, ErrSessionDraining
+	}
 	enc, err := EncodeAddr(target)
 	if err != nil {
 		return nil, err
@@ -377,7 +503,12 @@ func (s *Session) OpenStream(target string) (*Stream, error) {
 	s.streams[id] = st
 	s.mu.Unlock()
 
-	if err := s.writeFrame(cmdSYN, id, enc, 0); err != nil {
+	synPad := 0
+	if s.headFrames > 0 {
+		// Hide the target's length (a domain name's size) in the SYN.
+		synPad = 64 - len(enc)%64 + 64*rand.Intn(2)
+	}
+	if err := s.writeFrame(cmdSYN, id, enc, synPad); err != nil {
 		s.removeStream(id)
 		return nil, err
 	}
@@ -390,6 +521,9 @@ func (s *Session) OpenStream(target string) (*Stream, error) {
 func (s *Session) OpenUDP() (*Stream, error) {
 	if !s.initiator {
 		return nil, errors.New("prism: only the initiator may open streams")
+	}
+	if s.Draining() {
+		return nil, ErrSessionDraining
 	}
 	s.mu.Lock()
 	if s.closed {
@@ -498,12 +632,13 @@ type Stream struct {
 	sendWin   int
 	writeErr  error
 	writeDone bool
+	headLeft  int // head frames still to pad (see WithHeadPadding)
 
 	closeOnce sync.Once
 }
 
 func (s *Session) newStream(id uint32, target string) *Stream {
-	st := &Stream{id: id, s: s, target: target, sendWin: streamWindow}
+	st := &Stream{id: id, s: s, target: target, sendWin: streamWindow, headLeft: s.headFrames}
 	st.rcond = sync.NewCond(&st.rmu)
 	st.wcond = sync.NewCond(&st.wmu)
 	return st
@@ -520,14 +655,23 @@ func (st *Stream) IsUDP() bool { return st.udp }
 // deliver is called by the session read loop. It never blocks: the sender's
 // flow-control window bounds how much can be queued here, so appending is safe
 // and the read loop stays free to service other streams.
-func (st *Stream) deliver(b []byte) {
+//
+// It returns false if the peer overran the receive window. Bytes the reader
+// has consumed but not yet credited back still count against the window, so a
+// conforming sender can never have more than streamWindow outstanding.
+func (st *Stream) deliver(b []byte) bool {
 	st.rmu.Lock()
-	if st.readErr == nil {
-		st.queue = append(st.queue, b)
-		st.queued += len(b)
-		st.rcond.Broadcast()
+	defer st.rmu.Unlock()
+	if st.readErr != nil {
+		return true
 	}
-	st.rmu.Unlock()
+	if st.queued+st.consumed+len(b) > streamWindow {
+		return false
+	}
+	st.queue = append(st.queue, b)
+	st.queued += len(b)
+	st.rcond.Broadcast()
+	return true
 }
 
 func (st *Stream) closeRead(err error) {
@@ -548,9 +692,16 @@ func (st *Stream) failWrite(err error) {
 	st.wmu.Unlock()
 }
 
-func (st *Stream) addCredit(n int) {
+// addCredit grows the send window by a peer-supplied amount. The value is
+// untrusted: it is clamped so the window can never exceed streamWindow (or go
+// negative on 32-bit targets), whatever the peer sends.
+func (st *Stream) addCredit(n uint32) {
 	st.wmu.Lock()
-	st.sendWin += n
+	if room := streamWindow - st.sendWin; uint64(n) > uint64(room) {
+		st.sendWin = streamWindow
+	} else {
+		st.sendWin += int(n)
+	}
 	st.wcond.Broadcast()
 	st.wmu.Unlock()
 }
@@ -617,10 +768,18 @@ func (st *Stream) Write(p []byte) (int, error) {
 			n = st.sendWin
 		}
 		st.sendWin -= n
+		pad := 0
+		if st.headLeft > 0 {
+			st.headLeft--
+			pad = headPad(n)
+		}
 		st.wmu.Unlock()
 
-		if err := st.s.writeFrame(cmdData, st.id, p[:n], 0); err != nil {
+		if err := st.s.writeFrame(cmdData, st.id, p[:n], pad); err != nil {
 			return total, err
+		}
+		if sz := st.s.profile.ShouldCover(); sz > 0 {
+			_ = st.s.writeFrame(cmdPad, 0, nil, sz)
 		}
 		total += n
 		p = p[n:]

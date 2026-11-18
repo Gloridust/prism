@@ -8,6 +8,9 @@
   "psk": "本设备PSK(base64)",
   "allow_insecure": false,
 
+  "_backups": "备用出口（可选）。主出口不可达时自动切换，每 5 分钟尝试回切。各出口使用同一组 id/psk。",
+  "backups": [],
+
   "_cipher": "载波 AEAD，桌面有 AES-NI 用默认 aes-256-gcm 即可；留空=aes-256-gcm。所选算法必须在服务端 ciphers 列表里。",
   "cipher": "aes-256-gcm",
 
@@ -17,5 +20,46 @@
   "panel_listen": "127.0.0.1:9797",
   "pool_size": 4,
   "shaping": "none",
+
+  "_steal": "REALITY 风格主动探测抗性。服务端也需开启 steal，且 sni 填服务端 steal.dest 的域名。不能与 ech、transport:quic 同用。",
+  "steal": false,
+
+  "_transport": "载波传输层：\"\"(默认)=裸 TLS，\"ws\"=WebSocket over TLS（穿 CDN 时用），\"quic\"=隧道跑在 HTTP/3 请求里（服务端是真实 H3 站点）。ws_path / quic_path 须与服务端一致。",
+  "transport": "",
+  "ws_path": "",
+
+  "_head_padding": "流首填充（默认 true）：随机化每条流前 8 个帧的长度，隐藏隧道内 HTTPS 自身的 TLS 握手特征。",
+  "head_padding": true,
+
+  "_iat_max_ms": "帧间到达时间抖动(毫秒)，模糊时序指纹。0=关闭。建议 20-50。",
+  "iat_max_ms": 0,
+
+  "_max_lifetime_sec": "载波会话最大存活秒数。到期后旧会话渐次排空、新流用新会话。0=不限。",
+  "max_lifetime_sec": 0,
+
+  "_ech": "Encrypted Client Hello：加密 TLS 握手中的 SNI 字段，网络观察者无法看到你连的是哪个域名。\"auto\"=从 DNS HTTPS 记录自动获取 ECH 配置(通过 DoH)；也可填 base64 编码的 ECHConfigList。留空=关闭。",
+  "ech": "",
+  "_ech_doh": "ECH 自动获取所用的 DoH 解析器。默认 https://1.1.1.1/dns-query。",
+  "ech_doh": "",
+
+  "_handshake": "内层握手协议：\"\"=自研(默认)，\"noise\"=基于 flynn/noise 的 Noise_IKpsk1。需两端一致。",
+  "handshake": "",
+
+  "_shaping_profiles": "整形画像：\"none\"(默认)、\"pad\"(长度档位)、\"web\"(网页浏览)、\"video\"(视频流)、\"download\"(大文件)。",
+
+  "_dns": "DNS 防泄漏：本地 DNS 代理拦截直连 DNS 查询，通过隧道转发到出口节点的上游 DNS。桌面模式下同时设置系统 DNS 指向本地代理。listen 默认 127.0.0.1:53，upstream 默认 1.1.1.1:53。设为 null 关闭。",
+  "dns": {
+    "listen": "127.0.0.1:53",
+    "upstream": "1.1.1.1:53"
+  },
+
+  "_webrtc_guard": "WebRTC 防泄露（默认 true）：连接时给 Chrome/Edge/Brave 写入 WebRTC IP 策略（系统代理模式=disable_non_proxied_udp，TUN 模式=default_public_interface_only），断开时恢复原值；Firefox 写入 user.js。Safari 和原生应用（Zoom/Teams/微信）不受浏览器策略约束，要完全防护请用 TUN 模式。全公司强制可下发 config/webrtc-policy.mobileconfig（macOS）/ webrtc-policy.reg（Windows）。",
+  "webrtc_guard": true,
+
+  "_tun": "TUN 全局模式（需 root）。启用后创建 TUN 设备，IPv4 和 IPv6 全部经隧道，含 WebRTC 的 STUN/UDP；如果本机有公网 IPv6 却无法接管 IPv6，会拒绝启动，不会带着泄露运行。",
+  "_tun_example": {"device_name": "prism0", "address": "10.0.85.1/24", "gateway": "10.0.85.2", "orig_gateway": "192.168.1.1", "kill_switch": true, "kill_switch_boot": false},
+  "_kill_switch": "tun.kill_switch=true：用系统防火墙拒绝一切不经隧道的出站流量，客户端崩溃或被强杀后机器断网而不是回到直连。需同时配置 dns（发往局域网解析器的 DNS 也会被拒）。异常退出后恢复：重启客户端或执行 prism-client -killswitch-off。再加 kill_switch_boot=true 则每次开机自动装回规则（始终在线，需把客户端设为开机自启）。",
+  "tun": null,
+
   "auto_connect": true
 }

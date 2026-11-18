@@ -4,7 +4,9 @@ import (
 	"crypto/ecdh"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/gloridust/prism/pkg/prism"
@@ -26,6 +28,25 @@ type Config struct {
 	PrivateKey  string       `json:"private_key"` // base64 X25519 server private
 	Credentials []CredConfig `json:"credentials"`
 
+	// CredentialsFile, when set, is the writable source of truth for
+	// credentials: it is seeded from Credentials on first start, re-read on
+	// SIGHUP, and rewritten by the admin API so that added, revoked and rotated
+	// credentials survive a restart. It must live somewhere the service can
+	// write (e.g. /var/lib/prism/credentials.json).
+	CredentialsFile string `json:"credentials_file"`
+
+	// StatsFile persists per-credential traffic counters and the current day's
+	// quota usage across restarts. Defaults to stats.json next to
+	// CredentialsFile; with neither set, accounting is in-memory only.
+	StatsFile string `json:"stats_file"`
+
+	// MaxConns caps concurrent inbound TCP connections (authenticated or not),
+	// bounding memory and file descriptors under a connection flood. 0 uses the
+	// default (4096); negative means unlimited.
+	MaxConns int `json:"max_conns"`
+
+	creds []CredConfig // resolved credential list (file or inline)
+
 	// Ciphers lists the carrier AEADs this server accepts, in trial-decrypt
 	// order: "aes-256-gcm" and/or "chacha20-poly1305". Empty defaults to
 	// ["aes-256-gcm"]. List both to serve a mixed fleet (AES-NI desktops +
@@ -44,12 +65,50 @@ type Config struct {
 	// Shaping enables egress length-shaping ("pad" or "none", default none).
 	Shaping string `json:"shaping"`
 
+	// HeadPadding randomises the length of the first frames of every stream,
+	// hiding the size signature of the tunnelled connection's own TLS
+	// handshake (the TLS-in-TLS tell). Default true; set false to disable.
+	HeadPadding *bool `json:"head_padding"`
+
 	// MaxStreams caps concurrent streams per carrier (memory safety). 0 uses the
 	// built-in default (1024); a negative value means unlimited.
 	MaxStreams int `json:"max_streams"`
 
+	// Steal enables REALITY-style active probing resistance. When set, the
+	// server inspects raw ClientHellos: authenticated clients (HMAC tag in
+	// session_id derived from PSK) are handled as Prism carriers; everyone
+	// else has their TCP connection relayed transparently to Dest, so a prober
+	// sees the real site's certificate. Mutually exclusive with ACME/cert_file
+	// (steal generates an ephemeral cert for authenticated clients; the real
+	// target's cert is what probers see).
+	Steal *StealConfig `json:"steal"`
+
 	// Anti-replay / freshness.
 	WindowSeconds int `json:"window_seconds"` // default 120
+
+	// WSPath enables WebSocket transport at the given path (e.g. "/_prism/ws").
+	// When set, clients that upgrade to WebSocket on this path run the Prism
+	// handshake inside the WS stream, letting the carrier traverse CDN infra
+	// (Cloudflare, etc.) that only proxies HTTP. Regular TLS carriers and cover
+	// traffic coexist on the same port — only the exact path triggers the
+	// upgrade. Leave empty to disable.
+	WSPath string `json:"ws_path"`
+
+	// Handshake selects the inner handshake protocol: "" / "legacy" uses the
+	// hand-rolled handshake; "noise" uses the audited flynn/noise Noise_IKpsk2.
+	// Both ends must use the same handshake.
+	Handshake string `json:"handshake"`
+
+	// Admin enables the management API for credential CRUD, key rotation,
+	// per-CID quota and traffic stats.
+	Admin *AdminConfig `json:"admin"`
+
+	// QUICListen enables an HTTP/3 server on this UDP address (e.g. ":443").
+	// Clients with transport "quic" run Prism inside a POST to QUICPath; every
+	// other request is served the cover site, so the port looks like the same
+	// website over HTTP/3. Leave empty to disable.
+	QUICListen string `json:"quic_listen"`
+	QUICPath   string `json:"quic_path"` // default "/_prism/h3"; must match the client
 
 	// Cover: what an unauthenticated visitor (or active prober) sees.
 	// Exactly one is used, in this order: Backend, then StaticDir, then a
@@ -63,6 +122,9 @@ type CredConfig struct {
 	ID   string `json:"id"`  // base64 4 bytes
 	PSK  string `json:"psk"` // base64 32 bytes
 	Name string `json:"name"`
+	// MaxBytesPerDay is this client's daily traffic quota (up + down), reset at
+	// 00:00 UTC. 0 means unlimited.
+	MaxBytesPerDay int64 `json:"max_bytes_per_day,omitempty"`
 }
 
 // ACMEConfig enables automatic certificate issuance and renewal from Let's
@@ -86,6 +148,16 @@ type ACMEConfig struct {
 	DirectoryURL string `json:"directory_url"`
 }
 
+func (c *Config) statsFile() string {
+	if c.StatsFile != "" {
+		return c.StatsFile
+	}
+	if c.CredentialsFile != "" {
+		return filepath.Join(filepath.Dir(c.CredentialsFile), "stats.json")
+	}
+	return ""
+}
+
 func (c *Config) window() time.Duration {
 	if c.WindowSeconds <= 0 {
 		return 120 * time.Second
@@ -105,24 +177,113 @@ func loadConfig(path string) (*Config, *ecdh.PrivateKey, []prism.Credential, err
 	if c.Listen == "" {
 		c.Listen = ":443"
 	}
+	switch c.Handshake {
+	case "", "legacy", "noise":
+	default:
+		return nil, nil, nil, fmt.Errorf("handshake: unknown value %q (want \"\", \"legacy\" or \"noise\")", c.Handshake)
+	}
+	if c.Steal != nil && c.Steal.Dest != "" {
+		if _, _, err := net.SplitHostPort(c.Steal.Dest); err != nil {
+			return nil, nil, nil, fmt.Errorf("steal.dest must be host:port: %w", err)
+		}
+		if c.ACME != nil && c.ACME.Enabled {
+			return nil, nil, nil, fmt.Errorf("steal and acme are mutually exclusive")
+		}
+	}
+	if c.Admin != nil && c.Admin.Listen != "" && len(c.Admin.Token) < 16 {
+		return nil, nil, nil, fmt.Errorf("admin.token must be at least 16 characters (an empty token would leave the admin API open)")
+	}
 	priv, err := prism.ParseServerPrivate(c.PrivateKey)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("private_key: %w", err)
 	}
-	var creds []prism.Credential
-	for i, cc := range c.Credentials {
-		id, err := prism.ParseClientID(cc.ID)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("credentials[%d].id: %w", i, err)
-		}
-		psk, err := prism.DecodeKey(cc.PSK)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("credentials[%d].psk: %w", i, err)
-		}
-		creds = append(creds, prism.Credential{ID: id, PSK: psk})
+	c.creds, err = loadCredConfigs(&c)
+	if err != nil {
+		return nil, nil, nil, err
 	}
-	if len(creds) == 0 {
+	creds, err := parseCreds(c.creds)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if len(creds) == 0 && c.CredentialsFile == "" {
 		return nil, nil, nil, fmt.Errorf("no credentials configured")
 	}
 	return &c, priv, creds, nil
+}
+
+// loadCredConfigs returns the credential list: the credentials file when one
+// is configured (seeding it from the inline list on first start), otherwise
+// the inline list.
+func loadCredConfigs(c *Config) ([]CredConfig, error) {
+	if c.CredentialsFile == "" {
+		return c.Credentials, nil
+	}
+	raw, err := os.ReadFile(c.CredentialsFile)
+	if os.IsNotExist(err) {
+		if err := saveCredConfigs(c.CredentialsFile, c.Credentials); err != nil {
+			return nil, fmt.Errorf("seeding credentials_file: %w", err)
+		}
+		return c.Credentials, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("credentials_file: %w", err)
+	}
+	var out []CredConfig
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", c.CredentialsFile, err)
+	}
+	return out, nil
+}
+
+// saveCredConfigs atomically replaces the credentials file (0600: it holds PSKs).
+func saveCredConfigs(path string, creds []CredConfig) error {
+	if creds == nil {
+		creds = []CredConfig{}
+	}
+	raw, err := json.MarshalIndent(creds, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".credentials-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(append(raw, '\n')); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
+}
+
+func parseCreds(ccs []CredConfig) ([]prism.Credential, error) {
+	seen := make(map[prism.ClientID]bool, len(ccs))
+	creds := make([]prism.Credential, 0, len(ccs))
+	for i, cc := range ccs {
+		id, err := prism.ParseClientID(cc.ID)
+		if err != nil {
+			return nil, fmt.Errorf("credentials[%d].id: %w", i, err)
+		}
+		if seen[id] {
+			return nil, fmt.Errorf("credentials[%d]: duplicate id %s", i, cc.ID)
+		}
+		seen[id] = true
+		psk, err := prism.DecodeKey(cc.PSK)
+		if err != nil {
+			return nil, fmt.Errorf("credentials[%d].psk: %w", i, err)
+		}
+		creds = append(creds, prism.Credential{ID: id, PSK: psk, Name: cc.Name})
+	}
+	return creds, nil
 }

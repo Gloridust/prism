@@ -1,153 +1,69 @@
 # Prism
 
-**一个原创的抗审查隧道协议 + 两端软件**，用于把多地办公室/远程员工的出口统一收敛到新加坡公司。
+[![Test](https://github.com/Gloridust/prism/actions/workflows/test.yml/badge.svg)](https://github.com/Gloridust/prism/actions/workflows/test.yml)
 
-- 对观察者而言，流量就是**对你自有域名的一次普通 HTTPS 连接**。
-- 任何没有有效凭据的访问者（包括主动探测）看到的，是你服务器上**一个真实的网站**。
-- 鉴权是 **X25519 + 每客户端 PSK 的双因子互认**，握手首包 80 字节不可区分于随机，带前向保密与抗重放。
-- 数据面**不套内层 TLS**（规避 TLS-in-TLS 指纹），自有 AEAD 分帧 + **逐流流控的多路复用** + 整形。
-- 载波握手用 **uTLS 模拟 Chrome 的 ClientHello**（规避 Go `crypto/tls` 指纹）；证书支持 **ACME/Let's Encrypt 自动签发**；无 AES-NI 的路由器可切 **ChaCha20-Poly1305**（同线格式，服务端自动识别）。
-- 一条命令交叉编译到路由器 / macOS / Windows。生产加固引入了首批第三方依赖（uTLS、x/crypto），这是刻意的取舍，见下方 [依赖与取舍](#依赖与取舍)。
+简体中文 | [English](README.en.md)
 
-> 设计细节与字节级规范见 [`docs/PROTOCOL.md`](docs/PROTOCOL.md)。
-> 与 REALITY/Trojan/VLESS 的区别、安全局限与诚实告警也在那里，**上线前务必读第 9 节**。
+**Prism 是一套面向企业的加密隧道，把分布在各地的办公室和远程员工，统一经由公司自己的境外出口访问互联网。**
 
----
-
-## 组成
+在网络上，它看起来就是一次访问你公司网站的普通 HTTPS 连接。
 
 ```
-pkg/prism/            协议核心（除 ChaCha 外纯标准库，带单元测试）
-  kdf.go  aead.go  aead_chacha.go  keys.go  handshake.go  replay.go  session.go  addr.go
-cmd/prism-server/     新加坡出口：TLS(ACME/证书/自签) + 鉴权 + 多路复用出口 + 真实网站回落
-cmd/prism-client/     跨平台客户端：uTLS 载波 + 路由器旁车 / 桌面(系统代理+控制面板)
-config/               配置样例 + Nikki/Mihomo 路由片段
-test/                 uTLS 载波 + prism 端到端联调（AES/ChaCha，1MiB + 并发）
-scripts/              OpenWrt init / systemd / 桌面启动器
-docs/PROTOCOL.md      协议规范
+办公室路由器 ─┐
+在家办公电脑 ─┼──►  Prism 出口服务器（如新加坡） ──►  互联网
+出差笔记本   ─┘
 ```
 
----
+## 为什么选择 Prism
+
+- **难以识别**：流量与正常 HTTPS 无异，模拟 Chrome 浏览器的连接特征，没有可供识别的固定特征。
+- **抗主动探测**：没有凭据的访问者只会看到一个真实的网站，无法判断背后有隧道。
+- **不泄露真实 IP**：内置 DNS、WebRTC、IPv6 防泄露；可选 kill-switch，客户端意外退出时断网而不是直连。
+- **企业级运维**：每台设备独立凭据，可随时吊销、轮换、限额；Prometheus 监控；多出口自动故障切换。
+- **全平台**：OpenWrt 路由器（整个办公室免配置）、macOS、Windows、Linux。
+- **多种入口**：TLS、WebSocket（可经 CDN）、HTTP/3，按网络环境选择。
+- **部署简单**：单个二进制，证书自动签发，一条命令生成密钥与配置。
+
+Prism 借鉴了 Trojan、REALITY、VLESS-Vision、Hysteria2 等协议各自的长处，详细对照见 [协议规范 §0.1](docs/PROTOCOL.md#01-取长补短与主流协议逐项对照)。
+
+## 安装
+
+从 [Releases](https://github.com/Gloridust/prism/releases) 下载对应平台的程序，或从源码构建（Go 1.27+）：
+
+```bash
+make all
+```
 
 ## 快速开始
 
-### 0. 构建
+**1. 出口服务器**
 
 ```bash
-make all                     # 本机构建 + 跑测试
-make server-linux-amd64      # 新加坡服务器
-make client-linux-arm64      # 路由器（按 CPU 选 arm64 / mipsle / mips）
-make client-darwin-arm64     # Apple Silicon Mac
-make client-windows-amd64    # Windows
+./prism-server keygen sg.example.com   # 生成 server.json 和 client.json
+./prism-server -c server.json
 ```
 
-### 1. 新加坡服务器
+在 `server.json` 中开启 `acme` 自动证书，并把 `cover_backend` 指向一个真实网站。
 
-```bash
-# 生成密钥，直接得到可粘贴的 server.json / client.json
-./prism-server keygen sg.example.com
+**2. 客户端**
 
-# 把 server.json 放好，然后：
-./prism-server -c /etc/prism/server.json
-```
+- **办公室路由器（OpenWrt）**：安装 `prism-client` 后由 Nikki/Mihomo 分流，整个办公室即可使用。
+- **macOS / Windows**：把 `prism-client`、`client.json` 和启动脚本放在一起，双击启动，在弹出的控制面板中点“连接”。
 
-**证书（三选一，优先级 ACME > cert_file/key_file > self_signed）**：
+完整步骤见 [安装与快速上手](docs/INSTALL.md)。
 
-- `acme`（**推荐**）：自动向 Let's Encrypt 签发并续期，走 TLS-ALPN-01 挑战，**只用现成的 :443**，不需要 80 端口或额外 Web 服务。要求域名解析到本机且公网可达 :443。
+## 文档
 
-  ```json
-  "acme": { "enabled": true, "domains": ["sg.example.com"], "email": "you@example.com",
-            "cache_dir": "/etc/prism/acme" }
-  ```
-  首次测试建议把 `directory_url` 指向 Let's Encrypt staging，避免触发生产额度限制。
-- `cert_file` + `key_file`：自己用 certbot 签发并续期（`certbot certonly --standalone -d sg.example.com`，续期时 reload 本服务）。
-- `self_signed`：**仅本地测试**，过不了仔细探测；启动会打印 WARNING。
-
-强烈建议把 `cover_backend` 指向一个**真实的网站/应用**（反代），这样主动探测看到的是真站。
-用 systemd 托管见 `scripts/prism-server.service`。
-
-> 吊销某客户端：从 server.json 的 `credentials` 删掉该条，然后 `kill -HUP <prism-server-pid>` 热加载——无需重启，且会**立即踢掉**该凭据正在用的连接。
-
-**载波算法**：服务端 `ciphers` 列出接受的 AEAD（默认 `["aes-256-gcm"]`）。要同时服务有 AES-NI 的桌面和无 AES-NI 的路由器，列上两者 `["aes-256-gcm","chacha20-poly1305"]`——同线格式、无明文选择符，服务端按配置试解密自动识别每个客户端用的算法。
-
-> 新增一个办公室/员工：`prism-keygen client <名字>` 生成一条 `{id, psk}`，加进服务器 `credentials`、把 `id/psk/server_public_key` 发给对方即可；删掉该条即吊销该客户端。
-
-**验证抗探测**：浏览器直接访问 `https://sg.example.com/` 应当看到你的掩护网站，而不是任何异常。
-
-### 2A. 路由器（OpenWrt + Nikki）
-
-```bash
-# 路由器上
-cp prism-client /usr/bin/ && chmod +x /usr/bin/prism-client
-mkdir -p /etc/prism && cp client-router.json /etc/prism/client.json
-cp scripts/openwrt-prism-client.init /etc/init.d/prism-client
-chmod +x /etc/init.d/prism-client
-/etc/init.d/prism-client enable && /etc/init.d/prism-client start
-```
-
-然后在 Nikki/Mihomo 配置里加入 `config/nikki-mihomo.example.yaml` 的片段：定义一个指向
-`127.0.0.1:1080` 的 `socks5` 出站 `PRISM-SG`，把出国流量路由进去，并掐掉 QUIC(UDP/443) 强制回落 TCP。
-
-> **无 AES-NI 的路由器（MIPS / 老 ARM）**：在 `client.json` 里设 `"cipher": "chacha20-poly1305"`（服务端 `ciphers` 需包含它），软件实现比 AES-GCM 更快且常数时间。也可直接编译一个默认 ChaCha 的固件客户端：`go build -tags prism_chacha ./cmd/prism-client`，这样免改配置即默认走 ChaCha（显式 `cipher` 仍可覆盖）。
-
-### 2B. 在家办公的 macOS / Windows 员工（无路由器）
-
-把 `prism-client`、`client-desktop.json`（改名 `client.json`）、对应启动器放一个文件夹：
-
-- **macOS**：首次 `chmod +x start-macos.command`，之后双击它。浏览器会打开控制面板，点"连接"。
-- **Windows**：双击 `start-windows.bat`。
-
-桌面模式会自动设置系统代理（mac 用 `networksetup`，Windows 用 WinINET），并在
-`http://127.0.0.1:9797` 提供一个连接/断开的控制面板。退出时自动还原系统代理。
-
----
-
-## 它如何抵御审查（概览）
-
-| 审查手段 | Prism 的应对 |
+| 文档 | 内容 |
 |---|---|
-| 被动 DPI / TLS 指纹 | 对自有域名的真实 TLS 1.3；**uTLS 模拟 Chrome ClientHello**；首包无明文特征 |
-| 主动探测 | 无凭据 → 同机真实网站回落，探测只见正常站点 |
-| SNI / 证书封锁 | 自有域名 + 真实证书，SNI 即正常域名 |
-| TLS-in-TLS 检测 | 数据面不套内层 TLS，自有分帧 + 整形 |
-| 熵分析 | 高熵只出现在 TLS 记录体内，无裸随机段 |
-| 重放 | 一次性临时公钥 + 新鲜度窗口 + 重放集合 |
+| [安装与快速上手](docs/INSTALL.md) | 从零跑通第一条隧道 |
+| [部署与运维](docs/DEPLOY.md) | 生产上线清单、凭据管理、监控、升级、排障 |
+| [配置参考](docs/CONFIG.md) | 服务端与客户端全部配置项 |
+| [安全说明](docs/SECURITY.md) | 安全模型、已知局限、漏洞报告 |
+| [协议规范](docs/PROTOCOL.md) | 握手、分帧、多路复用等字节级设计 |
+| [开发指南](docs/DEVELOPMENT.md) | 代码结构、构建、测试 |
 
----
+## 注意
 
-## 安全与合规（请读）
-
-- 握手为**自研未审计**构造，刻意对齐 Noise_IKpsk2 以便替换为成熟库；面对高风险对手上线前请做密码学评审。
-- 载波已接 **uTLS 模拟 Chrome 指纹**（`cmd/prism-client/dialer.go`）；仍需跟随 Chrome 版本更新 uTLS，`HelloChrome_Auto` 只对齐到打包时的某个稳定版，且 uTLS 指纹本身也在被研究，需持续迭代。
-- 自有域名会被枚举/封锁，注意域名隔离与运维卫生。
-- UDP（DNS/QUIC/实时音视频）走 UDP-over-stream 转发，附带 TCP 可靠语义，对 QUIC 非最优但够用。
-- 出口默认拒绝连向私网/环回/云元数据地址（防 SSRF）；确需时在 server.json 设 `allow_private:true`。
-- 这是**坚实的工程基座，不是实网对抗成品**。完整清单见 `docs/PROTOCOL.md` §9。
-- 统一出口是正当企业需求，但请自行确认符合各运营地法律法规与公司合规。
-
----
-
-## 依赖与取舍
-
-Prism 的协议核心 `pkg/prism/`（握手、KDF、分帧、mux、流控、重放）**除 ChaCha 外仍是纯 Go 标准库**。生产加固引入了**首批第三方依赖**，这是刻意的、也是无法在标准库内完成的取舍：
-
-| 依赖 | 用途 | 为什么标准库做不到 |
-|---|---|---|
-| `github.com/refraction-networking/utls` | 客户端载波握手模拟 Chrome 的 ClientHello | Go `crypto/tls` 的 ClientHello（扩展顺序、GREASE、密码套件等）是一类**可被指纹识别**的特征，标准库不开放自定义 |
-| `golang.org/x/crypto` | 路由器用的 **ChaCha20-Poly1305**；证书的 **acme/autocert** 自动签发 | 这两者都不在标准库内 |
-
-因此 `go.mod` 不再是零依赖。影响与应对：
-
-- **离线/受限构建**：先在有网主机 `go mod download` 或 `go mod vendor`（提交 `vendor/`），之后即可离线交叉编译。
-- **交叉编译不受影响**：uTLS 与 x/crypto 均为纯 Go（无 CGO），`linux/mipsle`、`darwin/arm64`、`windows/amd64` 等目标照常 `GOOS/GOARCH` 一条命令构建（已验证）。
-- **想保留极简核心**：`pkg/prism` 可单独作为库引用；只有当你用到 `NewChaCha20Poly1305AEAD` 时才会真正链接 x/crypto 的 chacha 包，uTLS/autocert 只在 `cmd/` 里用到。
-
----
-
-## 测试
-
-```bash
-go test ./...        # 握手往返 / 重放拒绝 / AEAD(AES+ChaCha) / 算法协商矩阵 / 分帧 / mux / 流控(4MiB) /
-                     # 24并发流 / 回落 / uTLS 载波端到端(AES+ChaCha, 1MiB 完整性 + 并发)
-go test -race ./...  # 并发/mux 竞态检查
-```
+- Prism 尚未经过独立的第三方密码学审计，也未在真实审查网络中长期验证。用于高风险场景前，请先阅读 [安全说明](docs/SECURITY.md)。
+- 请确认你的部署符合各运营地的法律法规与公司合规要求。

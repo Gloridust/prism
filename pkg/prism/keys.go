@@ -43,8 +43,18 @@ func NewPSK() ([]byte, error) {
 // and PSK. The server keeps a small set of these and trial-authenticates an
 // incoming ClientInit against each, which gives per-client revocation.
 type Credential struct {
-	ID  ClientID
-	PSK []byte
+	ID   ClientID
+	PSK  []byte
+	Name string // human label (e.g. "office-local", "laptop-01")
+}
+
+// NewClientID generates a cryptographically random 4-byte client ID.
+func NewClientID() (ClientID, error) {
+	var id ClientID
+	if _, err := rand.Read(id[:]); err != nil {
+		return id, err
+	}
+	return id, nil
 }
 
 // --- base64 helpers for config files ---

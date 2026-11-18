@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS 配置描述文件（MDM 下发或双击安装）：强制 Chrome / Edge / Brave / Firefox
+  的 WebRTC 只走代理，不再用直连 UDP 做 STUN，因此无法暴露真实公网/内网 IP。
+  这是"强制"级策略，用户和扩展都改不掉；prism-client 自带的 webrtc_guard
+  只是用户级的"推荐"策略。
+  disable_non_proxied_udp：WebRTC 改走代理上的 TURN-over-TCP，通话质量会有所下降，
+  但在系统代理模式和 TUN 模式下都安全。
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>PayloadContent</key>
+	<array>
+		<dict>
+			<key>PayloadType</key><string>com.google.Chrome</string>
+			<key>PayloadIdentifier</key><string>com.prism.webrtc.chrome</string>
+			<key>PayloadUUID</key><string>EA0D8BF2-F7B2-460D-8DD8-8DF91753C13E</string>
+			<key>PayloadVersion</key><integer>1</integer>
+			<key>WebRtcIPHandling</key><string>disable_non_proxied_udp</string>
+		</dict>
+		<dict>
+			<key>PayloadType</key><string>com.microsoft.Edge</string>
+			<key>PayloadIdentifier</key><string>com.prism.webrtc.edge</string>
+			<key>PayloadUUID</key><string>C0D95A51-DFB5-46EC-9155-F03CFAA506FB</string>
+			<key>PayloadVersion</key><integer>1</integer>
+			<key>WebRtcLocalhostIpHandling</key><string>disable_non_proxied_udp</string>
+		</dict>
+		<dict>
+			<key>PayloadType</key><string>com.brave.Browser</string>
+			<key>PayloadIdentifier</key><string>com.prism.webrtc.brave</string>
+			<key>PayloadUUID</key><string>7A9CD3B4-16C2-4A98-9484-6D36D8DAB02F</string>
+			<key>PayloadVersion</key><integer>1</integer>
+			<key>WebRtcIPHandling</key><string>disable_non_proxied_udp</string>
+		</dict>
+		<dict>
+			<key>PayloadType</key><string>org.mozilla.firefox</string>
+			<key>PayloadIdentifier</key><string>com.prism.webrtc.firefox</string>
+			<key>PayloadUUID</key><string>E539ECDA-BEAB-4DBE-AFE5-349B4C7119D3</string>
+			<key>PayloadVersion</key><integer>1</integer>
+			<key>EnterprisePoliciesEnabled</key><true/>
+			<key>Preferences</key>
+			<dict>
+				<key>media.peerconnection.ice.proxy_only_if_behind_proxy</key>
+				<dict><key>Value</key><true/><key>Status</key><string>locked</string></dict>
+				<key>media.peerconnection.ice.default_address_only</key>
+				<dict><key>Value</key><true/><key>Status</key><string>locked</string></dict>
+			</dict>
+		</dict>
+	</array>
+	<key>PayloadDisplayName</key><string>Prism WebRTC 防泄露</string>
+	<key>PayloadIdentifier</key><string>com.prism.webrtc</string>
+	<key>PayloadType</key><string>Configuration</string>
+	<key>PayloadUUID</key><string>33B5F7A9-6BF7-49E9-9E59-C1F7A7B9D941</string>
+	<key>PayloadVersion</key><integer>1</integer>
+	<key>PayloadScope</key><string>System</string>
+</dict>
+</plist>

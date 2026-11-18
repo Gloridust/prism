@@ -4,7 +4,9 @@ package main
 
 import (
 	"log"
+	"net"
 	"os/exec"
+	"strings"
 )
 
 const regKey = `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`
@@ -35,6 +37,50 @@ func refreshWinINet() {
 		`[void]$t::InternetSetOption([IntPtr]::Zero,39,[IntPtr]::Zero,0);` +
 		`[void]$t::InternetSetOption([IntPtr]::Zero,37,[IntPtr]::Zero,0)`
 	run("powershell", "-NoProfile", "-NonInteractive", "-Command", script)
+}
+
+func setSystemDNS(dnsAddr string) error {
+	host, _, _ := net.SplitHostPort(dnsAddr)
+	for _, iface := range activeInterfaces() {
+		// validate=no: netsh would otherwise probe the resolver and fail while
+		// our DNS proxy is still starting.
+		run("netsh", "interface", "ipv4", "set", "dnsservers", "name="+iface, "source=static", "address="+host, "validate=no")
+	}
+	log.Printf("system DNS set to %s", host)
+	return nil
+}
+
+func clearSystemDNS() error {
+	for _, iface := range activeInterfaces() {
+		run("netsh", "interface", "ipv4", "set", "dnsservers", "name="+iface, "source=dhcp")
+	}
+	log.Printf("system DNS restored to DHCP defaults")
+	return nil
+}
+
+// activeInterfaces lists the adapters whose DNS must point at the local proxy:
+// every one that is up and has an IPv4 address, except loopback and the Prism
+// TUN. It uses the OS interface table rather than parsing netsh's localized,
+// column-formatted output.
+func activeInterfaces() []string {
+	ifs, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	var names []string
+	for _, ifc := range ifs {
+		if ifc.Flags&net.FlagUp == 0 || ifc.Flags&net.FlagLoopback != 0 || strings.HasPrefix(strings.ToLower(ifc.Name), "prism") {
+			continue
+		}
+		addrs, _ := ifc.Addrs()
+		for _, a := range addrs {
+			if ipn, ok := a.(*net.IPNet); ok && ipn.IP.To4() != nil && !ipn.IP.IsLinkLocalUnicast() {
+				names = append(names, ifc.Name)
+				break
+			}
+		}
+	}
+	return names
 }
 
 func run(name string, args ...string) {

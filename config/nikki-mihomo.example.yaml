@@ -4,6 +4,21 @@
 # Prism 现已支持 UDP（SOCKS5 UDP ASSOCIATE，经 UDP-over-stream 转发），
 # 故 UDP（含 QUIC/DNS/实时音视频）也可直接走 PRISM-SG，无需再拒绝 QUIC。
 
+# ---- WebRTC / IP 泄露防护（重要）----
+# 1) IPv6：国内宽带通常给 LAN 终端分配公网 IPv6。如果 Mihomo 不接管 IPv6，
+#    终端的 IPv6 流量（含 WebRTC STUN）会绕过代理直连，暴露公司真实地址。
+#    二选一：
+#    a. 让 Mihomo 接管 IPv6：保持下面的 ipv6: true，并在 Nikki 里开启 IPv6 代理/TUN；
+#    b. 更稳妥：在 OpenWrt 上关闭 LAN 的 IPv6 分发，终端没有公网 IPv6 就无从泄露：
+#         uci set dhcp.lan.ra='disabled'
+#         uci set dhcp.lan.dhcpv6='disabled'
+#         uci set dhcp.lan.ndp='disabled'
+#         uci commit dhcp && /etc/init.d/odhcpd restart
+# 2) STUN：网站可以故意指定一个国内的 STUN 服务器，GEOIP,CN,DIRECT 会让这类
+#    探测直连出去，从而拿到真实公网 IP。下面的规则把 STUN/TURN 端口
+#    排在 GEOIP 之前，强制走新加坡出口。
+ipv6: true
+
 proxies:
   - name: "PRISM-SG"
     type: socks5
@@ -19,6 +34,13 @@ proxy-groups:
       - "DIRECT"
 
 rules:
+  # 0) WebRTC STUN/TURN 一律走出口，排在国内直连之前，防止经国内 STUN 暴露真实 IP
+  - DST-PORT,3478,PRISM-SG
+  - DST-PORT,5349,PRISM-SG
+  - DST-PORT,19302,PRISM-SG
+  # 最严格的选项：所有 UDP 都走出口，可防住使用非标准端口的 STUN；代价是国内 UDP 应用
+  # （游戏、国内会议软件）也会绕道新加坡。需要时取消下一行的注释：
+  # - NETWORK,udp,PRISM-SG
   # 1) 国内直连
   - GEOIP,CN,DIRECT,no-resolve
   # 2) 其余全部走新加坡出口（TCP 与 UDP 皆可）

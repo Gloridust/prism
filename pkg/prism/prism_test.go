@@ -228,3 +228,25 @@ func TestServerFallbackOnShortHTTPRequest(t *testing.T) {
 		t.Fatal("server blocked on a complete short HTTP request (probe timing tell)")
 	}
 }
+
+func TestAddrRejectsHostileDomains(t *testing.T) {
+	for _, host := range []string{"", "a b.com", "a\nb.com", "ex[ample.com", "a:b", "a/b", "evil.com\x00", "host%eth0"} {
+		if _, err := EncodeAddr(net.JoinHostPort(host, "80")); err == nil && host != "" {
+			t.Errorf("EncodeAddr accepted host %q", host)
+		}
+		raw := append([]byte{atypDomain, byte(len(host))}, host...)
+		raw = append(raw, 0, 80)
+		if _, err := DecodeAddr(raw); err == nil {
+			t.Errorf("DecodeAddr accepted host %q", host)
+		}
+	}
+	for _, hp := range []string{"example.com:443", "xn--fiqs8s.example:80", "_dmarc.a-b.example:53", "1.2.3.4:1", "[2001:db8::1]:2"} {
+		b, err := EncodeAddr(hp)
+		if err != nil {
+			t.Fatalf("EncodeAddr(%q): %v", hp, err)
+		}
+		if got, err := DecodeAddr(b); err != nil || got != hp {
+			t.Fatalf("round trip %q -> %q, %v", hp, got, err)
+		}
+	}
+}
