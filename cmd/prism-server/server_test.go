@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -173,7 +174,7 @@ func TestAdminMutationsPersistAndKick(t *testing.T) {
 
 	// What is on disk is exactly what a restart would load.
 	fi, err := os.Stat(s.credsFile)
-	if err != nil || fi.Mode().Perm() != 0o600 {
+	if err != nil || (runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600) {
 		t.Fatalf("credentials file: %v mode %v", err, fi.Mode())
 	}
 	loaded, err := loadCredConfigs(&Config{CredentialsFile: s.credsFile})
