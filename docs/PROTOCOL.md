@@ -357,7 +357,7 @@ WebRTC 会用 STUN（UDP）探测本机的公网地址（server-reflexive candid
 | 模式 | 机制 | 保证程度 |
 |---|---|---|
 | TUN 全局（`tun`） | IPv4 用 `0/1`+`128/1`、IPv6 用 `::/1`+`8000::/1` 全部路由进 TUN；UDP 按 §7.6 封帧经隧道转发，STUN 从新加坡出口发出，探测到的是新加坡地址。服务器地址在启动时固定为一个 IPv4（`pinServerIPv4`），并加主机路由，避免载波自身被 TUN 接管而形成环路。若本机有公网 IPv6 但接管失败，**拒绝启动**（fail-closed）。浏览器侧再加 `default_public_interface_only`，物理网卡的内网地址也不会出现在 candidate 里。 | 对所有应用生效，包括 Safari 和原生会议软件 |
-| 桌面系统代理 | `webrtc_guard`（默认开启）：连接时写入 Chrome/Brave 的 `WebRtcIPHandling` 和 Edge 的 `WebRtcLocalhostIpHandling`，值为 `disable_non_proxied_udp`，断开时恢复原值；Firefox 的 `user.js` 写入 `proxy_only_if_behind_proxy` 和 `default_address_only`。WebRTC 不再发直连 UDP，改走代理上的 TURN-over-TCP。 | 只覆盖上述浏览器；Safari 和原生应用仍会直连，需要完全防护请用 TUN |
+| 桌面系统代理 | `webrtc_guard`（默认开启）：连接时写入 Chrome/Brave 的 `WebRtcIPHandling` 和 Edge 的 `WebRtcLocalhostIpHandling`，值为 `disable_non_proxied_udp`，断开时恢复原值；Firefox 的 `user.js` 写入 `proxy_only_if_behind_proxy` 和 `default_address_only`。WebRTC 不再发直连 UDP，改走代理上的 TURN-over-TCP。 | 只覆盖上述浏览器；Safari 和原生应用仍会直连，需要完全防护请用 TUN。**Linux 上的 Edge 不在覆盖范围内**：微软只在 Windows 和 macOS 上提供这项策略，真实 Edge 在 Linux 上实测仍会暴露地址，客户端启动时会对此告警 |
 | 路由器（Nikki/Mihomo） | STUN/TURN 端口（3478/5349/19302）的规则排在 `GEOIP,CN,DIRECT` 之前，强制走出口；IPv6 要么由 Mihomo 接管，要么关闭 LAN 的 IPv6 分发（见 `config/nikki-mihomo.example.yaml`）。最严格的做法是 `NETWORK,udp,PRISM-SG`。 | 覆盖整个 LAN |
 
 全公司强制：`config/webrtc-policy.mobileconfig`（macOS MDM）、`config/webrtc-policy.reg`（Windows HKLM/GPO）、`config/firefox-policies.json` 提供 mandatory 级策略，用户和扩展都无法覆盖。

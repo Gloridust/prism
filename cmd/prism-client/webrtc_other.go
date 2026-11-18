@@ -20,9 +20,14 @@ type chromiumBrowser struct {
 var chromiumBrowsers = []chromiumBrowser{
 	{"Chrome", []string{"google-chrome", "google-chrome-stable"}, "/etc/opt/chrome/policies/managed", "WebRtcIPHandling"},
 	{"Chromium", []string{"chromium", "chromium-browser"}, "/etc/chromium/policies/managed", "WebRtcIPHandling"},
-	{"Edge", []string{"microsoft-edge", "microsoft-edge-stable"}, "/etc/opt/edge/policies/managed", "WebRtcLocalhostIpHandling"},
 	{"Brave", []string{"brave-browser", "brave"}, "/etc/brave/policies/managed", "WebRtcIPHandling"},
 }
+
+// edgeBinaries: Edge has no WebRTC IP-handling policy on Linux (Microsoft
+// supports WebRtcLocalhostIpHandling and WebRtcIPHandlingUrl on Windows and
+// macOS only, and a real Edge on Linux ignores them and Chromium's
+// WebRtcIPHandling alike), so the guard cannot cover it here.
+var edgeBinaries = []string{"microsoft-edge", "microsoft-edge-stable"}
 
 func (b chromiumBrowser) installed() bool {
 	for _, name := range b.binaries {
@@ -39,22 +44,16 @@ const linuxPolicyFile = "prism-webrtc.json"
 // Chromium-family browser. Linux only reads these from /etc, so it needs root
 // (which TUN mode already has); otherwise it just explains what to do.
 func applyChromiumWebRTC(value string) (restore []func(), applied []string) {
+	if (chromiumBrowser{binaries: edgeBinaries}).installed() {
+		log.Printf("WebRTC guard: Microsoft Edge on Linux offers no policy to restrict WebRTC and is NOT protected " +
+			"in proxy mode — use TUN mode, or Chrome/Firefox")
+	}
 	for _, b := range chromiumBrowsers {
 		if !b.installed() {
 			continue
 		}
 		path := filepath.Join(b.policyDir, linuxPolicyFile)
-		// Edge documents WebRtcLocalhostIpHandling for Windows and macOS only;
-		// on Linux it follows the Chromium policies instead (confirmed with a
-		// real Edge). Writing all of them is harmless: a browser ignores the
-		// names it does not know.
-		data, _ := json.Marshal(map[string]any{
-			b.key:              value,
-			"WebRtcIPHandling": value,
-			"WebRtcIPHandlingUrl": []map[string]string{
-				{"url": "*", "handling": value},
-			},
-		})
+		data, _ := json.Marshal(map[string]string{b.key: value})
 		err := os.MkdirAll(b.policyDir, 0o755)
 		if err == nil {
 			err = os.WriteFile(path, data, 0o644)

@@ -141,7 +141,7 @@ scrape_configs:
 
 ### 6.2 桌面（macOS / Windows）
 
-- **系统代理模式**（默认）：自动设置系统代理，控制面板在 `http://127.0.0.1:9797`。`webrtc_guard` 默认开启，为 Chrome / Edge / Brave / Firefox 写入 WebRTC 策略。Safari 和原生应用不受浏览器策略约束。
+- **系统代理模式**（默认）：自动设置系统代理，控制面板在 `http://127.0.0.1:9797`。`webrtc_guard` 默认开启，为 Chrome / Edge / Brave / Firefox 写入 WebRTC 策略。Safari 和原生应用不受浏览器策略约束；Linux 上的 Edge 也没有可用的策略（客户端会告警），这些情况请用 TUN 模式。
 - **TUN 全局模式**（配置 `tun` 块，需管理员权限）：IPv4 与 IPv6 全部进隧道，覆盖所有应用。**要求不泄露真实 IP 时用这个模式。**
 - **Kill-switch**：在 `tun` 块里加 `"kill_switch": true`。启用后只有隧道、Prism 服务器和本地网络可达，客户端崩溃或被强杀时机器断网而不是回到直连。此时发往局域网解析器的 DNS 也会被拒绝，所以需要同时配置 `dns` 块（或把系统 DNS 设为公网解析器，让查询走隧道）。异常退出后恢复上网：重新启动客户端，或以管理员身份执行 `prism-client -killswitch-off`。Linux 需要 nftables，Windows 需要系统防火墙处于启用状态。需要开机即受保护（重启后、隧道建立前也不允许直连）时再加 `"kill_switch_boot": true`，并把客户端设为开机自启；此模式下正常退出也不会解除规则，只能用 `-killswitch-off`。
 - `dns` 块开启本地 DNS 代理并把系统 DNS 指向它，防止直连解析泄露访问目标。

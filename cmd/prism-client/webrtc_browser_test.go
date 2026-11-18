@@ -283,6 +283,9 @@ func TestChromiumHonoursWebRTCGuard(t *testing.T) {
 		}
 		ran++
 		t.Run(b.name, func(t *testing.T) {
+			if runtime.GOOS == "linux" && b.name == "Edge" {
+				t.Skip("Edge has no WebRTC IP-handling policy on Linux; the guard reports it as unprotected (see webrtc_other.go)")
+			}
 			lab := newWebRTCLab(t)
 			run := func(label string) ([]string, int64) {
 				dir := t.TempDir()
