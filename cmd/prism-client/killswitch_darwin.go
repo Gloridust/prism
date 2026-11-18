@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"html"
 	"os"
 	"os/exec"
 	"regexp"
@@ -106,7 +107,7 @@ func ksPlistText() string {
 	<array>
 		<string>/bin/sh</string>
 		<string>-c</string>
-		<string>` + ksBootCommand() + `</string>
+		<string>` + html.EscapeString(ksBootCommand()) + `</string>
 	</array>
 	<key>RunAtLoad</key><true/>
 </dict>

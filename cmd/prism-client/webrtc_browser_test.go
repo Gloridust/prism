@@ -218,6 +218,17 @@ func (l *webrtcLab) url() string { return "http://" + l.web.Addr().String() + "/
 // many STUN requests reached the server meanwhile.
 func (l *webrtcLab) gather(label, bin, marker string, args ...string) (cands []string, hits int64) {
 	l.t.Helper()
+	cands, hits, ok := l.tryGather(label, bin, marker, args...)
+	if !ok {
+		l.t.Fatalf("%s: the browser never reported WebRTC candidates", label)
+	}
+	return cands, hits
+}
+
+// tryGather is gather that reports, rather than fails on, a browser that never
+// loads the page (ok=false) — some builds will not run headless as root.
+func (l *webrtcLab) tryGather(label, bin, marker string, args ...string) (cands []string, hits int64, ok bool) {
+	l.t.Helper()
 	ch := make(chan []string, 1)
 	l.mu.Lock()
 	l.result = ch
@@ -232,12 +243,12 @@ func (l *webrtcLab) gather(label, bin, marker string, args ...string) (cands []s
 	select {
 	case cands = <-ch:
 	case <-time.After(60 * time.Second):
-		l.t.Fatalf("%s: the browser never reported WebRTC candidates", label)
+		return nil, 0, false
 	}
 	time.Sleep(500 * time.Millisecond)
 	hits = l.stun.hits.Load() - before
 	l.t.Logf("%s: %d STUN request(s) reached the server; candidates: %q", label, hits, cands)
-	return
+	return cands, hits, true
 }
 
 func (l *webrtcLab) assertNoLeak(cands []string, hits int64) {
@@ -282,7 +293,17 @@ func TestChromiumHonoursWebRTCGuard(t *testing.T) {
 				}
 				return lab.gather(label, bin, dir, args...)
 			}
-			if _, baseline := run("without the guard"); baseline == 0 {
+			dir := t.TempDir()
+			baseArgs := []string{"--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+				"--user-data-dir=" + dir, "--proxy-server=socks5://" + lab.proxy.Addr().String(), lab.url()}
+			if runtime.GOOS == "linux" {
+				baseArgs = append([]string{"--no-sandbox"}, baseArgs...)
+			}
+			_, baseline, ok := lab.tryGather("without the guard", bin, dir, baseArgs...)
+			if !ok {
+				t.Skipf("%s does not run headless in this environment; cannot test it here", b.name)
+			}
+			if baseline == 0 {
 				t.Skip("this browser sends no STUN even without the policy; nothing to compare against")
 			}
 			restore, applied := applyChromiumWebRTC(webrtcProxyOnly)
