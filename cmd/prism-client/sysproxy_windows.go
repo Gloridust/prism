@@ -41,43 +41,46 @@ func refreshWinINet() {
 
 func setSystemDNS(dnsAddr string) error {
 	host, _, _ := net.SplitHostPort(dnsAddr)
-	ifaces := activeInterfaces()
-	for _, iface := range ifaces {
-		run("netsh", "interface", "ip", "set", "dns", "name="+iface, "source=static", "addr="+host)
+	for _, iface := range activeInterfaces() {
+		// validate=no: netsh would otherwise probe the resolver and fail while
+		// our DNS proxy is still starting.
+		run("netsh", "interface", "ipv4", "set", "dnsservers", "name="+iface, "source=static", "address="+host, "validate=no")
 	}
-	refreshWinINet()
 	log.Printf("system DNS set to %s", host)
 	return nil
 }
 
 func clearSystemDNS() error {
-	ifaces := activeInterfaces()
-	for _, iface := range ifaces {
-		run("netsh", "interface", "ip", "set", "dns", "name="+iface, "source=dhcp")
+	for _, iface := range activeInterfaces() {
+		run("netsh", "interface", "ipv4", "set", "dnsservers", "name="+iface, "source=dhcp")
 	}
-	refreshWinINet()
 	log.Printf("system DNS restored to DHCP defaults")
 	return nil
 }
 
+// activeInterfaces lists the adapters whose DNS must point at the local proxy:
+// every one that is up and has an IPv4 address, except loopback and the Prism
+// TUN. It uses the OS interface table rather than parsing netsh's localized,
+// column-formatted output.
 func activeInterfaces() []string {
-	out, err := exec.Command("netsh", "interface", "show", "interface").Output()
+	ifs, err := net.Interfaces()
 	if err != nil {
-		return []string{"Wi-Fi", "Ethernet"}
+		return nil
 	}
-	var ifaces []string
-	for _, line := range strings.Split(string(out), "\n") {
-		if strings.Contains(line, "Connected") && !strings.Contains(line, "Dedicated") {
-			fields := strings.Fields(line)
-			if len(fields) >= 4 {
-				ifaces = append(ifaces, strings.Join(fields[3:], " "))
+	var names []string
+	for _, ifc := range ifs {
+		if ifc.Flags&net.FlagUp == 0 || ifc.Flags&net.FlagLoopback != 0 || strings.HasPrefix(strings.ToLower(ifc.Name), "prism") {
+			continue
+		}
+		addrs, _ := ifc.Addrs()
+		for _, a := range addrs {
+			if ipn, ok := a.(*net.IPNet); ok && ipn.IP.To4() != nil && !ipn.IP.IsLinkLocalUnicast() {
+				names = append(names, ifc.Name)
+				break
 			}
 		}
 	}
-	if len(ifaces) == 0 {
-		return []string{"Wi-Fi", "Ethernet"}
-	}
-	return ifaces
+	return names
 }
 
 func run(name string, args ...string) {
