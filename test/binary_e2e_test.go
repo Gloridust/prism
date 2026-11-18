@@ -24,6 +24,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/quic-go/quic-go/http3"
+
 	"github.com/gloridust/prism/pkg/prism"
 )
 
@@ -717,4 +719,45 @@ func TestBinariesFailover(t *testing.T) {
 	if !strings.Contains(clientLog.String(), "egress switched: "+primaryAddr+" -> "+backup.serverAddr) {
 		t.Fatalf("no failover to the backup; client log:\n%s", clientLog.String())
 	}
+}
+
+// TestBinariesH3Cover: the QUIC port is a real HTTP/3 website to everyone but
+// authenticated clients — including a prober that knows the carrier path.
+func TestBinariesH3Cover(t *testing.T) {
+	d := deploy(t, deployOpts{transport: "quic"})
+	echo := tcpEchoServer(t)
+	echoThrough(t, d.socks, echo, 200_000)
+
+	tr := &http3.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+	defer tr.Close()
+	client := &http.Client{Transport: tr, Timeout: 10 * time.Second}
+
+	get := func(method, path string, body io.Reader) (int, string, string) {
+		t.Helper()
+		req, _ := http.NewRequest(method, "https://"+d.serverAddr+path, body)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s over HTTP/3: %v", method, path, err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, resp.Proto, string(b)
+	}
+
+	if code, proto, body := get("GET", "/", nil); code != 200 || proto != "HTTP/3.0" || !strings.Contains(body, "It works.") {
+		t.Fatalf("browser over HTTP/3 got %d %s %q", code, proto, body)
+	}
+	// Probing the carrier path without credentials looks exactly the same.
+	for name, body := range map[string][]byte{
+		"empty":            nil,
+		"short":            []byte("hello"),
+		"clientinit-sized": bytes.Repeat([]byte{0x5a}, 80),
+		"large":            bytes.Repeat([]byte{0x11}, 5000),
+	} {
+		code, _, got := get("POST", "/_prism/h3", bytes.NewReader(body))
+		if code != 200 || !strings.Contains(got, "It works.") {
+			t.Fatalf("probe %q of the carrier path got %d %q, want the cover page", name, code, got)
+		}
+	}
+	echoThrough(t, d.socks, echo, 200_000) // real clients unaffected
 }

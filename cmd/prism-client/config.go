@@ -39,6 +39,10 @@ type ClientConfig struct {
 	//                  control at the transport layer.
 	Transport string `json:"transport"`
 
+	// QUICPath is the HTTP/3 request path that carries the tunnel (must match
+	// the server's quic_path; default "/_prism/h3"). Only for transport="quic".
+	QUICPath string `json:"quic_path"`
+
 	// WSPath is the HTTP path the server exposes for WebSocket upgrade (must
 	// match the server's ws_path). Only used when transport="ws".
 	WSPath string `json:"ws_path"`
@@ -133,6 +137,12 @@ type TUNConfig struct {
 	Gateway     string `json:"gateway"`      // peer IP for point-to-point, e.g. "10.0.85.2"
 	OrigGateway string `json:"orig_gateway"` // original default gateway for server route
 	SetRoutes   *bool  `json:"set_routes"`   // auto-configure default route (default true)
+
+	// KillSwitch installs firewall rules that reject all outbound traffic not
+	// going through the tunnel. They outlive the process: after a crash the
+	// machine has no internet until prism-client runs again or is asked to
+	// remove them (`prism-client -killswitch-off`). Requires set_routes.
+	KillSwitch bool `json:"kill_switch"`
 }
 
 func (c *ClientConfig) defaults() {
@@ -201,6 +211,9 @@ func (c *ClientConfig) validate() error {
 		if net.ParseIP(c.TUN.Gateway) == nil {
 			return fmt.Errorf("tun.gateway must be an IP address")
 		}
+		if c.TUN.KillSwitch && !c.tunSetRoutes() {
+			return fmt.Errorf("tun.kill_switch requires tun.set_routes")
+		}
 		if c.tunSetRoutes() && net.ParseIP(c.TUN.OrigGateway) == nil {
 			return fmt.Errorf("tun.orig_gateway (your LAN's default gateway IP) is required when tun.set_routes is on")
 		}
@@ -243,10 +256,14 @@ func pinServerIPv4(server string) (string, error) {
 	}
 	ips, err := net.LookupIP(host)
 	if err != nil {
+		if cached := loadResolveCache()[host]; cached != "" {
+			return net.JoinHostPort(cached, port), nil
+		}
 		return "", fmt.Errorf("resolve %s: %w", host, err)
 	}
 	for _, ip := range ips {
 		if v4 := ip.To4(); v4 != nil {
+			storeResolved(host, v4.String())
 			return net.JoinHostPort(v4.String(), port), nil
 		}
 	}

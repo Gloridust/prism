@@ -43,8 +43,9 @@ type Dialer struct {
 	wsPath      string // non-empty = WebSocket transport
 	maxLifetime time.Duration
 	iatMaxMs    int
-	useNoise    bool // use audited Noise_IKpsk2 handshake
-	useQUIC     bool // use QUIC/H3 transport
+	useNoise    bool   // use audited Noise_IKpsk2 handshake
+	useQUIC     bool   // use QUIC/H3 transport
+	h3Path      string // HTTP/3 carrier path
 
 	pool []*carrier
 
@@ -133,6 +134,7 @@ func NewDialer(c *ClientConfig, cred *prism.Credential) (*Dialer, error) {
 		iatMaxMs:    c.IATMaxMs,
 		useNoise:    c.Handshake == "noise",
 		useQUIC:     c.Transport == "quic",
+		h3Path:      c.QUICPath,
 		pool:        pool,
 	}
 	servers := append([]ServerEndpoint{{Server: c.Server, SNI: c.SNI, ServerPublicKey: c.ServerPublicKey}}, c.Backups...)
@@ -342,7 +344,7 @@ func (d *Dialer) dialQUICSession(ep *endpoint) (*prism.Session, error) {
 		NextProtos:                     []string{"h3"},
 		EncryptedClientHelloConfigList: ep.ech,
 	}
-	qc, err := prism.QUICClientDial(ep.server, tlsCfg, 10*time.Second)
+	qc, err := prism.H3Dial(ep.server, ep.sni, d.h3Path, tlsCfg, 10*time.Second)
 	if err != nil {
 		return nil, err
 	}

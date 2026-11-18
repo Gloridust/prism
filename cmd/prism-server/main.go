@@ -5,6 +5,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdh"
 	"crypto/tls"
@@ -23,7 +24,6 @@ import (
 	"time"
 
 	"github.com/gloridust/prism/pkg/prism"
-	"github.com/quic-go/quic-go"
 )
 
 const handshakeTimeout = 10 * time.Second
@@ -127,6 +127,13 @@ func main() {
 		acct:         newAccounting(),
 		active:       make(map[*sessConn]struct{}),
 	}
+	statsPath := cfg.statsFile()
+	if statsPath != "" {
+		if err := s.acct.load(statsPath); err != nil {
+			log.Printf("stats file %s unreadable, starting counters from zero: %v", statsPath, err)
+		}
+		go s.acct.persist(statsPath, 30*time.Second, make(chan struct{}))
+	}
 	s.acct.syncQuotas(cfg.creds)
 	if stealMode {
 		s.stealDest = cfg.Steal.Dest
@@ -146,17 +153,20 @@ func main() {
 	if err != nil {
 		log.Fatalf("listen %s: %v", cfg.Listen, err)
 	}
-	var ql *prism.QUICListener
+	var ql *prism.H3Listener
 	if cfg.QUICListen != "" {
 		if stealMode {
-			log.Fatalf("quic_listen cannot be combined with steal (QUIC has no relay-to-real-site fallback)")
+			log.Fatalf("quic_listen cannot be combined with steal")
 		}
-		ql, err = prism.NewQUICListener(cfg.QUICListen, tlsCfg)
+		s.h3Path = cfg.QUICPath
+		if s.h3Path == "" {
+			s.h3Path = prism.DefaultH3Path
+		}
+		ql, err = prism.ListenH3(cfg.QUICListen, tlsCfg, http.HandlerFunc(s.serveH3))
 		if err != nil {
 			log.Fatalf("quic listen %s: %v", cfg.QUICListen, err)
 		}
-		go s.serveQUIC(ql)
-		log.Printf("QUIC listening on %s", cfg.QUICListen)
+		log.Printf("HTTP/3 (QUIC) listening on %s", ql.Addr())
 	}
 
 	// SIGHUP hot-reloads credentials; SIGINT/SIGTERM shut down cleanly.
@@ -174,6 +184,11 @@ func main() {
 				ql.Close()
 			}
 			s.closeAll()
+			if statsPath != "" {
+				if err := s.acct.save(statsPath); err != nil {
+					log.Printf("saving stats: %v", err)
+				}
+			}
 			os.Exit(0)
 		}
 	}()
@@ -260,6 +275,7 @@ type server struct {
 	cfgPath      string              // for SIGHUP reload
 	stealDest    string              // steal mode: relay destination (e.g. "www.microsoft.com:443")
 	wsPath       string              // WebSocket upgrade path (e.g. "/_prism/ws"); empty = disabled
+	h3Path       string              // HTTP/3 carrier path
 	useNoise     bool                // use the Noise handshake
 	acct         *accounting         // per-credential traffic + quotas
 
@@ -437,31 +453,28 @@ func (s *server) handle(raw net.Conn) {
 	s.runSession(tlsConn, keys, cred, "tls", raw.RemoteAddr())
 }
 
-func (s *server) serveQUIC(ql *prism.QUICListener) {
-	for {
-		conn, err := ql.Accept(context.Background())
-		if err != nil {
+// serveH3 answers every HTTP/3 request. A POST to the carrier path whose body
+// opens with a valid Prism handshake becomes a session; everything else —
+// other paths, browsers, probers, a failed handshake — gets the cover site,
+// with whatever was read from the body put back.
+func (s *server) serveH3(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost && r.URL.Path == s.h3Path {
+		conn := prism.NewH3ServerConn(w, r)
+		_ = conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
+		keys, cred, consumed, err := s.handshake(conn)
+		_ = conn.SetReadDeadline(time.Time{})
+		if err == nil {
+			remote, _ := net.ResolveUDPAddr("udp", r.RemoteAddr)
+			s.runSession(conn, keys, cred, "quic", remote)
 			return
 		}
-		go s.handleQUICConn(conn)
+		r.Body = struct {
+			io.Reader
+			io.Closer
+		}{io.MultiReader(bytes.NewReader(consumed), r.Body), r.Body}
 	}
-}
-
-func (s *server) handleQUICConn(qconn *quic.Conn) {
-	qc, err := prism.QUICServerAccept(qconn, handshakeTimeout)
-	if err != nil {
-		qconn.CloseWithError(0, "")
-		return
-	}
-	defer qc.Close()
-
-	qc.SetDeadline(time.Now().Add(handshakeTimeout))
-	keys, cred, _, hsErr := s.handshake(qc)
-	if hsErr != nil {
-		return
-	}
-	qc.SetDeadline(time.Time{})
-	s.runSession(qc, keys, cred, "quic", qconn.RemoteAddr())
+	s.nCover.Add(1)
+	s.cover.ServeHTTP(w, r)
 }
 
 func (s *server) handleStream(st *prism.Stream, m *meter) {

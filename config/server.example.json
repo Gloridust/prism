@@ -61,8 +61,12 @@
   "_admin": "管理 API（可选），例：{\"listen\": \"127.0.0.1:9090\", \"token\": \"至少16字符\"}。凭据增删/轮换、按日配额、流量统计、Prometheus /metrics。token 少于 16 字符拒绝启动；务必绑 127.0.0.1。详见 docs/DEPLOY.md。",
   "admin": null,
 
-  "_quic_listen": "QUIC 监听地址（可选，UDP）。客户端用 transport:quic 连接，弱网下延迟更稳。注意：该入口没有回落站点，主动探测可识别，对抗性线路不建议作为唯一入口。留空不启用。",
+  "_quic_listen": "HTTP/3 监听地址（可选，UDP）。该入口是真实的 HTTP/3 站点：客户端（transport:quic）把隧道跑在对 quic_path 的 POST 请求里，其余请求和握手失败的请求都由回落站点应答。quic_path 默认 /_prism/h3，两端需一致。留空不启用。",
   "quic_listen": "",
+  "quic_path": "",
+
+  "_stats_file": "流量计数与当日配额用量的落盘文件。留空时与 credentials_file 同目录（stats.json）；两者都没配则只在内存中。",
+  "stats_file": "",
 
   "_cover": "未通过鉴权的访问者（含主动探测）看到的内容。三选一，优先级 Backend > StaticDir > 内置占位页。强烈建议反代到一个真实网站。cover 现已支持 HTTP/2（h2 ALPN）。",
   "cover_backend": "http://127.0.0.1:8080",

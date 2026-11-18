@@ -35,6 +35,11 @@ type Config struct {
 	// write (e.g. /var/lib/prism/credentials.json).
 	CredentialsFile string `json:"credentials_file"`
 
+	// StatsFile persists per-credential traffic counters and the current day's
+	// quota usage across restarts. Defaults to stats.json next to
+	// CredentialsFile; with neither set, accounting is in-memory only.
+	StatsFile string `json:"stats_file"`
+
 	// MaxConns caps concurrent inbound TCP connections (authenticated or not),
 	// bounding memory and file descriptors under a connection flood. 0 uses the
 	// default (4096); negative means unlimited.
@@ -98,10 +103,12 @@ type Config struct {
 	// per-CID quota and traffic stats.
 	Admin *AdminConfig `json:"admin"`
 
-	// QUICListen enables a QUIC/H3 listener on this address (e.g. ":443").
-	// QUIC runs over UDP on the same port as TLS/TCP, giving clients an HTTP/3
-	// carrier with per-stream congestion control. Leave empty to disable.
+	// QUICListen enables an HTTP/3 server on this UDP address (e.g. ":443").
+	// Clients with transport "quic" run Prism inside a POST to QUICPath; every
+	// other request is served the cover site, so the port looks like the same
+	// website over HTTP/3. Leave empty to disable.
 	QUICListen string `json:"quic_listen"`
+	QUICPath   string `json:"quic_path"` // default "/_prism/h3"; must match the client
 
 	// Cover: what an unauthenticated visitor (or active prober) sees.
 	// Exactly one is used, in this order: Backend, then StaticDir, then a
@@ -139,6 +146,16 @@ type ACMEConfig struct {
 	// (https://acme-staging-v02.api.letsencrypt.org/directory) while testing to
 	// avoid burning production rate limits.
 	DirectoryURL string `json:"directory_url"`
+}
+
+func (c *Config) statsFile() string {
+	if c.StatsFile != "" {
+		return c.StatsFile
+	}
+	if c.CredentialsFile != "" {
+		return filepath.Join(filepath.Dir(c.CredentialsFile), "stats.json")
+	}
+	return ""
 }
 
 func (c *Config) window() time.Duration {

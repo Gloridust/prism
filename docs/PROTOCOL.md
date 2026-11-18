@@ -39,10 +39,10 @@ Prism 的三个独有设计点：
 | **REALITY** | 不需要自有域名与证书；探测者看到真实站点；标记绑定握手、不可重放 | steal 模式：标记覆盖整个 ClientHello、带加密时间戳、单次有效；仅 TLS 1.3；启动时探测目标站并对齐 ALPN 与证书链长度（§7.7） | ServerHello 由 Go `crypto/tls` 生成，套件选择等细节无法逐字节复刻目标站，目标站需按提示挑选；客户端不校验外层证书，服务端身份由内层握手保证 |
 | **VLESS XTLS-Vision** | 对隧道内 TLS 握手包做填充，消除 TLS-in-TLS 长度特征 | 流首填充默认开启：每条流前 8 个数据帧与 SYN 随机化长度（§7.12） | 不做 Vision 的「握手后直通（splice）」，全程双层加密，CPU 开销略高 |
 | **Shadowsocks 2022** | 首包全随机、时间戳 + 重放保护 | ClientInit 80 字节全随机，新鲜度窗口 + 重放集合；Noise 模式同样处理 | — |
-| **Hysteria2 / TUIC** | QUIC 原生数据报、弱网拥塞控制、HTTP/3 伪装 | `transport: "quic"`（ALPN h3，按流拥塞控制） | UDP 仍走 over-stream；QUIC 入口**没有** HTTP/3 回落，主动探测可区分，对抗性网络请用 TCP 载波 |
+| **Hysteria2 / TUIC** | QUIC 弱网拥塞控制、HTTP/3 伪装、认证失败即表现为普通 H3 站点 | `transport: "quic"`：服务端是真实的 HTTP/3 站点，隧道跑在一个 POST 请求里，握手不通过的任何请求都由回落站点应答（§7.14） | UDP 仍走 over-stream，没有用 QUIC 原生数据报；客户端 QUIC 指纹是 quic-go 的，不是 Chrome 的 |
 | **naiveproxy** | 复用 Chrome 网络栈，指纹完全一致 | uTLS 模拟 Chrome ClientHello | 仅 ClientHello 层面对齐，需随 Chrome 版本升级 uTLS |
 | **WireGuard** | 极简、经审计的 Noise 握手 | `handshake: "noise"` 使用 flynn/noise 状态机（§6.6） | Prism 用的是 IKpsk1 而非 WireGuard 的 IKpsk2，见 §6.6 的取舍说明 |
-| **企业 VPN 网关** | 多出口容灾、按人吊销、配额、监控 | `backups` 自动故障切换与回切；管理 API 持久化增删/轮换凭据并踢线；按日配额；Prometheus `/metrics` | 流量计数与当日用量在内存中，服务重启后清零 |
+| **企业 VPN 网关** | 多出口容灾、按人吊销、配额、监控 | `backups` 自动故障切换与回切；管理 API 持久化增删/轮换凭据并踢线；按日配额；Prometheus `/metrics` | 计量每 30 秒落盘一次，异常掉电最多丢 30 秒的计数 |
 
 ---
 
@@ -362,7 +362,7 @@ WebRTC 会用 STUN（UDP）探测本机的公网地址（server-reflexive candid
 
 全公司强制：`config/webrtc-policy.mobileconfig`（macOS MDM）、`config/webrtc-policy.reg`（Windows HKLM/GPO）、`config/firefox-policies.json` 提供 mandatory 级策略，用户和扩展都无法覆盖。
 
-残留风险：进程被强杀后，Linux/macOS 的 TUN 设备随 fd 关闭而消失，路由跟着失效，流量会回到直连（没有持久 kill-switch）；用户级浏览器策略也可能残留，下次连接时会被识别为我方设置的值并正确清理。
+残留风险：未启用 `tun.kill_switch` 时，进程被强杀后 TUN 设备消失、路由失效，流量会回到直连——要求不泄露真实 IP 的部署请启用 kill-switch（§7.15）。用户级浏览器策略可能在异常退出后残留，下次连接时会被识别为我方设置的值并正确清理。
 
 ### 7.12 流首填充（对抗 TLS-in-TLS 识别）
 
@@ -377,6 +377,34 @@ WebRTC 会用 STUN（UDP）探测本机的公网地址（server-reflexive candid
 ### 7.13 多出口与故障切换
 
 客户端可配置 `backups`（每项含 `server`、`sni`、`server_public_key`，共用同一组 `id`/`psk`）。拨号时从当前出口开始按顺序尝试，当前出口不可达就切到下一个并记录日志；运行在备用出口时每 5 分钟尝试一次回切主出口。拨号失败的连接槽按指数退避（0.5 s 起，上限 30 s，带抖动）快速失败，出口不可达时应用侧不会被逐个 10 秒超时拖住。TUN 模式下每个出口都固定为一个 IPv4 并加主机路由。
+
+### 7.14 QUIC 载波：HTTP/3 请求内的隧道
+
+`quic_listen` 启动的是一个真实的 HTTP/3 服务器（ALPN `h3`，TLS 1.3，与 TCP 入口共用证书）。客户端建立 QUIC 连接后发起一个流式 `POST <quic_path>`（默认 `/_prism/h3`）：请求体是客户端→服务端方向的 Prism 字节流，响应体是反方向。
+
+服务端处理每个 HTTP/3 请求时：
+
+- 路径与方法匹配 → 从请求体读内层握手；**握手成功之前不写任何响应**；
+- 握手成功 → 回 200 并在同一个请求上进入会话；
+- 路径不匹配、握手失败、普通浏览器访问 → 把已读的请求体放回，交给回落站点处理。
+
+所以即使探测者知道隧道路径，不持有凭据时得到的也是回落站点对这个 POST 的正常应答，与访问其它路径没有区别。
+
+### 7.15 Kill-switch（TUN 模式）
+
+`tun.kill_switch: true` 时，客户端在系统防火墙里安装规则，拒绝一切不经隧道的出站流量。规则属于操作系统而不是客户端进程，进程崩溃或被强杀后依然生效，机器会断网而不是回到直连。
+
+| 放行 | 拒绝 |
+|---|---|
+| 回环；TUN 接口；Prism 服务器（含备用出口）的 IP；本地网络（RFC1918、链路本地、组播、IPv6 ULA/链路本地） | 其余全部 IPv4 与 IPv6 出站；**发往回环与隧道以外任何地址的 DNS（含局域网解析器）** |
+
+| 平台 | 实现 | 重启后 |
+|---|---|---|
+| Linux | nftables 表 `inet prism_killswitch`，output 链，原子替换 | 规则不保留 |
+| macOS | pf 锚点 `com.apple/250.PrismKillSwitch`（系统默认规则集已引用 `com.apple/*`，不改写 `/etc/pf.conf`），`pfctl -E` 引用计数启用 | 规则不保留 |
+| Windows | Windows 防火墙出站阻止规则 `PrismKillSwitch`。阻止规则优先于允许规则，所以写成「阻止允许集合的补集」，并限定本地地址为隧道地址与回环以外的地址 | 规则保留 |
+
+正常退出时规则被移除；异常退出后用 `prism-client -killswitch-off` 移除，或重新启动客户端（启动时会原子替换旧规则）。因为异常退出后 DNS 也被封，客户端把上次解析到的服务器 IP 缓存在 `<配置文件>.resolved`，解析失败时使用缓存，保证能自己恢复连接。启用后若规则安装失败，客户端拒绝启动。
 
 ---
 
@@ -393,6 +421,7 @@ WebRTC 会用 STUN（UDP）探测本机的公网地址（server-reflexive candid
 | T7 重放 | 一次性 `E_pub` + 新鲜度窗口 + 重放集合 |
 | T8 内网 SSRF | 出口默认拒绝私网/环回/链路本地(含云元数据)/CGNAT 目标；解析后只连已放行公网 IP，杜绝 DNS 重绑定 |
 | T9 WebRTC/IPv6 泄露真实 IP | TUN 接管 IPv4+IPv6 与 UDP（STUN 从出口发出，IPv6 接管失败即拒绝启动）；代理模式写入浏览器 WebRTC IP 策略；路由器侧 STUN 规则前置（§7.11） |
+| T10 客户端崩溃后回落直连 | kill-switch：防火墙规则独立于进程，隧道消失后机器断网而不是直连（§7.15） |
 
 ---
 
@@ -416,9 +445,9 @@ WebRTC 会用 STUN（UDP）探测本机的公网地址（server-reflexive candid
    选择，服务端用 `ciphers` 列出接受集合并**按序试解密**自动识别每个客户端用的算法。两者**线格式完全一致**
    （12B nonce / 16B tag，首包仍 80 字节），**不在明文里携带算法选择符**（那会引入可识别特征并改变线格式）。
    注意：引入 ChaCha 使 `go.mod` 依赖 `golang.org/x/crypto`（见 README「依赖与取舍」），不再是零第三方依赖。
-8. **QUIC 入口没有回落**：`quic_listen` 上未通过内层握手的连接直接被关闭，主动探测可以把它和真实的 HTTP/3 站点区分开。对抗性网络请用 TCP 载波（TLS / steal / WebSocket）。
-9. **没有持久 kill-switch**：客户端进程被强杀时，TUN 路由随设备消失，流量回到直连；桌面模式写入的系统代理、系统 DNS、浏览器策略在异常退出后可能残留，重新启动并正常退出即可恢复。
-10. **计量在内存中**：每凭据的累计流量与当日用量不落盘，服务重启后清零，按日配额因此会被重启重置。
+8. **QUIC 载波的指纹**：QUIC 入口有 HTTP/3 回落（§7.14），主动探测看到的是普通 H3 站点；但客户端的 QUIC 握手由 quic-go 生成，传输参数与 Chrome 不同，被动指纹上能区分「Go 写的 H3 客户端」。对抗性强的线路优先用 TCP 载波（uTLS 对齐 Chrome）。
+9. **Kill-switch 需显式开启，且不跨重启（Windows 除外）**：默认关闭。Linux 与 macOS 的规则在重启后消失，重启后到客户端启动前的这段时间流量是直连的；需要覆盖这段时间请把客户端设为开机自启。未启用时，进程被强杀后流量回到直连。桌面模式写入的系统代理、系统 DNS、浏览器策略在异常退出后可能残留，重新启动并正常退出即可恢复。
+10. **计量**：每凭据流量与当日用量每 30 秒落盘（`stats_file`）并在正常退出时保存；异常掉电最多丢失最后 30 秒。未配置 `credentials_file`/`stats_file` 时仍只在内存中。
 11. **时钟**：握手带时间戳，两端时钟偏差超过 `window_seconds`（默认 120 秒）会被当作未认证连接。没有 RTC 的路由器需先完成 NTP 同步。
 12. **合规**：统一出口是正当的企业网络需求，但请确认符合你各运营地的法律法规与公司合规要求。
 
@@ -445,6 +474,8 @@ WebRTC 会用 STUN（UDP）探测本机的公网地址（server-reflexive candid
 - [x] 流首填充（对抗 TLS-in-TLS 长度特征，默认开启）
 - [x] 多出口故障切换与回切、拨号退避
 - [x] 管理 API 持久化（`credentials_file`）、按日配额强制执行、Prometheus `/metrics`
-- [ ] QUIC 入口的 HTTP/3 回落、QUIC 原生数据报承载 UDP
-- [ ] 计量落盘
-- [ ] 持久 kill-switch（进程异常退出时用防火墙阻断直连，而不是只依赖路由）
+- [x] QUIC 入口改为真实 HTTP/3 站点 + 回落（§7.14）
+- [x] 计量落盘（`stats_file`）
+- [x] 持久 kill-switch（nftables / pf / Windows 防火墙，§7.15）
+- [ ] QUIC 原生数据报承载 UDP
+- [ ] 第三方密码学审计

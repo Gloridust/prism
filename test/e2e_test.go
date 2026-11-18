@@ -8,7 +8,6 @@ package e2e
 
 import (
 	"bytes"
-	"context"
 	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -25,7 +24,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/quic-go/quic-go"
 	utls "github.com/refraction-networking/utls"
 
 	"github.com/gloridust/prism/pkg/prism"
@@ -1041,151 +1039,5 @@ func TestUDPRelayEndToEnd(t *testing.T) {
 		if !bytes.Equal(gotData, payload) {
 			t.Fatal("large datagram mismatch")
 		}
-	})
-}
-
-// --- QUIC/H3 transport e2e ---
-
-func serveQUICCarrier(ctx context.Context, addr string, tlsCfg *tls.Config, priv *ecdh.PrivateKey, creds []prism.Credential, aeads []prism.AEADFactory) (*prism.QUICListener, error) {
-	ql, err := prism.NewQUICListener(addr, tlsCfg)
-	if err != nil {
-		return nil, err
-	}
-
-	go func() {
-		for {
-			conn, err := ql.Accept(ctx)
-			if err != nil {
-				return
-			}
-			go func(conn *quic.Conn) {
-				qc, err := prism.QUICServerAccept(conn, 10*time.Second)
-				if err != nil {
-					return
-				}
-				_ = qc.SetDeadline(time.Now().Add(10 * time.Second))
-				keys, _, _, err := prism.ServerHandshake(qc, priv, creds, prism.NewReplayWindow(2*time.Minute), 2*time.Minute, aeads...)
-				if err != nil {
-					qc.Close()
-					return
-				}
-				_ = qc.SetDeadline(time.Time{})
-				runEchoSession(qc, keys)
-			}(conn)
-		}
-	}()
-
-	return ql, nil
-}
-
-func TestQUICTransportEndToEnd(t *testing.T) {
-	kp, err := prism.GenerateServerKeypair()
-	if err != nil {
-		t.Fatal(err)
-	}
-	psk, err := prism.NewPSK()
-	if err != nil {
-		t.Fatal(err)
-	}
-	cred := prism.Credential{ID: prism.ClientID{0xC0, 0x1C, 0xE0, 0x01}, PSK: psk}
-	serverAEADs, _ := prism.AEADFactoriesByName([]string{prism.CipherAES256GCM})
-
-	tlsCfg := &tls.Config{
-		Certificates: []tls.Certificate{selfSignedCert(t)},
-		MinVersion:   tls.VersionTLS13,
-		NextProtos:   []string{"h3"},
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	ql, err := serveQUICCarrier(ctx, "127.0.0.1:0", tlsCfg, kp.Private, []prism.Credential{cred}, serverAEADs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ql.Close()
-	t.Logf("QUIC listener on %s", ql.Addr())
-
-	t.Run("quic-echo", func(t *testing.T) {
-		clientTLS := &tls.Config{
-			InsecureSkipVerify: true,
-			NextProtos:         []string{"h3"},
-		}
-		qc, err := prism.QUICClientDial(ql.Addr().String(), clientTLS, 5*time.Second)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer qc.Close()
-
-		keys, err := prism.ClientHandshake(qc, kp.Public, cred, prism.NewAEAD)
-		if err != nil {
-			t.Fatalf("prism handshake over QUIC: %v", err)
-		}
-		sess, err := prism.NewSession(qc, keys, true)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer sess.Close()
-
-		st, err := sess.OpenStream("echo:443")
-		if err != nil {
-			t.Fatal(err)
-		}
-		payload := bytes.Repeat([]byte("quic-"), 10000)
-		go func() { st.Write(payload); st.CloseWrite() }()
-		got, err := io.ReadAll(st)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !bytes.Equal(got, payload) {
-			t.Fatalf("echo mismatch over QUIC: got %d bytes want %d", len(got), len(payload))
-		}
-	})
-
-	t.Run("quic-concurrent-streams", func(t *testing.T) {
-		clientTLS := &tls.Config{
-			InsecureSkipVerify: true,
-			NextProtos:         []string{"h3"},
-		}
-		qc, err := prism.QUICClientDial(ql.Addr().String(), clientTLS, 5*time.Second)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer qc.Close()
-
-		keys, err := prism.ClientHandshake(qc, kp.Public, cred, prism.NewAEAD)
-		if err != nil {
-			t.Fatalf("prism handshake over QUIC: %v", err)
-		}
-		sess, err := prism.NewSession(qc, keys, true)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer sess.Close()
-
-		var wg sync.WaitGroup
-		for i := 0; i < 8; i++ {
-			wg.Add(1)
-			go func(n int) {
-				defer wg.Done()
-				st, err := sess.OpenStream("target:80")
-				if err != nil {
-					t.Errorf("open %d: %v", n, err)
-					return
-				}
-				defer st.Close()
-				msg := bytes.Repeat([]byte{byte(n)}, 3000+n*500)
-				go func() { st.Write(msg); st.CloseWrite() }()
-				got := make([]byte, len(msg))
-				if _, err := io.ReadFull(st, got); err != nil {
-					t.Errorf("stream %d read: %v", n, err)
-					return
-				}
-				if !bytes.Equal(got, msg) {
-					t.Errorf("stream %d mismatch", n)
-				}
-			}(i)
-		}
-		wg.Wait()
 	})
 }

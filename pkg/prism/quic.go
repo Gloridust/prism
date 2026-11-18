@@ -4,155 +4,192 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 )
 
-// QUICConn adapts a quic-go QUIC stream to a net.Conn-like ReadWriteCloser
-// suitable for running a Prism session on top of.
-type QUICConn struct {
-	conn   *quic.Conn
-	stream *quic.Stream
-	mu     sync.Mutex
+// QUIC carrier: the Prism byte stream rides inside one HTTP/3 request — the
+// client POSTs to a path, its request body is the client→server direction and
+// the response body is server→client. The server is therefore a real HTTP/3
+// server: any request that does not complete the Prism handshake, on any path,
+// is answered by the cover site, so probing the UDP port finds an ordinary
+// HTTP/3 website.
+
+// DefaultH3Path is the request path used when none is configured.
+const DefaultH3Path = "/_prism/h3"
+
+func quicConfig() *quic.Config {
+	return &quic.Config{MaxIdleTimeout: 60 * time.Second, KeepAlivePeriod: 15 * time.Second}
 }
 
-// quicTLS returns a copy of cfg for QUIC: ALPN is always exactly "h3" (what
-// every HTTP/3 endpoint speaks — a private ALPN would be a fingerprint, and the
-// TCP listener's h2/http1.1 list is meaningless over QUIC) and TLS 1.3 only.
-func quicTLS(cfg *tls.Config) *tls.Config {
-	c := cfg.Clone()
-	c.NextProtos = []string{"h3"}
-	c.MinVersion = tls.VersionTLS13
-	return c
+// --- server ---
+
+// H3Listener is an HTTP/3 server bound to a UDP address.
+type H3Listener struct {
+	srv  *http3.Server
+	conn net.PacketConn
 }
 
-// QUICClientDial establishes a QUIC connection to the server and opens a
-// single bidirectional stream for the Prism handshake + data phase.
-func QUICClientDial(addr string, tlsCfg *tls.Config, timeout time.Duration) (*QUICConn, error) {
-	tlsCfg = quicTLS(tlsCfg)
+// ListenH3 starts an HTTP/3 server on addr serving handler.
+func ListenH3(addr string, tlsCfg *tls.Config, handler http.Handler) (*H3Listener, error) {
+	pc, err := net.ListenPacket("udp", addr)
+	if err != nil {
+		return nil, err
+	}
+	cfg := tlsCfg.Clone()
+	cfg.MinVersion = tls.VersionTLS13
+	srv := &http3.Server{
+		TLSConfig:   http3.ConfigureTLSConfig(cfg),
+		QUICConfig:  quicConfig(),
+		Handler:     handler,
+		IdleTimeout: 2 * time.Minute,
+	}
+	go srv.Serve(pc)
+	return &H3Listener{srv: srv, conn: pc}, nil
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
+// Addr returns the UDP address the server listens on.
+func (l *H3Listener) Addr() net.Addr { return l.conn.LocalAddr() }
 
-	conn, err := quic.DialAddr(ctx, addr, tlsCfg, &quic.Config{
-		MaxIdleTimeout:  60 * time.Second,
-		KeepAlivePeriod: 15 * time.Second,
+// Close stops the server.
+func (l *H3Listener) Close() error {
+	l.srv.Close()
+	return l.conn.Close()
+}
+
+// H3ServerConn adapts one HTTP/3 request to the carrier byte stream.
+type H3ServerConn struct {
+	w  http.ResponseWriter
+	r  *http.Request
+	rc *http.ResponseController
+
+	once sync.Once
+}
+
+// NewH3ServerConn wraps a request. Nothing is written until the first Write,
+// so a caller whose handshake fails can still answer the request normally.
+func NewH3ServerConn(w http.ResponseWriter, r *http.Request) *H3ServerConn {
+	return &H3ServerConn{w: w, r: r, rc: http.NewResponseController(w)}
+}
+
+func (c *H3ServerConn) Read(p []byte) (int, error) { return c.r.Body.Read(p) }
+
+func (c *H3ServerConn) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	if err != nil {
+		return n, err
+	}
+	return n, c.rc.Flush()
+}
+
+// Close ends the request in both directions, unblocking any pending Read.
+func (c *H3ServerConn) Close() error {
+	c.once.Do(func() {
+		_ = c.rc.SetReadDeadline(time.Unix(1, 0))
+		_ = c.rc.SetWriteDeadline(time.Unix(1, 0))
+		c.r.Body.Close()
 	})
+	return nil
+}
+
+func (c *H3ServerConn) SetReadDeadline(t time.Time) error { return c.rc.SetReadDeadline(t) }
+
+// --- client ---
+
+// H3ClientConn is the client side of the carrier: one streaming HTTP/3 POST.
+type H3ClientConn struct {
+	pw     *io.PipeWriter
+	cancel func()
+
+	respCh chan struct{} // closed when the response (or its error) is in
+	resp   *http.Response
+	err    error
+
+	mu    sync.Mutex
+	timer *time.Timer
+	once  sync.Once
+}
+
+// H3Dial opens a QUIC connection to addr and starts a streaming POST to path.
+// host is the :authority (normally the SNI).
+func H3Dial(addr, host, path string, tlsCfg *tls.Config, timeout time.Duration) (*H3ClientConn, error) {
+	if path == "" {
+		path = DefaultH3Path
+	}
+	cfg := tlsCfg.Clone()
+	cfg.NextProtos = []string{http3.NextProtoH3}
+	cfg.MinVersion = tls.VersionTLS13
+
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), timeout)
+	defer dialCancel()
+	qconn, err := quic.DialAddr(dialCtx, addr, cfg, quicConfig())
 	if err != nil {
 		return nil, err
 	}
+	cc := (&http3.Transport{}).NewClientConn(qconn)
 
-	stream, err := conn.OpenStreamSync(ctx)
+	ctx, cancel := context.WithCancel(context.Background())
+	pr, pw := io.Pipe()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+host+path, pr)
 	if err != nil {
-		conn.CloseWithError(0, "stream open failed")
+		cancel()
+		qconn.CloseWithError(0, "")
 		return nil, err
 	}
+	req.ContentLength = -1
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
-	return &QUICConn{conn: conn, stream: stream}, nil
+	c := &H3ClientConn{pw: pw, respCh: make(chan struct{}),
+		cancel: func() { cancel(); qconn.CloseWithError(0, "") }}
+	go func() {
+		c.resp, c.err = cc.RoundTrip(req)
+		if c.err == nil && c.resp.StatusCode != http.StatusOK {
+			c.resp.Body.Close()
+			c.err = fmt.Errorf("prism: h3 carrier refused (HTTP %d)", c.resp.StatusCode)
+		}
+		close(c.respCh)
+	}()
+	return c, nil
 }
 
-// QUICServerAccept accepts an incoming QUIC connection and its first stream.
-func QUICServerAccept(conn *quic.Conn, timeout time.Duration) (*QUICConn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	stream, err := conn.AcceptStream(ctx)
-	if err != nil {
-		return nil, err
+func (c *H3ClientConn) Read(p []byte) (int, error) {
+	<-c.respCh
+	if c.err != nil {
+		return 0, c.err
 	}
-
-	return &QUICConn{conn: conn, stream: stream}, nil
+	return c.resp.Body.Read(p)
 }
 
-func (q *QUICConn) Read(p []byte) (int, error) {
-	return q.stream.Read(p)
-}
+func (c *H3ClientConn) Write(p []byte) (int, error) { return c.pw.Write(p) }
 
-func (q *QUICConn) Write(p []byte) (int, error) {
-	return q.stream.Write(p)
-}
-
-func (q *QUICConn) Close() error {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.stream.CancelRead(0)
-	q.stream.Close()
-	return q.conn.CloseWithError(0, "done")
-}
-
-func (q *QUICConn) SetDeadline(t time.Time) error {
-	return q.stream.SetDeadline(t)
-}
-
-func (q *QUICConn) SetReadDeadline(t time.Time) error {
-	return q.stream.SetReadDeadline(t)
-}
-
-func (q *QUICConn) SetWriteDeadline(t time.Time) error {
-	return q.stream.SetWriteDeadline(t)
-}
-
-func (q *QUICConn) LocalAddr() net.Addr {
-	return q.conn.LocalAddr()
-}
-
-func (q *QUICConn) RemoteAddr() net.Addr {
-	return q.conn.RemoteAddr()
-}
-
-// QUICListener wraps a quic.Listener for the server to accept Prism sessions
-// over QUIC.
-type QUICListener struct {
-	ln *quic.Listener
-}
-
-// NewQUICListener creates a QUIC listener on the given address.
-func NewQUICListener(addr string, tlsCfg *tls.Config) (*QUICListener, error) {
-	tlsCfg = quicTLS(tlsCfg)
-
-	udpAddr, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		return nil, err
-	}
-	udpConn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		return nil, err
-	}
-
-	tr := &quic.Transport{Conn: udpConn}
-	ln, err := tr.Listen(tlsCfg, &quic.Config{
-		MaxIdleTimeout:  60 * time.Second,
-		KeepAlivePeriod: 15 * time.Second,
+// Close tears the request and its QUIC connection down.
+func (c *H3ClientConn) Close() error {
+	c.once.Do(func() {
+		c.pw.CloseWithError(errors.New("prism: carrier closed"))
+		c.cancel()
 	})
-	if err != nil {
-		udpConn.Close()
-		return nil, err
+	return nil
+}
+
+// SetDeadline closes the carrier at t (zero clears it). It exists to bound the
+// handshake; afterwards QUIC's own idle timeout detects a dead peer.
+func (c *H3ClientConn) SetDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.timer != nil {
+		c.timer.Stop()
+		c.timer = nil
 	}
-
-	return &QUICListener{ln: ln}, nil
+	if !t.IsZero() {
+		c.timer = time.AfterFunc(time.Until(t), func() { c.Close() })
+	}
+	return nil
 }
-
-// Accept waits for and returns an incoming QUIC connection.
-func (l *QUICListener) Accept(ctx context.Context) (*quic.Conn, error) {
-	return l.ln.Accept(ctx)
-}
-
-// Close closes the QUIC listener.
-func (l *QUICListener) Close() error {
-	return l.ln.Close()
-}
-
-// Addr returns the listener's network address.
-func (l *QUICListener) Addr() net.Addr {
-	return l.ln.Addr()
-}
-
-// ErrQUICNotAvailable is returned when QUIC transport is not configured.
-var ErrQUICNotAvailable = errors.New("prism: QUIC transport not available")
-
-// Ensure QUICConn satisfies io.ReadWriteCloser.
-var _ io.ReadWriteCloser = (*QUICConn)(nil)

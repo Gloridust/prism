@@ -24,6 +24,8 @@ import (
 // version is set at build time with -ldflags "-X main.version=...".
 var version = "dev"
 
+var killSwitchOn bool
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
 	log.SetPrefix("[prism-client] ")
@@ -31,7 +33,16 @@ func main() {
 	cfgPath := flag.String("c", "client.json", "path to config JSON")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	checkOnly := flag.Bool("check", false, "validate the config and exit")
+	ksOff := flag.Bool("killswitch-off", false, "remove kill-switch firewall rules left by a previous run, then exit")
 	flag.Parse()
+	if *ksOff {
+		if err := disableKillSwitch(); err != nil {
+			log.Fatalf("kill switch: %v", err)
+		}
+		fmt.Println("kill switch removed")
+		return
+	}
+	resolveCachePath = *cfgPath + ".resolved"
 	if *showVersion {
 		fmt.Println("prism-client", version)
 		return
@@ -158,6 +169,21 @@ func main() {
 				log.Printf("tun: IPv6 capture unavailable (%v); host has no global IPv6, nothing to leak", tunErr)
 			}
 		}
+		if cfg.TUN.KillSwitch {
+			p, err := ksParamsFor(tunDev, cfg)
+			if err == nil {
+				err = enableKillSwitch(p)
+			}
+			if err != nil {
+				serverHost, _, _ := net.SplitHostPort(cfg.Server)
+				removeDefaultRoute(tunDev, serverHost, cfg.TUN.OrigGateway)
+				tunDev.Close()
+				log.Fatalf("kill switch could not be installed, refusing to run without it: %v", err)
+			}
+			killSwitchOn = true
+			log.Printf("kill switch on: only the tunnel, the server and the local network are reachable; " +
+				"it stays in force if this process dies (remove with -killswitch-off)")
+		}
 		go tunRouter(tunDev, &realDialerAdapter{d: d})
 		log.Printf("TUN device %s up, routing all IPv4+IPv6 traffic through Prism", tunDev.Name())
 	}
@@ -181,6 +207,11 @@ func main() {
 			}
 		}
 		tunDev.Close()
+		if killSwitchOn {
+			if err := disableKillSwitch(); err != nil {
+				log.Printf("kill switch: %v", err)
+			}
+		}
 	}
 	a.Disconnect()
 	d.Close()

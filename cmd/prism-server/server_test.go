@@ -216,3 +216,38 @@ func TestSelfSignedSizedMatchesTarget(t *testing.T) {
 		}
 	}
 }
+
+func TestAccountingSurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stats.json")
+	id := prism.ClientID{0xde, 0xad, 0xbe, 0xef}
+
+	a := newAccounting()
+	m := a.meter(id)
+	m.quota.Store(1000)
+	m.add(300, 500)
+	m.conns.Add(2)
+	if err := a.save(path); err != nil {
+		t.Fatal(err)
+	}
+
+	b := newAccounting()
+	if err := b.load(path); err != nil {
+		t.Fatal(err)
+	}
+	b.syncQuotas([]CredConfig{{ID: prism.EncodeKey(id[:]), MaxBytesPerDay: 1000}})
+	r := b.meter(id)
+	if r.up.Load() != 300 || r.down.Load() != 500 || r.conns.Load() != 2 || r.usedToday() != 800 {
+		t.Fatalf("restored up=%d down=%d conns=%d today=%d", r.up.Load(), r.down.Load(), r.conns.Load(), r.usedToday())
+	}
+	// A restart must not hand back the day's quota.
+	if r.add(150, 100) {
+		t.Fatal("quota usage was forgotten across the restart")
+	}
+	if err := newAccounting().load(filepath.Join(t.TempDir(), "missing.json")); err != nil {
+		t.Fatalf("missing stats file should be fine: %v", err)
+	}
+	os.WriteFile(path, []byte("{broken"), 0o600)
+	if err := newAccounting().load(path); err == nil {
+		t.Fatal("corrupt stats file should be reported")
+	}
+}

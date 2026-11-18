@@ -60,6 +60,7 @@ unit 文件会在启动前执行 `prism-server -check` 校验配置，以最小�
 
 - `acme.cache_dir` 留空时，在 systemd 下自动使用 `/var/lib/prism/acme`。
 - `credentials_file` 第一次启动时由 `credentials` 列表生成；**此后以该文件为准**，`server.json` 里的列表不再生效。这样通过管理 API 吊销的凭据不会在重启后复活。
+- 流量计数与当日配额用量保存在 `stats.json`（与 `credentials_file` 同目录，或用 `stats_file` 指定），每 30 秒落盘一次，重启不丢。
 - `max_conns`（默认 4096）限制并发入站连接数；`max_streams`（默认 1024）限制每条载波的并发流数。
 - `head_padding` 默认开启，一般不需要改。
 
@@ -75,7 +76,7 @@ steal 目标站的选择：启动日志会打印探测结果，例如
 `steal target www.example.org:443: TLS 1.3, TLS_AES_128_GCM_SHA256, ALPN "h2", 4321-byte certificate chain (matched)`。
 出现 `WARNING`（不是 TLS 1.3）或 `NOTE`（套件不同）时请换一个目标站。目标站应是境外可正常访问、与出口服务器同地区的常见站点。
 
-QUIC（`quic_listen` + 客户端 `"transport": "quic"`）在丢包线路上延迟更稳，但该入口没有回落站点，主动探测能识别，不建议在对抗性强的线路上作为唯一入口。
+QUIC（`quic_listen` + 客户端 `"transport": "quic"`）在丢包线路上延迟更稳。该入口是一个真实的 HTTP/3 站点，未认证的请求一律由回落站点应答；两端的 `quic_path`（默认 `/_prism/h3`）需一致。客户端的 QUIC 指纹来自 quic-go 而非 Chrome，对抗性强的线路仍优先用 TCP 入口。
 
 ## 4. 凭据生命周期（管理 API）
 
@@ -125,7 +126,7 @@ scrape_configs:
 
 建议告警：`prism_sessions == 0` 持续 5 分钟（工作时间）；`prism_cover_served_total` 的增长率突增（被集中探测）；某凭据 `bytes_today` 接近配额。
 
-计数器保存在内存里，服务重启后归零（当日用量也随之归零）。
+计数器每 30 秒写入 `stats.json` 并在正常退出时保存，重启后延续；异常掉电最多丢失最后 30 秒。
 
 日志走 journald：`journalctl -u prism-server -f`。每次客户端接入会记录凭据 ID、名称、入口类型和来源地址；被出口策略拦截的私网目标也会记录。
 
@@ -142,6 +143,7 @@ scrape_configs:
 
 - **系统代理模式**（默认）：自动设置系统代理，控制面板在 `http://127.0.0.1:9797`。`webrtc_guard` 默认开启，为 Chrome / Edge / Brave / Firefox 写入 WebRTC 策略。Safari 和原生应用不受浏览器策略约束。
 - **TUN 全局模式**（配置 `tun` 块，需管理员权限）：IPv4 与 IPv6 全部进隧道，覆盖所有应用。**要求不泄露真实 IP 时用这个模式。**
+- **Kill-switch**：在 `tun` 块里加 `"kill_switch": true`。启用后只有隧道、Prism 服务器和本地网络可达，客户端崩溃或被强杀时机器断网而不是回到直连。此时发往局域网解析器的 DNS 也会被拒绝，所以需要同时配置 `dns` 块（或把系统 DNS 设为公网解析器，让查询走隧道）。异常退出后恢复上网：重新启动客户端，或以管理员身份执行 `prism-client -killswitch-off`。Linux 需要 nftables，Windows 需要系统防火墙处于启用状态。Linux 与 macOS 的规则不跨重启，需要开机即受保护请把客户端设为开机自启。
 - `dns` 块开启本地 DNS 代理并把系统 DNS 指向它，防止直连解析泄露访问目标。
 - 全公司强制浏览器策略：下发 `config/webrtc-policy.mobileconfig`（macOS MDM）、`config/webrtc-policy.reg`（Windows 组策略 / Intune）、`config/firefox-policies.json`。
 
@@ -160,7 +162,7 @@ scrape_configs:
 
 ## 7. 升级
 
-- 客户端与服务端的二进制可以分别升级，但**握手类型、steal 标记格式必须两端一致**。本版本修改了 Noise 握手和 steal 标记的线格式：使用 `handshake: "noise"` 或 `steal` 的部署，需要在同一个维护窗口内升级两端。默认握手（`handshake` 留空）且未启用 steal 的部署，线格式不变，可以先升级服务端再逐步升级客户端。
+- 客户端与服务端的二进制可以分别升级，但**握手类型、steal 标记格式必须两端一致**。本版本修改了 Noise 握手、steal 标记和 QUIC 载波的线格式：使用 `handshake: "noise"`、`steal` 或 `transport: "quic"` 的部署，需要在同一个维护窗口内升级两端。默认握手（`handshake` 留空）且未启用 steal 的部署，线格式不变，可以先升级服务端再逐步升级客户端。
 - 升级服务端：替换二进制后 `systemctl restart prism-server`。在线会话会断开，客户端自动重连（退避 0.5–30 秒）。
 - 每次升级 Chrome 大版本后，关注 uTLS 是否发布了对应指纹并跟进升级依赖。
 
@@ -175,6 +177,8 @@ scrape_configs:
 | 某个网站打不开，日志有 `blocked egress` | 目标解析到私网 / 保留地址。确需访问出口服务器内网时设 `allow_private: true` |
 | 用到一半全部断流 | 该凭据当日配额用尽（`/api/stats` 的 `bytes_today`） |
 | TUN 模式启动失败 `tun ipv6 capture failed and this host has global IPv6` | 本机有公网 IPv6 但无法把 IPv6 路由进隧道。程序拒绝在会泄露的状态下运行；检查是否有其它 VPN 占用了 IPv6 路由 |
+| 客户端异常退出后整机断网 | 这是 kill-switch 在起作用。重新启动客户端，或执行 `prism-client -killswitch-off` |
+| 启用 kill-switch 后域名解析全部失败 | 系统 DNS 指向了局域网解析器。配置 `dns` 块，或改用公网解析器 |
 | WebRTC 泄露检测仍显示真实 IP | 浏览器没有重启（策略在启动时读取）；用的是 Safari 或原生应用（改用 TUN 模式）；路由器侧没有按示例处理 IPv6 |
 
 配置自检：`prism-server -c server.json -check`、`prism-client -c client.json -check`。版本：`-version`。

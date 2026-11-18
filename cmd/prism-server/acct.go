@@ -1,7 +1,12 @@
 package main
 
 import (
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"io"
+	"log"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -10,8 +15,8 @@ import (
 )
 
 // meter is one credential's traffic accounting and daily quota. All sessions of
-// a credential share one meter. Counters live in memory, so totals and the
-// current day's usage restart from zero when the server restarts.
+// a credential share one meter. Meters are saved to the stats file (when one
+// is configured) so totals and the current day's usage survive a restart.
 type meter struct {
 	up, down atomic.Int64 // lifetime totals (client→internet, internet→client)
 	conns    atomic.Int64
@@ -109,6 +114,88 @@ func copyMetered(dst io.Writer, src io.Reader, account func(n int64) bool) {
 			}
 		}
 		if err != nil {
+			return
+		}
+	}
+}
+
+// meterState is a meter's persisted form.
+type meterState struct {
+	Up       int64 `json:"up"`
+	Down     int64 `json:"down"`
+	Conns    int64 `json:"conns"`
+	LastSeen int64 `json:"last_seen"`
+	Day      int64 `json:"day"`
+	DayUsed  int64 `json:"day_used"`
+}
+
+// save writes every meter to path atomically, so totals and the current day's
+// quota usage survive a restart.
+func (a *accounting) save(path string) error {
+	a.mu.Lock()
+	out := make(map[string]meterState, len(a.meters))
+	for id, m := range a.meters {
+		m.mu.Lock()
+		out[fmt.Sprintf("%x", id[:])] = meterState{
+			Up: m.up.Load(), Down: m.down.Load(), Conns: m.conns.Load(),
+			LastSeen: m.lastSeen.Load(), Day: m.day, DayUsed: m.dayUsed,
+		}
+		m.mu.Unlock()
+	}
+	a.mu.Unlock()
+
+	raw, err := json.Marshal(out)
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// load restores meters saved by save. A missing file is not an error.
+func (a *accounting) load(path string) error {
+	raw, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var in map[string]meterState
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return err
+	}
+	for hexID, st := range in {
+		b, err := hex.DecodeString(hexID)
+		if err != nil || len(b) != 4 {
+			continue
+		}
+		m := a.meter(prism.ClientID(b))
+		m.up.Store(st.Up)
+		m.down.Store(st.Down)
+		m.conns.Store(st.Conns)
+		m.lastSeen.Store(st.LastSeen)
+		m.mu.Lock()
+		m.day, m.dayUsed = st.Day, st.DayUsed
+		m.mu.Unlock()
+	}
+	return nil
+}
+
+// persist saves to path every interval until stop is closed.
+func (a *accounting) persist(path string, every time.Duration, stop <-chan struct{}) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			if err := a.save(path); err != nil {
+				log.Printf("saving stats to %s: %v", path, err)
+			}
+		case <-stop:
 			return
 		}
 	}
