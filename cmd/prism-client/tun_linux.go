@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"strconv"
 	"syscall"
@@ -31,7 +32,7 @@ func openTUN(name string) (*tunDevice, error) {
 	}
 
 	const (
-		iffTun = 0x0001
+		iffTun  = 0x0001
 		iffNoPi = 0x1000
 	)
 
@@ -96,22 +97,50 @@ func configureTUN(dev *tunDevice, addr, _ string) error {
 	return nil
 }
 
-func addDefaultRoute(dev *tunDevice, serverHost, origGateway string) error {
-	cmds := [][]string{
-		{"ip", "route", "add", serverHost + "/32", "via", origGateway},
-		{"ip", "route", "add", "0.0.0.0/1", "dev", dev.Name()},
-		{"ip", "route", "add", "128.0.0.0/1", "dev", dev.Name()},
-	}
+func runAll(cmds [][]string) error {
 	for _, cmd := range cmds {
 		if out, err := exec.Command(cmd[0], cmd[1:]...).CombinedOutput(); err != nil {
-			return fmt.Errorf("%s: %s: %w", cmd[0], out, err)
+			return fmt.Errorf("%v: %s: %w", cmd, out, err)
 		}
 	}
 	return nil
 }
 
-func removeDefaultRoute(serverHost, _ string) {
-	exec.Command("ip", "route", "del", "0.0.0.0/1").Run()
-	exec.Command("ip", "route", "del", "128.0.0.0/1").Run()
+func addDefaultRoute(dev *tunDevice, serverHost, origGateway string) error {
+	if err := runAll([][]string{{"ip", "route", "add", serverHost + "/32", "via", origGateway}}); err != nil {
+		return err
+	}
+	return addRoutes4(dev, ipv4CaptureRoutes)
+}
+
+func addRoutes4(dev *tunDevice, prefixes []string) error {
+	var cmds [][]string
+	for _, p := range prefixes {
+		cmds = append(cmds, []string{"ip", "route", "add", p, "dev", dev.Name()})
+	}
+	return runAll(cmds)
+}
+
+func addIPv6Capture(dev *tunDevice) error { return addRoutes6(dev, ipv6CaptureRoutes) }
+
+// addRoutes6 gives the TUN an IPv6 address and routes prefixes into it.
+func addRoutes6(dev *tunDevice, prefixes []string) error {
+	_ = os.WriteFile("/proc/sys/net/ipv6/conf/"+dev.Name()+"/disable_ipv6", []byte("0"), 0o644)
+	cmds := [][]string{
+		{"ip", "-6", "addr", "add", fmt.Sprintf("%s/%d", tunAddr6, tunPrefix6), "dev", dev.Name(), "nodad"},
+	}
+	for _, p := range prefixes {
+		cmds = append(cmds, []string{"ip", "-6", "route", "add", p, "dev", dev.Name()})
+	}
+	return runAll(cmds)
+}
+
+func removeDefaultRoute(dev *tunDevice, serverHost, _ string) {
+	for _, p := range ipv4CaptureRoutes {
+		exec.Command("ip", "route", "del", p, "dev", dev.Name()).Run()
+	}
+	for _, p := range ipv6CaptureRoutes {
+		exec.Command("ip", "-6", "route", "del", p, "dev", dev.Name()).Run()
+	}
 	exec.Command("ip", "route", "del", serverHost+"/32").Run()
 }

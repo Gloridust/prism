@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 
 	"github.com/gloridust/prism/pkg/prism"
@@ -15,7 +16,7 @@ type ClientConfig struct {
 	ServerPublicKey string `json:"server_public_key"` // base64 X25519
 	ID              string `json:"id"`                // base64 4 bytes
 	PSK             string `json:"psk"`               // base64 32 bytes
-	AllowInsecure bool `json:"allow_insecure"` // skip cert verify (testing/self-signed)
+	AllowInsecure   bool   `json:"allow_insecure"`    // skip cert verify (testing/self-signed)
 
 	// Steal enables REALITY-style active probing resistance. When true, the
 	// client embeds an HMAC tag (derived from the PSK) in the TLS session_id
@@ -85,6 +86,12 @@ type ClientConfig struct {
 	// flynn/noise Noise_IKpsk2 implementation.
 	Handshake string `json:"handshake"`
 
+	// WebRTCGuard (desktop mode, default true) sets browser WebRTC IP-handling
+	// policy while connected so WebRTC can't reveal the real public/LAN address:
+	// Chrome/Edge/Brave get disable_non_proxied_udp in system-proxy mode and
+	// default_public_interface_only in TUN mode; Firefox gets equivalent prefs.
+	WebRTCGuard *bool `json:"webrtc_guard"`
+
 	// DNS configures DNS leak prevention. When enabled, a local DNS proxy
 	// intercepts queries and forwards them through the Prism tunnel.
 	DNS *DNSConfig `json:"dns"`
@@ -131,6 +138,38 @@ func (c *ClientConfig) defaults() {
 
 func (c *ClientConfig) autoConnect() bool {
 	return c.AutoConnect == nil || *c.AutoConnect
+}
+
+func (c *ClientConfig) webrtcGuard() bool {
+	return c.WebRTCGuard == nil || *c.WebRTCGuard
+}
+
+func (c *ClientConfig) tunSetRoutes() bool {
+	return c.TUN != nil && (c.TUN.SetRoutes == nil || *c.TUN.SetRoutes)
+}
+
+// pinServerIPv4 resolves server "host:port" to a single IPv4 "ip:port".
+func pinServerIPv4(server string) (string, error) {
+	host, port, err := net.SplitHostPort(server)
+	if err != nil {
+		return "", fmt.Errorf("server %q: %w", server, err)
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.To4() == nil {
+			return "", fmt.Errorf("TUN mode needs an IPv4 server address, got %s", host)
+		}
+		return server, nil
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return "", fmt.Errorf("resolve %s: %w", host, err)
+	}
+	for _, ip := range ips {
+		if v4 := ip.To4(); v4 != nil {
+			return net.JoinHostPort(v4.String(), port), nil
+		}
+	}
+	return "", fmt.Errorf("%s has no IPv4 address (TUN mode routes the carrier over IPv4)", host)
 }
 
 // cipher resolves the configured cipher name, falling back to the build default

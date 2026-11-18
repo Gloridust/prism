@@ -31,6 +31,15 @@ func main() {
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
+	if cfg.TUN != nil && cfg.tunSetRoutes() {
+		// The carrier must use the one IPv4 address that gets a host route via the
+		// original gateway; anything else would be captured by the TUN and loop.
+		pinned, err := pinServerIPv4(cfg.Server)
+		if err != nil {
+			log.Fatalf("tun: %v", err)
+		}
+		cfg.Server = pinned
+	}
 	d, err := NewDialer(cfg, cred)
 	if err != nil {
 		log.Fatalf("dialer: %v", err)
@@ -100,19 +109,25 @@ func main() {
 			tunDev.Close()
 			log.Fatalf("tun configure: %v", tunErr)
 		}
-		setRoutes := cfg.TUN.SetRoutes == nil || *cfg.TUN.SetRoutes
-		if setRoutes {
+		if cfg.tunSetRoutes() {
 			serverHost, _, _ := net.SplitHostPort(cfg.Server)
-			if serverHost == "" {
-				serverHost = cfg.Server
-			}
 			if tunErr = addDefaultRoute(tunDev, serverHost, cfg.TUN.OrigGateway); tunErr != nil {
 				tunDev.Close()
 				log.Fatalf("tun routes: %v", tunErr)
 			}
+			// IPv6 is captured too, otherwise WebRTC/STUN (and anything else)
+			// would leave over the physical link's IPv6 with the real address.
+			if tunErr = addIPv6Capture(tunDev); tunErr != nil {
+				if hostHasGlobalIPv6(tunDev.Name()) {
+					removeDefaultRoute(tunDev, serverHost, cfg.TUN.OrigGateway)
+					tunDev.Close()
+					log.Fatalf("tun ipv6 capture failed and this host has global IPv6 (would leak): %v", tunErr)
+				}
+				log.Printf("tun: IPv6 capture unavailable (%v); host has no global IPv6, nothing to leak", tunErr)
+			}
 		}
 		go tunRouter(tunDev, &realDialerAdapter{d: d})
-		log.Printf("TUN device %s up, routing all traffic through Prism", tunDev.Name())
+		log.Printf("TUN device %s up, routing all IPv4+IPv6 traffic through Prism", tunDev.Name())
 	}
 
 	// Clean up the system proxy on exit so we never strand the machine offline.
@@ -124,12 +139,9 @@ func main() {
 		dnsP.Close()
 	}
 	if tunDev != nil {
-		if cfg.TUN.SetRoutes == nil || *cfg.TUN.SetRoutes {
+		if cfg.tunSetRoutes() {
 			serverHost, _, _ := net.SplitHostPort(cfg.Server)
-			if serverHost == "" {
-				serverHost = cfg.Server
-			}
-			removeDefaultRoute(serverHost, cfg.TUN.OrigGateway)
+			removeDefaultRoute(tunDev, serverHost, cfg.TUN.OrigGateway)
 		}
 		tunDev.Close()
 	}
@@ -144,6 +156,7 @@ type app struct {
 
 	mu        sync.Mutex
 	connected bool
+	webrtc    *webrtcGuard
 }
 
 // Connect points the OS system proxy at our local inbounds (desktop mode).
@@ -162,6 +175,9 @@ func (a *app) Connect() {
 			}
 			setSystemDNS(listen)
 		}
+		if a.cfg.webrtcGuard() {
+			a.webrtc = applyWebRTCGuard(a.cfg.TUN != nil)
+		}
 	}
 	a.connected = true
 }
@@ -178,6 +194,8 @@ func (a *app) Disconnect() {
 		if a.cfg.DNS != nil {
 			clearSystemDNS()
 		}
+		a.webrtc.Remove()
+		a.webrtc = nil
 	}
 	a.connected = false
 }
@@ -185,6 +203,7 @@ func (a *app) Disconnect() {
 func (a *app) status() map[string]any {
 	a.mu.Lock()
 	connected := a.connected
+	webrtc := a.webrtc.Applied()
 	a.mu.Unlock()
 	live := 0
 	if a.d != nil {
@@ -196,5 +215,6 @@ func (a *app) status() map[string]any {
 		"live":      live,
 		"socks":     a.cfg.SocksListen,
 		"http":      a.cfg.HTTPListen,
+		"webrtc":    webrtc,
 	}
 }

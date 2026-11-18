@@ -87,11 +87,18 @@ func (t *tunDevice) Read(buf []byte) (int, error) {
 	return copy(buf, t.rbuf[4:n]), nil
 }
 
-// Write prepends the macOS utun 4-byte AF_INET header and writes a raw IPv4
-// packet to the TUN device.
+// Write prepends the macOS utun 4-byte address-family header and writes a raw
+// IPv4 or IPv6 packet to the TUN device.
 func (t *tunDevice) Write(buf []byte) (int, error) {
+	if len(buf) == 0 {
+		return 0, nil
+	}
+	af := byte(syscall.AF_INET)
+	if buf[0]>>4 == 6 {
+		af = syscall.AF_INET6
+	}
 	wbuf := make([]byte, 4+len(buf))
-	wbuf[0], wbuf[1], wbuf[2], wbuf[3] = 0, 0, 0, syscall.AF_INET
+	wbuf[0], wbuf[1], wbuf[2], wbuf[3] = 0, 0, 0, af
 	copy(wbuf[4:], buf)
 	n, err := syscall.Write(t.fd, wbuf)
 	if n > 4 {
@@ -126,22 +133,49 @@ func configureTUN(dev *tunDevice, addr, peerAddr string) error {
 	return nil
 }
 
-func addDefaultRoute(dev *tunDevice, serverHost, origGateway string) error {
-	cmds := [][]string{
-		{"route", "add", "-host", serverHost, origGateway},
-		{"route", "add", "-net", "0.0.0.0/1", "-interface", dev.Name()},
-		{"route", "add", "-net", "128.0.0.0/1", "-interface", dev.Name()},
-	}
+func runAll(cmds [][]string) error {
 	for _, cmd := range cmds {
 		if out, err := exec.Command(cmd[0], cmd[1:]...).CombinedOutput(); err != nil {
-			return fmt.Errorf("%s: %s: %w", cmd[0], out, err)
+			return fmt.Errorf("%v: %s: %w", cmd, out, err)
 		}
 	}
 	return nil
 }
 
-func removeDefaultRoute(serverHost, origGateway string) {
-	exec.Command("route", "delete", "-net", "0.0.0.0/1").Run()
-	exec.Command("route", "delete", "-net", "128.0.0.0/1").Run()
-	exec.Command("route", "delete", "-host", serverHost, origGateway).Run()
+func addDefaultRoute(dev *tunDevice, serverHost, origGateway string) error {
+	if err := runAll([][]string{{"route", "-n", "add", "-host", serverHost, origGateway}}); err != nil {
+		return err
+	}
+	return addRoutes4(dev, ipv4CaptureRoutes)
+}
+
+func addRoutes4(dev *tunDevice, prefixes []string) error {
+	var cmds [][]string
+	for _, p := range prefixes {
+		cmds = append(cmds, []string{"route", "-n", "add", "-net", p, "-interface", dev.Name()})
+	}
+	return runAll(cmds)
+}
+
+func addIPv6Capture(dev *tunDevice) error { return addRoutes6(dev, ipv6CaptureRoutes) }
+
+// addRoutes6 gives the utun an IPv6 address and routes prefixes into it.
+func addRoutes6(dev *tunDevice, prefixes []string) error {
+	cmds := [][]string{
+		{"ifconfig", dev.Name(), "inet6", fmt.Sprintf("%s/%d", tunAddr6, tunPrefix6), "alias"},
+	}
+	for _, p := range prefixes {
+		cmds = append(cmds, []string{"route", "-n", "add", "-inet6", p, "-interface", dev.Name()})
+	}
+	return runAll(cmds)
+}
+
+func removeDefaultRoute(dev *tunDevice, serverHost, origGateway string) {
+	for _, p := range ipv4CaptureRoutes {
+		exec.Command("route", "-n", "delete", "-net", p, "-interface", dev.Name()).Run()
+	}
+	for _, p := range ipv6CaptureRoutes {
+		exec.Command("route", "-n", "delete", "-inet6", p, "-interface", dev.Name()).Run()
+	}
+	exec.Command("route", "-n", "delete", "-host", serverHost, origGateway).Run()
 }

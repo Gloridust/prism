@@ -47,7 +47,10 @@
     "upstream": "1.1.1.1:53"
   },
 
-  "_tun": "TUN 全局模式（需 root）。启用后创建 TUN 设备并路由所有流量。",
+  "_webrtc_guard": "WebRTC 防泄露（默认 true）：连接时给 Chrome/Edge/Brave 写入 WebRTC IP 策略（系统代理模式=disable_non_proxied_udp，TUN 模式=default_public_interface_only），断开时恢复原值；Firefox 写入 user.js。Safari 和原生应用（Zoom/Teams/微信）不受浏览器策略约束，要完全防护请用 TUN 模式。全公司强制可下发 config/webrtc-policy.mobileconfig（macOS）/ webrtc-policy.reg（Windows）。",
+  "webrtc_guard": true,
+
+  "_tun": "TUN 全局模式（需 root）。启用后创建 TUN 设备，IPv4 和 IPv6 全部经隧道，含 WebRTC 的 STUN/UDP；如果本机有公网 IPv6 却无法接管 IPv6，会拒绝启动，不会带着泄露运行。",
   "tun": null,
 
   "auto_connect": true

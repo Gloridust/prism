@@ -1,0 +1,19 @@
+Windows Registry Editor Version 5.00
+
+; Prism WebRTC leak protection: machine-wide (HKLM) mandatory policy.
+; Import as administrator, or deploy the same values via GPO / Intune.
+; Overrides the per-user (HKCU) policy written by prism-client; users and
+; extensions cannot change it.
+; disable_non_proxied_udp: WebRTC never sends direct UDP (no STUN leak of the
+; real public IP); it uses TURN-over-TCP through the proxy instead.
+; For Firefox, copy config/firefox-policies.json to
+; <Firefox install dir>\distribution\policies.json
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Google\Chrome]
+"WebRtcIPHandling"="disable_non_proxied_udp"
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Edge]
+"WebRtcLocalhostIpHandling"="disable_non_proxied_udp"
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\BraveSoftware\Brave]
+"WebRtcIPHandling"="disable_non_proxied_udp"

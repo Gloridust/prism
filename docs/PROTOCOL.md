@@ -297,6 +297,20 @@ TLS 终止始终在 Prism 侧完成。这避免了 REALITY 的 MITM 透传设计
 
 目的：定期轮换 TLS 连接，避免单条连接存活过久成为统计特征；与真实浏览器的连接行为更一致。
 
+### 7.11 WebRTC 与 IP 泄露防护
+
+WebRTC 会用 STUN（UDP）探测本机的公网地址（server-reflexive candidate），还会枚举本机网卡地址（host candidate）。这些行为都不经过 HTTP/SOCKS 代理，所以只设系统代理时，网页能直接拿到中国办公室的真实公网 IP，以及原生 IPv6 地址。各模式的防护方式如下：
+
+| 模式 | 机制 | 保证程度 |
+|---|---|---|
+| TUN 全局（`tun`） | IPv4 用 `0/1`+`128/1`、IPv6 用 `::/1`+`8000::/1` 全部路由进 TUN；UDP 按 §7.6 封帧经隧道转发，STUN 从新加坡出口发出，探测到的是新加坡地址。服务器地址在启动时固定为一个 IPv4（`pinServerIPv4`），并加主机路由，避免载波自身被 TUN 接管而形成环路。若本机有公网 IPv6 但接管失败，**拒绝启动**（fail-closed）。浏览器侧再加 `default_public_interface_only`，物理网卡的内网地址也不会出现在 candidate 里。 | 对所有应用生效，包括 Safari 和原生会议软件 |
+| 桌面系统代理 | `webrtc_guard`（默认开启）：连接时写入 Chrome/Brave 的 `WebRtcIPHandling` 和 Edge 的 `WebRtcLocalhostIpHandling`，值为 `disable_non_proxied_udp`，断开时恢复原值；Firefox 的 `user.js` 写入 `proxy_only_if_behind_proxy` 和 `default_address_only`。WebRTC 不再发直连 UDP，改走代理上的 TURN-over-TCP。 | 只覆盖上述浏览器；Safari 和原生应用仍会直连，需要完全防护请用 TUN |
+| 路由器（Nikki/Mihomo） | STUN/TURN 端口（3478/5349/19302）的规则排在 `GEOIP,CN,DIRECT` 之前，强制走出口；IPv6 要么由 Mihomo 接管，要么关闭 LAN 的 IPv6 分发（见 `config/nikki-mihomo.example.yaml`）。最严格的做法是 `NETWORK,udp,PRISM-SG`。 | 覆盖整个 LAN |
+
+全公司强制：`config/webrtc-policy.mobileconfig`（macOS MDM）、`config/webrtc-policy.reg`（Windows HKLM/GPO）、`config/firefox-policies.json` 提供 mandatory 级策略，用户和扩展都无法覆盖。
+
+残留风险：进程被强杀后，Linux/macOS 的 TUN 设备随 fd 关闭而消失，路由跟着失效，流量会回到直连（没有持久 kill-switch）；用户级浏览器策略也可能残留，下次连接时会被识别为我方设置的值并正确清理。
+
 ---
 
 ## 8. 各威胁如何被应对
@@ -311,6 +325,7 @@ TLS 终止始终在 Prism 侧完成。这避免了 REALITY 的 MITM 透传设计
 | T6 流量分析 | profile 整形 + IAT 时序抖动（§7.3）+ 多路复用长连接 + 载波轮换（§7.10），贴近真实应用的长度/时序/连接分布 |
 | T7 重放 | 一次性 `E_pub` + 新鲜度窗口 + 重放集合 |
 | T8 内网 SSRF | 出口默认拒绝私网/环回/链路本地(含云元数据)/CGNAT 目标；解析后只连已放行公网 IP，杜绝 DNS 重绑定 |
+| T9 WebRTC/IPv6 泄露真实 IP | TUN 接管 IPv4+IPv6 与 UDP（STUN 从出口发出，IPv6 接管失败即拒绝启动）；代理模式写入浏览器 WebRTC IP 策略；路由器侧 STUN 规则前置（§7.11） |
 
 ---
 
@@ -355,3 +370,5 @@ TLS 终止始终在 Prism 侧完成。这避免了 REALITY 的 MITM 透传设计
 - [x] UDP relay（SOCKS UDP ASSOCIATE + UDP over stream）
 - [x] 订阅分发与密钥轮换、per-CID 配额与审计（管理 API `admin.listen`）
 - [x] 桌面原生 TUN 全局模式（Linux /dev/net/tun + macOS utun + Windows wintun，gVisor netstack 用户态 TCP/IP 栈，`tun` 配置块）
+- [x] WebRTC/IPv6 防泄露（TUN 接管 IPv6 + UDP 封帧、浏览器 WebRTC 策略、路由器 STUN 规则，§7.11）
+- [ ] 持久 kill-switch（进程异常退出时用防火墙阻断直连，而不是只依赖路由）

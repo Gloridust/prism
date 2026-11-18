@@ -31,6 +31,7 @@ button{font:inherit;font-weight:600;border:0;border-radius:10px;padding:12px 22p
   <div class="kv"><span>活动链路 Carriers</span><b id="live">–</b></div>
   <div class="kv"><span>SOCKS</span><b id="socks">–</b></div>
   <div class="kv"><span>HTTP</span><b id="http">–</b></div>
+  <div class="kv"><span>WebRTC 防护</span><b id="webrtc">–</b></div>
   <button id="btn" class="connect" onclick="toggle()">连接 Connect</button>
 </div>
 <script>
@@ -44,6 +45,7 @@ async function refresh(){
   document.getElementById('live').textContent=s.live;
   document.getElementById('socks').textContent=s.socks;
   document.getElementById('http').textContent=s.http;
+  document.getElementById('webrtc').textContent=(s.webrtc&&s.webrtc.length)?s.webrtc.join(', '):'未启用 Off';
   const b=document.getElementById('btn');
   b.textContent=s.connected?'断开 Disconnect':'连接 Connect';
   b.className=s.connected?'disconnect':'connect';

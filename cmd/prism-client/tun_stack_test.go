@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net"
@@ -14,9 +15,17 @@ import (
 	"github.com/sagernet/gvisor/pkg/tcpip/header"
 	"github.com/sagernet/gvisor/pkg/tcpip/link/channel"
 	"github.com/sagernet/gvisor/pkg/tcpip/network/ipv4"
+	"github.com/sagernet/gvisor/pkg/tcpip/network/ipv6"
 	"github.com/sagernet/gvisor/pkg/tcpip/stack"
 	"github.com/sagernet/gvisor/pkg/tcpip/transport/tcp"
 	"github.com/sagernet/gvisor/pkg/tcpip/transport/udp"
+
+	"github.com/gloridust/prism/pkg/prism"
+)
+
+var (
+	clientAddr4 = tcpip.AddrFrom4([4]byte{10, 0, 85, 2})
+	clientAddr6 = tcpip.AddrFrom16([16]byte{0xfd, 0x50, 0x72, 0x69, 0x73, 0x6d, 15: 2})
 )
 
 // pipeTUN bridges two gVisor channel endpoints via an in-memory pipe, acting
@@ -82,9 +91,10 @@ func (ms *mockStream) CloseWrite() error {
 
 // mockDialer records dialed targets and connects to a local echo server.
 type mockDialer struct {
-	echoAddr string
-	mu       sync.Mutex
-	targets  []string
+	echoAddr   string
+	mu         sync.Mutex
+	targets    []string
+	udpTargets []string
 }
 
 func (md *mockDialer) Open(target string) (proxyStream, error) {
@@ -99,12 +109,26 @@ func (md *mockDialer) Open(target string) (proxyStream, error) {
 	return &mockStream{Conn: conn}, nil
 }
 
+// OpenUDP behaves like the server's UDP egress: it parses framed datagrams
+// (rejecting anything unframed) and echoes each back framed with its address.
 func (md *mockDialer) OpenUDP() (proxyStream, error) {
-	conn, err := net.DialTimeout("tcp", md.echoAddr, 2*time.Second)
-	if err != nil {
-		return nil, err
-	}
-	return &mockStream{Conn: conn}, nil
+	cli, srv := net.Pipe()
+	go func() {
+		defer srv.Close()
+		for {
+			addr, data, err := prism.ReadDatagram(srv)
+			if err != nil {
+				return
+			}
+			md.mu.Lock()
+			md.udpTargets = append(md.udpTargets, addr)
+			md.mu.Unlock()
+			if err := prism.WriteDatagram(srv, addr, data); err != nil {
+				return
+			}
+		}
+	}()
+	return &mockStream{Conn: cli}, nil
 }
 
 func (md *mockDialer) getTargets() []string {
@@ -113,6 +137,12 @@ func (md *mockDialer) getTargets() []string {
 	out := make([]string, len(md.targets))
 	copy(out, md.targets)
 	return out
+}
+
+func (md *mockDialer) getUDPTargets() []string {
+	md.mu.Lock()
+	defer md.mu.Unlock()
+	return append([]string(nil), md.udpTargets...)
 }
 
 // startEchoServer starts a TCP server that echoes back everything it receives.
@@ -154,7 +184,7 @@ func makeClientStack(t *testing.T, tun *pipeTUN) *stack.Stack {
 	ep := channel.New(256, tunMTU, "")
 
 	s := stack.New(stack.Options{
-		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
 	})
 
@@ -163,19 +193,19 @@ func makeClientStack(t *testing.T, tun *pipeTUN) *stack.Stack {
 		t.Fatalf("client stack: CreateNIC: %s", err)
 	}
 
-	clientAddr := tcpip.AddrFrom4([4]byte{10, 0, 85, 2})
-	protoAddr := tcpip.ProtocolAddress{
-		Protocol:          ipv4.ProtocolNumber,
-		AddressWithPrefix: tcpip.AddressWithPrefix{Address: clientAddr, PrefixLen: 24},
-	}
-	if err := s.AddProtocolAddress(nicID, protoAddr, stack.AddressProperties{}); err != nil {
-		t.Fatalf("client stack: AddProtocolAddress: %s", err)
+	for _, pa := range []tcpip.ProtocolAddress{
+		{Protocol: ipv4.ProtocolNumber, AddressWithPrefix: tcpip.AddressWithPrefix{Address: clientAddr4, PrefixLen: 24}},
+		{Protocol: ipv6.ProtocolNumber, AddressWithPrefix: tcpip.AddressWithPrefix{Address: clientAddr6, PrefixLen: 64}},
+	} {
+		if err := s.AddProtocolAddress(nicID, pa, stack.AddressProperties{}); err != nil {
+			t.Fatalf("client stack: AddProtocolAddress: %s", err)
+		}
 	}
 
-	s.SetRouteTable([]tcpip.Route{{
-		Destination: header.IPv4EmptySubnet,
-		NIC:         nicID,
-	}})
+	s.SetRouteTable([]tcpip.Route{
+		{Destination: header.IPv4EmptySubnet, NIC: nicID},
+		{Destination: header.IPv6EmptySubnet, NIC: nicID},
+	})
 
 	// Pump: client stack → pipeTUN (router reads these).
 	go func() {
@@ -212,10 +242,14 @@ func makeClientStack(t *testing.T, tun *pipeTUN) *stack.Stack {
 			if n == 0 {
 				continue
 			}
+			proto := header.IPv4ProtocolNumber
+			if buf[0]>>4 == 6 {
+				proto = header.IPv6ProtocolNumber
+			}
 			pb := stack.NewPacketBuffer(stack.PacketBufferOptions{
 				Payload: buffer.MakeWithData(buf[:n]),
 			})
-			ep.InjectInbound(header.IPv4ProtocolNumber, pb)
+			ep.InjectInbound(proto, pb)
 			pb.DecRef()
 		}
 	}()
@@ -312,5 +346,123 @@ func TestTunRouterAddrHelpers(t *testing.T) {
 		if got := itoa(tt.n); got != tt.want {
 			t.Errorf("itoa(%d) = %q, want %q", tt.n, got, tt.want)
 		}
+	}
+}
+
+func waitForTarget(t *testing.T, get func() []string, want string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, got := range get() {
+			if got == want {
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("target %q never reached the dialer; saw %v", want, get())
+}
+
+func udpRoundTrip(t *testing.T, s *stack.Stack, local, remote tcpip.FullAddress, proto tcpip.NetworkProtocolNumber, payload []byte) {
+	t.Helper()
+	conn, err := gonet.DialUDP(s, &local, &remote, proto)
+	if err != nil {
+		t.Fatalf("DialUDP: %v", err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("udp write: %v", err)
+	}
+	buf := make([]byte, 2048)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("udp read (datagram did not come back through the tunnel): %v", err)
+	}
+	if !bytes.Equal(buf[:n], payload) {
+		t.Fatalf("udp echo mismatch: got %x want %x", buf[:n], payload)
+	}
+}
+
+// stunBindingRequest is a minimal RFC 5389 Binding Request, the packet a
+// browser sends to discover its public (server-reflexive) WebRTC candidate.
+func stunBindingRequest() []byte {
+	b := []byte{0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xa4, 0x42}
+	return append(b, bytes.Repeat([]byte{0x5a}, 12)...)
+}
+
+// TestTunRouterUDPFramedSTUN proves a STUN probe entering the TUN leaves as a
+// properly framed Prism datagram addressed to the STUN server, and the reply
+// makes it back — i.e. WebRTC reflexive discovery happens via the exit node.
+func TestTunRouterUDPFramedSTUN(t *testing.T) {
+	tun := newPipeTUN()
+	dialer := &mockDialer{}
+	go tunRouter(tun, dialer)
+	defer tun.Close()
+	cs := makeClientStack(t, tun)
+	defer cs.Close()
+
+	udpRoundTrip(t, cs,
+		tcpip.FullAddress{Addr: clientAddr4},
+		tcpip.FullAddress{Addr: tcpip.AddrFrom4([4]byte{74, 125, 250, 129}), Port: 19302},
+		ipv4.ProtocolNumber, stunBindingRequest())
+	waitForTarget(t, dialer.getUDPTargets, "74.125.250.129:19302")
+}
+
+// TestTunRouterIPv6 proves IPv6 TCP and UDP are carried through the tunnel
+// rather than dropped or left to bypass it.
+func TestTunRouterIPv6(t *testing.T) {
+	echoAddr, stopEcho := startEchoServer(t)
+	defer stopEcho()
+
+	tun := newPipeTUN()
+	dialer := &mockDialer{echoAddr: echoAddr}
+	go tunRouter(tun, dialer)
+	defer tun.Close()
+	cs := makeClientStack(t, tun)
+	defer cs.Close()
+
+	dst6 := tcpip.AddrFrom16([16]byte{0x20, 0x01, 0x0d, 0xb8, 15: 0x07})
+
+	t.Run("tcp", func(t *testing.T) {
+		conn, err := gonet.DialTCPWithBind(context.Background(), cs,
+			tcpip.FullAddress{Addr: clientAddr6},
+			tcpip.FullAddress{Addr: dst6, Port: 443}, ipv6.ProtocolNumber)
+		if err != nil {
+			t.Fatalf("DialTCP v6: %v", err)
+		}
+		defer conn.Close()
+		waitForTarget(t, dialer.getTargets, "[2001:db8::7]:443")
+		conn.SetDeadline(time.Now().Add(5 * time.Second))
+		msg := []byte("ipv6 through prism")
+		conn.Write(msg)
+		got := make([]byte, len(msg))
+		if _, err := io.ReadFull(conn, got); err != nil || !bytes.Equal(got, msg) {
+			t.Fatalf("v6 tcp echo: %q %v", got, err)
+		}
+	})
+
+	t.Run("udp-stun", func(t *testing.T) {
+		udpRoundTrip(t, cs,
+			tcpip.FullAddress{Addr: clientAddr6},
+			tcpip.FullAddress{Addr: dst6, Port: 3478},
+			ipv6.ProtocolNumber, stunBindingRequest())
+		waitForTarget(t, dialer.getUDPTargets, "[2001:db8::7]:3478")
+	})
+}
+
+func TestTunRouterUDPIdleTimeout(t *testing.T) {
+	old := tunUDPIdle
+	tunUDPIdle = 200 * time.Millisecond
+	defer func() { tunUDPIdle = old }()
+
+	local, peer := net.Pipe()
+	defer peer.Close()
+	done := make(chan struct{})
+	go func() { relayUDP(local, &mockDialer{}, "192.0.2.1:53"); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("idle UDP flow was never torn down")
 	}
 }

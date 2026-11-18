@@ -28,6 +28,11 @@ jobs:
           go test -c -o /tmp/prism-test-amd64 ./test/
           sudo unshare --net bash -c \
             'PRISM_ROOT_TEST=1 /tmp/prism-test-amd64 -test.v -test.run "TestLinuxTUNDevice|TestRealTUNWithRealPrism" -test.timeout 60s'
+      - name: Production TUN captures IPv4 + IPv6 TCP/UDP (WebRTC leak guard)
+        run: |
+          go test -c -o /tmp/prism-client-test ./cmd/prism-client/
+          sudo unshare --net bash -c \
+            'PRISM_ROOT_TEST=1 /tmp/prism-client-test -test.v -test.run "TestTUNCapturesIPv4AndIPv6" -test.timeout 90s'
       - name: ECH live tests
         run: PRISM_LIVE_TEST=1 go test -v -run "TestECHHandshakeLive|TestECHWithPrismSession" -count=1 -timeout 60s ./test/ ./pkg/prism/
       - name: Cross-compile router (mipsle)
@@ -46,6 +51,10 @@ jobs:
         run: sudo PRISM_ROOT_TEST=1 go test -v -run "TestDarwinUTunDevice" -count=1 -timeout 60s ./test/
       - name: Real macOS utun + real Prism e2e
         run: sudo PRISM_ROOT_TEST=1 go test -v -run "TestDarwinUTunWithRealPrism" -count=1 -timeout 60s ./test/
+      - name: Production utun captures IPv4 + IPv6 TCP/UDP (WebRTC leak guard)
+        run: |
+          go test -c -o /tmp/prism-client-test ./cmd/prism-client/
+          sudo PRISM_ROOT_TEST=1 /tmp/prism-client-test -test.v -test.run "TestTUNCapturesIPv4AndIPv6" -test.timeout 90s
 
   windows:
     runs-on: windows-latest
@@ -67,4 +76,4 @@ jobs:
         run: |
           go test -c -o wintun-test.exe ./cmd/prism-client/
           set PRISM_ROOT_TEST=1
-          wintun-test.exe -test.v -test.run "TestWintunAdapterCreate|TestWintunOpenTUN" -test.timeout 60s
+          wintun-test.exe -test.v -test.run "TestWintunAdapterCreate|TestWintunOpenTUN|TestTUNCapturesIPv4AndIPv6" -test.timeout 120s

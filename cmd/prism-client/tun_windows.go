@@ -113,12 +113,7 @@ func configureTUN(dev *tunDevice, addr, gateway string) error {
 	return nil
 }
 
-func addDefaultRoute(dev *tunDevice, serverHost, origGateway string) error {
-	cmds := [][]string{
-		{"route", "add", serverHost, "mask", "255.255.255.255", origGateway},
-		{"route", "add", "0.0.0.0", "mask", "128.0.0.0", dev.tunGW, "metric", "5"},
-		{"route", "add", "128.0.0.0", "mask", "128.0.0.0", dev.tunGW, "metric", "5"},
-	}
+func runAll(cmds [][]string) error {
 	for _, cmd := range cmds {
 		if out, err := exec.Command(cmd[0], cmd[1:]...).CombinedOutput(); err != nil {
 			return fmt.Errorf("%v: %s: %w", cmd, out, err)
@@ -127,8 +122,43 @@ func addDefaultRoute(dev *tunDevice, serverHost, origGateway string) error {
 	return nil
 }
 
-func removeDefaultRoute(serverHost, _ string) {
-	exec.Command("route", "delete", "0.0.0.0", "mask", "128.0.0.0").Run()
-	exec.Command("route", "delete", "128.0.0.0", "mask", "128.0.0.0").Run()
+func addDefaultRoute(dev *tunDevice, serverHost, origGateway string) error {
+	if err := runAll([][]string{{"route", "add", serverHost, "mask", "255.255.255.255", origGateway}}); err != nil {
+		return err
+	}
+	return addRoutes4(dev, ipv4CaptureRoutes)
+}
+
+// Routes are on-link and store=active so nothing outlives the adapter.
+func addRoutes4(dev *tunDevice, prefixes []string) error {
+	var cmds [][]string
+	for _, p := range prefixes {
+		cmds = append(cmds, []string{"netsh", "interface", "ipv4", "add", "route",
+			"prefix=" + p, "interface=" + dev.Name(), "metric=5", "store=active"})
+	}
+	return runAll(cmds)
+}
+
+func addIPv6Capture(dev *tunDevice) error { return addRoutes6(dev, ipv6CaptureRoutes) }
+
+func addRoutes6(dev *tunDevice, prefixes []string) error {
+	cmds := [][]string{
+		{"netsh", "interface", "ipv6", "add", "address", "interface=" + dev.Name(),
+			fmt.Sprintf("address=%s/%d", tunAddr6, tunPrefix6), "store=active"},
+	}
+	for _, p := range prefixes {
+		cmds = append(cmds, []string{"netsh", "interface", "ipv6", "add", "route",
+			"prefix=" + p, "interface=" + dev.Name(), "metric=5", "store=active"})
+	}
+	return runAll(cmds)
+}
+
+func removeDefaultRoute(dev *tunDevice, serverHost, _ string) {
+	for _, p := range ipv4CaptureRoutes {
+		exec.Command("netsh", "interface", "ipv4", "delete", "route", "prefix="+p, "interface="+dev.Name()).Run()
+	}
+	for _, p := range ipv6CaptureRoutes {
+		exec.Command("netsh", "interface", "ipv6", "delete", "route", "prefix="+p, "interface="+dev.Name()).Run()
+	}
 	exec.Command("route", "delete", serverHost).Run()
 }
