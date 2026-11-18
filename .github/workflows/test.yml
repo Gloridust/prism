@@ -68,7 +68,7 @@ jobs:
         run: sudo PRISM_ROOT_TEST=1 /tmp/prism-client-test -test.v -test.run 'TestKillSwitch$' -test.timeout 120s
       - name: WebRTC browser policy via real defaults
         run: /tmp/prism-client-test -test.v -test.run 'TestChromiumWebRTCDefaults'
-      - name: System proxy + DNS on real macOS network services (last: repoints the machine briefly)
+      - name: "System proxy + DNS on real macOS network services (repoints the machine briefly, so last)"
         run: sudo PRISM_SYSCFG_TEST=1 /tmp/prism-client-test -test.v -test.run 'TestSystemProxyAndDNSRoundTrip' -test.timeout 120s
 
   windows:
@@ -97,7 +97,7 @@ jobs:
         run: |
           set PRISM_ROOT_TEST=1
           wintun-test.exe -test.v -test.run "TestKillSwitch$" -test.timeout 180s
-      - name: System proxy + DNS on real Windows settings (last: repoints the machine briefly)
+      - name: "System proxy + DNS on real Windows settings (repoints the machine briefly, so last)"
         shell: cmd
         run: |
           set PRISM_SYSCFG_TEST=1
