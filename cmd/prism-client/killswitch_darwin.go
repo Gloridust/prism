@@ -18,8 +18,22 @@ const (
 
 func ksRuleset(p ksParams) string {
 	var b strings.Builder
+	// Loopback and tunnel traffic are matched both by interface and by
+	// address: pf does not always attribute a packet to the interface a rule
+	// names (loopback delivery of local addresses, scoped routes), and a
+	// packet missed here would hit the final block.
 	b.WriteString("pass out quick on lo0 all\n")
+	b.WriteString("pass out quick inet to 127.0.0.0/8\n")
+	b.WriteString("pass out quick inet6 to ::1\n")
 	fmt.Fprintf(&b, "pass out quick on %s all\n", p.tunName)
+	if p.tun4.IsValid() {
+		fmt.Fprintf(&b, "pass out quick inet from %s to any\n", p.tun4)
+		fmt.Fprintf(&b, "pass out quick inet to %s\n", p.tun4)
+	}
+	if p.tun6.IsValid() {
+		fmt.Fprintf(&b, "pass out quick inet6 from %s to any\n", p.tun6)
+		fmt.Fprintf(&b, "pass out quick inet6 to %s\n", p.tun6)
+	}
 	if len(p.servers) > 0 {
 		fmt.Fprintf(&b, "pass out quick inet to { %s }\n", joinAddrs(p.servers, ", "))
 	}

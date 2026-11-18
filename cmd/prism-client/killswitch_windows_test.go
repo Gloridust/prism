@@ -33,3 +33,5 @@ func ksTestPrepare(t *testing.T) bool {
 }
 
 func ksTestCrash(dev *tunDevice) { dev.Close() }
+
+func ksTestDump(t *testing.T) {}

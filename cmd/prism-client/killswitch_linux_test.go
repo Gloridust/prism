@@ -41,3 +41,5 @@ func ksTestCrash(dev *tunDevice) {
 	exec.Command("ip", "link", "del", dev.Name()).Run()
 	dev.Close()
 }
+
+func ksTestDump(t *testing.T) {}

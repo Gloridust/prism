@@ -174,6 +174,11 @@ func TestKillSwitch(t *testing.T) {
 	}
 	defer disableKillSwitch()
 	t.Logf("kill switch installed on %s", runtime.GOOS)
+	defer func() {
+		if t.Failed() {
+			ksTestDump(t)
+		}
+	}()
 
 	viaTunnel("with the kill switch on")
 	expect(t, "kill switch on", direct, "blocked")
