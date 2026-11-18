@@ -134,11 +134,13 @@ func TestKillSwitch(t *testing.T) {
 		t.Helper()
 		var c net.Conn
 		var err error
-		for i := 0; i < 10; i++ {
+		// A freshly created adapter (wintun especially) takes a few seconds
+		// before its routes carry traffic.
+		for i := 0; i < 40; i++ {
 			if c, err = net.DialTimeout("tcp", "198.51.100.7:80", 2*time.Second); err == nil {
 				break
 			}
-			time.Sleep(300 * time.Millisecond)
+			time.Sleep(500 * time.Millisecond)
 		}
 		if err != nil {
 			t.Fatalf("%s: traffic through the tunnel failed: %v", what, err)
