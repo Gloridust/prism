@@ -85,7 +85,51 @@ func releasePFToken() {
 	}
 }
 
+// Boot persistence: a LaunchDaemon reloads the saved rules at every boot, so
+// the machine starts out cut off from direct access.
+var (
+	ksBootRules = "/etc/prism-killswitch.pf.conf"
+	ksBootPlist = "/Library/LaunchDaemons/com.prism.killswitch.plist"
+)
+
+func ksBootCommand() string {
+	return "/sbin/pfctl -a '" + pfAnchor + "' -f '" + ksBootRules + "' && /sbin/pfctl -E"
+}
+
+func ksPlistText() string {
+	return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key><string>com.prism.killswitch</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/sh</string>
+		<string>-c</string>
+		<string>` + ksBootCommand() + `</string>
+	</array>
+	<key>RunAtLoad</key><true/>
+</dict>
+</plist>
+`
+}
+
+// persistKillSwitch makes the kill switch come back at every boot.
+func persistKillSwitch(p ksParams) error {
+	if err := os.WriteFile(ksBootRules, []byte(ksRuleset(p)), 0o600); err != nil {
+		return err
+	}
+	// launchd only loads daemons owned by root and not group/world writable.
+	return os.WriteFile(ksBootPlist, []byte(ksPlistText()), 0o644)
+}
+
+func unpersistKillSwitch() {
+	os.Remove(ksBootPlist)
+	os.Remove(ksBootRules)
+}
+
 func disableKillSwitch() error {
+	unpersistKillSwitch()
 	out, err := exec.Command("pfctl", "-a", pfAnchor, "-F", "all").CombinedOutput()
 	releasePFToken()
 	if err != nil {

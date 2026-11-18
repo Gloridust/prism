@@ -400,11 +400,11 @@ WebRTC 会用 STUN（UDP）探测本机的公网地址（server-reflexive candid
 
 | 平台 | 实现 | 重启后 |
 |---|---|---|
-| Linux | nftables 表 `inet prism_killswitch`，output 链，原子替换 | 规则不保留 |
-| macOS | pf 锚点 `com.apple/250.PrismKillSwitch`（系统默认规则集已引用 `com.apple/*`，不改写 `/etc/pf.conf`），`pfctl -E` 引用计数启用 | 规则不保留 |
+| Linux | nftables 表 `inet prism_killswitch`，output 链，原子替换 | 默认不保留；`kill_switch_boot` 时由 systemd 单元在 `network-pre.target` 之前加载 |
+| macOS | pf 锚点 `com.apple/250.PrismKillSwitch`（系统默认规则集已引用 `com.apple/*`，不改写 `/etc/pf.conf`），`pfctl -E` 引用计数启用。放行规则一律无状态、匹配任意 TCP 标志位（pf 默认的「只匹配 SYN + 状态」会重置回环连接和启用前已建立的连接） | 默认不保留；`kill_switch_boot` 时由 LaunchDaemon 在开机时加载 |
 | Windows | Windows 防火墙出站阻止规则 `PrismKillSwitch`。阻止规则优先于允许规则，所以写成「阻止允许集合的补集」，并限定本地地址为隧道地址与回环以外的地址 | 规则保留 |
 
-正常退出时规则被移除；异常退出后用 `prism-client -killswitch-off` 移除，或重新启动客户端（启动时会原子替换旧规则）。因为异常退出后 DNS 也被封，客户端把上次解析到的服务器 IP 缓存在 `<配置文件>.resolved`，解析失败时使用缓存，保证能自己恢复连接。启用后若规则安装失败，客户端拒绝启动。
+`tun.kill_switch_boot: true` 让规则在每次开机时重新装上（开机到隧道建立之间也没有直连），并且正常退出时**不**移除规则，只有 `-killswitch-off` 能解除——这是「始终在线」模式，客户端需要设为开机自启，否则机器开机后没有外网。未设置该项时，正常退出时规则被移除；异常退出后用 `prism-client -killswitch-off` 移除，或重新启动客户端（启动时会原子替换旧规则）。因为异常退出后 DNS 也被封，客户端把上次解析到的服务器 IP 缓存在 `<配置文件>.resolved`，解析失败时使用缓存，保证能自己恢复连接。启用后若规则安装失败，客户端拒绝启动。
 
 ---
 
@@ -446,7 +446,7 @@ WebRTC 会用 STUN（UDP）探测本机的公网地址（server-reflexive candid
    （12B nonce / 16B tag，首包仍 80 字节），**不在明文里携带算法选择符**（那会引入可识别特征并改变线格式）。
    注意：引入 ChaCha 使 `go.mod` 依赖 `golang.org/x/crypto`（见 README「依赖与取舍」），不再是零第三方依赖。
 8. **QUIC 载波的指纹**：QUIC 入口有 HTTP/3 回落（§7.14），主动探测看到的是普通 H3 站点；但客户端的 QUIC 握手由 quic-go 生成，传输参数与 Chrome 不同，被动指纹上能区分「Go 写的 H3 客户端」。对抗性强的线路优先用 TCP 载波（uTLS 对齐 Chrome）。
-9. **Kill-switch 需显式开启，且不跨重启（Windows 除外）**：默认关闭。Linux 与 macOS 的规则在重启后消失，重启后到客户端启动前的这段时间流量是直连的；需要覆盖这段时间请把客户端设为开机自启。未启用时，进程被强杀后流量回到直连。桌面模式写入的系统代理、系统 DNS、浏览器策略在异常退出后可能残留，重新启动并正常退出即可恢复。
+9. **Kill-switch 需显式开启**：默认关闭；未启用时，进程被强杀后流量回到直连。跨重启的保护需要再开 `kill_switch_boot`（Windows 的规则本身就跨重启）。开机加载的时序没有在真实重启中验证过：自动化测试验证的是「开机时执行的那条命令能独立把规则装回去」，没有真的重启机器。桌面模式写入的系统代理、系统 DNS、浏览器策略在异常退出后可能残留，重新启动并正常退出即可恢复。
 10. **计量**：每凭据流量与当日用量每 30 秒落盘（`stats_file`）并在正常退出时保存；异常掉电最多丢失最后 30 秒。未配置 `credentials_file`/`stats_file` 时仍只在内存中。
 11. **时钟**：握手带时间戳，两端时钟偏差超过 `window_seconds`（默认 120 秒）会被当作未认证连接。没有 RTC 的路由器需先完成 NTP 同步。
 12. **合规**：统一出口是正当的企业网络需求，但请确认符合你各运营地的法律法规与公司合规要求。

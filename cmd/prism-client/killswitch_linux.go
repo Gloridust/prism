@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -44,7 +46,70 @@ func enableKillSwitch(p ksParams) error {
 	return nil
 }
 
+// Boot persistence: a oneshot unit loads the saved ruleset before the network
+// comes up, so the machine is already cut off from direct access when it boots
+// and stays that way until prism-client brings the tunnel up.
+var (
+	ksBootRules = "/etc/prism/killswitch.nft"
+	ksBootUnit  = "/etc/systemd/system/prism-killswitch.service"
+	ksSystemctl = func(args ...string) error {
+		out, err := exec.Command("systemctl", args...).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("systemctl %v: %s: %w", args, bytes.TrimSpace(out), err)
+		}
+		return nil
+	}
+)
+
+func ksUnitText(nft string) string {
+	return `[Unit]
+Description=Prism kill switch (no direct traffic until the tunnel is up)
+DefaultDependencies=no
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=` + nft + ` -f ` + ksBootRules + `
+
+[Install]
+WantedBy=sysinit.target
+`
+}
+
+// persistKillSwitch makes the kill switch come back at every boot.
+func persistKillSwitch(p ksParams) error {
+	nft, err := exec.LookPath("nft")
+	if err != nil {
+		return fmt.Errorf("nft not found: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(ksBootRules), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(ksBootRules, []byte(ksRuleset(p)), 0o600); err != nil {
+		return err
+	}
+	if err := os.WriteFile(ksBootUnit, []byte(ksUnitText(nft)), 0o644); err != nil {
+		return err
+	}
+	if err := ksSystemctl("daemon-reload"); err != nil {
+		return err
+	}
+	return ksSystemctl("enable", filepath.Base(ksBootUnit))
+}
+
+func unpersistKillSwitch() {
+	if _, err := os.Stat(ksBootUnit); err == nil {
+		ksSystemctl("disable", filepath.Base(ksBootUnit))
+		os.Remove(ksBootUnit)
+		ksSystemctl("daemon-reload")
+	}
+	os.Remove(ksBootRules)
+}
+
 func disableKillSwitch() error {
+	unpersistKillSwitch()
 	out, err := exec.Command("nft", "delete", "table", "inet", ksTable).CombinedOutput()
 	if err != nil && !bytes.Contains(out, []byte("No such file")) {
 		return fmt.Errorf("nft: %s: %w", bytes.TrimSpace(out), err)

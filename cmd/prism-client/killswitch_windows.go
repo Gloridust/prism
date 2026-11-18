@@ -60,3 +60,6 @@ func disableKillSwitch() error {
 	exec.Command("netsh", "advfirewall", "firewall", "delete", "rule", "name="+ksRuleName).Run()
 	return nil
 }
+
+// persistKillSwitch is a no-op: Windows Firewall rules already survive a reboot.
+func persistKillSwitch(ksParams) error { return nil }

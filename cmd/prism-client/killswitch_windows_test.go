@@ -2,6 +2,7 @@ package main
 
 import (
 	"net"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -35,3 +36,10 @@ func ksTestPrepare(t *testing.T) bool {
 func ksTestCrash(dev *tunDevice) { dev.Close() }
 
 func ksTestDump(t *testing.T) {}
+
+// ksTestBoot: Windows Firewall stores the rules itself; check they are in the
+// persistent store rather than only in memory.
+func ksTestBoot(t *testing.T, p ksParams) bool {
+	out, _ := exec.Command("netsh", "advfirewall", "firewall", "show", "rule", "name="+ksRuleName).CombinedOutput()
+	return strings.Contains(string(out), ksRuleName)
+}

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -17,23 +18,72 @@ import (
 	"time"
 )
 
-func findChrome() string {
-	candidates := []string{"google-chrome", "google-chrome-stable"}
+// testBrowser is a browser the guard configures and the tests can launch.
+type testBrowser struct {
+	name  string   // as reported by applyChromiumWebRTC
+	paths []string // candidates, per OS
+}
+
+func chromiumTestBrowsers() []testBrowser {
+	pf, pf86 := os.Getenv("ProgramFiles"), os.Getenv("ProgramFiles(x86)")
 	switch runtime.GOOS {
 	case "darwin":
-		candidates = []string{"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"}
+		return []testBrowser{
+			{"Chrome", []string{"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"}},
+			{"Edge", []string{"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"}},
+			{"Brave", []string{"/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"}},
+		}
 	case "windows":
-		candidates = []string{
-			os.Getenv("ProgramFiles") + `\Google\Chrome\Application\chrome.exe`,
-			os.Getenv("ProgramFiles(x86)") + `\Google\Chrome\Application\chrome.exe`,
+		return []testBrowser{
+			{"Chrome", []string{pf + `\Google\Chrome\Application\chrome.exe`, pf86 + `\Google\Chrome\Application\chrome.exe`}},
+			{"Edge", []string{pf86 + `\Microsoft\Edge\Application\msedge.exe`, pf + `\Microsoft\Edge\Application\msedge.exe`}},
+			{"Brave", []string{pf + `\BraveSoftware\Brave-Browser\Application\brave.exe`}},
+		}
+	default:
+		return []testBrowser{
+			{"Chrome", []string{"google-chrome", "google-chrome-stable"}},
+			{"Edge", []string{"microsoft-edge", "microsoft-edge-stable"}},
+			{"Brave", []string{"brave-browser", "brave"}},
 		}
 	}
-	for _, c := range candidates {
+}
+
+func (b testBrowser) find() string {
+	for _, c := range b.paths {
 		if p, err := exec.LookPath(c); err == nil {
 			return p
 		}
 	}
 	return ""
+}
+
+func firefoxPath() string {
+	paths := []string{"firefox"}
+	switch runtime.GOOS {
+	case "darwin":
+		paths = []string{"/Applications/Firefox.app/Contents/MacOS/firefox"}
+	case "windows":
+		paths = []string{os.Getenv("ProgramFiles") + `\Mozilla Firefox\firefox.exe`, os.Getenv("ProgramFiles(x86)") + `\Mozilla Firefox\firefox.exe`}
+	}
+	return testBrowser{paths: paths}.find()
+}
+
+// killTree stops a browser and the helper processes it spawned. It never
+// blocks: a confined browser (snap) may refuse the signal, and a test must not
+// hang on that.
+func killTree(cmd *exec.Cmd, marker string) {
+	if runtime.GOOS == "windows" {
+		exec.Command("taskkill", "/F", "/T", "/PID", fmt.Sprint(cmd.Process.Pid)).Run()
+	} else {
+		exec.Command("pkill", "-KILL", "-f", marker).Run()
+	}
+	cmd.Process.Kill()
+	done := make(chan struct{})
+	go func() { cmd.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+	}
 }
 
 // stunServer answers RFC 5389 Binding Requests and counts them. A request
@@ -91,126 +141,217 @@ pc.createOffer().then(o => pc.setLocalDescription(o));
 setTimeout(report, 8000);
 </script>`
 
-// TestChromeHonoursWebRTCGuard drives a real Chrome: it loads a page that
-// gathers WebRTC candidates against a local STUN server, first without and
-// then with the policy prism-client installs. Without it Chrome sends a STUN
-// probe from the machine's real address; with it, behind a proxy, it must not.
-//
-// Requires PRISM_BROWSER_TEST=1 and an installed Chrome (root on Linux, where
-// managed policy lives in /etc).
-func TestChromeHonoursWebRTCGuard(t *testing.T) {
-	if os.Getenv("PRISM_BROWSER_TEST") == "" {
-		t.Skip("set PRISM_BROWSER_TEST=1 (launches Chrome and sets its WebRTC policy)")
-	}
-	chrome := findChrome()
-	if chrome == "" {
-		t.Skip("Chrome not installed")
-	}
+// webrtcLab is the fixture a browser is pointed at: a page that gathers WebRTC
+// candidates, a STUN server on the machine's real address that counts what
+// reaches it, and a local proxy standing in for prism-client's.
+type webrtcLab struct {
+	t      *testing.T
+	hostIP net.IP
+	stun   *stunServer
+	web    net.Listener
+	proxy  net.Listener // forwarding HTTP proxy (also accepts and drops SOCKS)
+
+	mu     sync.Mutex
+	result chan []string
+}
+
+func newWebRTCLab(t *testing.T) *webrtcLab {
+	t.Helper()
 	c, err := net.Dial("udp4", "203.0.113.1:9")
 	if err != nil {
 		t.Skipf("no outbound interface: %v", err)
 	}
-	hostIP := c.LocalAddr().(*net.UDPAddr).IP
+	l := &webrtcLab{t: t, hostIP: c.LocalAddr().(*net.UDPAddr).IP}
 	c.Close()
+	l.stun = newSTUNServer(t, l.hostIP)
 
-	stun := newSTUNServer(t, hostIP)
-	stunAddr := stun.conn.LocalAddr().String()
-
-	var mu sync.Mutex
-	var result chan []string
-	web, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
+	if l.web, err = net.Listen("tcp", "127.0.0.1:0"); err != nil {
 		t.Fatal(err)
 	}
-	defer web.Close()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprintf(w, webrtcProbePage, stunAddr)
+		fmt.Fprintf(w, webrtcProbePage, l.stun.conn.LocalAddr().String())
 	})
 	mux.HandleFunc("/result", func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
 		var cands []string
 		json.Unmarshal(raw, &cands)
-		mu.Lock()
-		ch := result
-		mu.Unlock()
+		l.mu.Lock()
+		ch := l.result
+		l.mu.Unlock()
 		select {
 		case ch <- cands:
 		default:
 		}
 	})
-	go http.Serve(web, mux)
+	go http.Serve(l.web, mux)
 
-	// A stand-in for prism-client's local proxy: Chrome only needs one to be
-	// configured for "no UDP outside the proxy" to apply.
-	proxy, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
+	if l.proxy, err = net.Listen("tcp", "127.0.0.1:0"); err != nil {
 		t.Fatal(err)
 	}
-	defer proxy.Close()
-	go func() {
-		for {
-			pc, err := proxy.Accept()
-			if err != nil {
-				return
-			}
-			pc.Close()
+	go http.Serve(l.proxy, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !r.URL.IsAbs() {
+			http.Error(w, "proxy", http.StatusBadRequest)
+			return
 		}
-	}()
+		r.RequestURI = ""
+		resp, err := http.DefaultTransport.RoundTrip(r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		for k, v := range resp.Header {
+			w.Header()[k] = v
+		}
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
+	}))
+	t.Cleanup(func() { l.web.Close(); l.proxy.Close() })
+	return l
+}
 
-	gather := func(label string) (cands []string, hits int64) {
-		t.Helper()
-		ch := make(chan []string, 1)
-		mu.Lock()
-		result = ch
-		mu.Unlock()
-		before := stun.hits.Load()
+func (l *webrtcLab) url() string { return "http://" + l.web.Addr().String() + "/" }
 
-		args := []string{"--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
-			"--user-data-dir=" + t.TempDir(), "--proxy-server=socks5://" + proxy.Addr().String(),
-			"http://" + web.Addr().String() + "/"}
-		if runtime.GOOS == "linux" {
-			args = append([]string{"--no-sandbox"}, args...)
-		}
-		cmd := exec.Command(chrome, args...)
-		if err := cmd.Start(); err != nil {
-			t.Fatalf("start chrome: %v", err)
-		}
-		defer func() { cmd.Process.Kill(); cmd.Wait() }()
-		select {
-		case cands = <-ch:
-		case <-time.After(45 * time.Second):
-			t.Fatalf("%s: Chrome never reported WebRTC candidates", label)
-		}
-		time.Sleep(500 * time.Millisecond)
-		hits = stun.hits.Load() - before
-		t.Logf("%s: %d STUN request(s) reached the server; candidates: %q", label, hits, cands)
-		return
+// gather launches the browser and returns the candidates it reported and how
+// many STUN requests reached the server meanwhile.
+func (l *webrtcLab) gather(label, bin, marker string, args ...string) (cands []string, hits int64) {
+	l.t.Helper()
+	ch := make(chan []string, 1)
+	l.mu.Lock()
+	l.result = ch
+	l.mu.Unlock()
+	before := l.stun.hits.Load()
+
+	cmd := exec.Command(bin, args...)
+	if err := cmd.Start(); err != nil {
+		l.t.Fatalf("start %s: %v", bin, err)
 	}
-
-	_, baseline := gather("without the guard")
-	if baseline == 0 {
-		t.Skip("this Chrome sends no STUN even without the policy (no usable interface); nothing to compare against")
+	defer killTree(cmd, marker)
+	select {
+	case cands = <-ch:
+	case <-time.After(60 * time.Second):
+		l.t.Fatalf("%s: the browser never reported WebRTC candidates", label)
 	}
+	time.Sleep(500 * time.Millisecond)
+	hits = l.stun.hits.Load() - before
+	l.t.Logf("%s: %d STUN request(s) reached the server; candidates: %q", label, hits, cands)
+	return
+}
 
-	restore, applied := applyChromiumWebRTC(webrtcProxyOnly)
-	defer func() {
-		for i := len(restore) - 1; i >= 0; i-- {
-			restore[i]()
-		}
-	}()
-	if !strings.Contains(strings.Join(applied, ","), "Chrome") {
-		t.Fatalf("policy was not applied to Chrome (applied to %v)", applied)
-	}
-
-	cands, hits := gather("with the guard")
+func (l *webrtcLab) assertNoLeak(cands []string, hits int64) {
+	l.t.Helper()
 	if hits != 0 {
-		t.Errorf("Chrome still sent %d STUN request(s) from the real address with the policy in place", hits)
+		l.t.Errorf("the browser still sent %d STUN request(s) from the real address with the guard in place", hits)
 	}
 	for _, cand := range cands {
-		if strings.Contains(cand, "typ srflx") || strings.Contains(cand, " "+hostIP.String()+" ") {
-			t.Errorf("candidate exposes the real address: %s", cand)
+		if strings.Contains(cand, "typ srflx") || strings.Contains(cand, " "+l.hostIP.String()+" ") {
+			l.t.Errorf("candidate exposes the real address: %s", cand)
 		}
 	}
+}
+
+// TestChromiumHonoursWebRTCGuard drives every installed Chromium-family
+// browser (Chrome, Edge, Brave): each loads a page that gathers WebRTC
+// candidates against a local STUN server, first without and then with the
+// policy prism-client installs. Without it the browser sends a STUN probe from
+// the machine's real address; with it, behind a proxy, it must not.
+//
+// Requires PRISM_BROWSER_TEST=1 (root on Linux, where managed policy lives in
+// /etc).
+func TestChromiumHonoursWebRTCGuard(t *testing.T) {
+	if os.Getenv("PRISM_BROWSER_TEST") == "" {
+		t.Skip("set PRISM_BROWSER_TEST=1 (launches browsers and sets their WebRTC policy)")
+	}
+	ran := 0
+	for _, b := range chromiumTestBrowsers() {
+		bin := b.find()
+		if bin == "" {
+			continue
+		}
+		ran++
+		t.Run(b.name, func(t *testing.T) {
+			lab := newWebRTCLab(t)
+			run := func(label string) ([]string, int64) {
+				dir := t.TempDir()
+				args := []string{"--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+					"--user-data-dir=" + dir, "--proxy-server=socks5://" + lab.proxy.Addr().String(), lab.url()}
+				if runtime.GOOS == "linux" {
+					args = append([]string{"--no-sandbox"}, args...)
+				}
+				return lab.gather(label, bin, dir, args...)
+			}
+			if _, baseline := run("without the guard"); baseline == 0 {
+				t.Skip("this browser sends no STUN even without the policy; nothing to compare against")
+			}
+			restore, applied := applyChromiumWebRTC(webrtcProxyOnly)
+			defer func() {
+				for i := len(restore) - 1; i >= 0; i-- {
+					restore[i]()
+				}
+			}()
+			if !strings.Contains(","+strings.Join(applied, ",")+",", ","+b.name+",") {
+				t.Fatalf("policy was not applied to %s (applied to %v)", b.name, applied)
+			}
+			lab.assertNoLeak(run("with the guard"))
+		})
+	}
+	if ran == 0 {
+		t.Skip("no Chromium-family browser installed")
+	}
+}
+
+// TestFirefoxHonoursWebRTCGuard does the same with a real Firefox and the
+// user.js block prism-client writes into Firefox profiles.
+func TestFirefoxHonoursWebRTCGuard(t *testing.T) {
+	if os.Getenv("PRISM_BROWSER_TEST") == "" {
+		t.Skip("set PRISM_BROWSER_TEST=1 (launches Firefox)")
+	}
+	bin := firefoxPath()
+	if bin == "" {
+		t.Skip("Firefox not installed")
+	}
+	lab := newWebRTCLab(t)
+
+	// A throwaway profile in a real profile root (snap/flatpak builds cannot
+	// read arbitrary temp dirs), proxied through the lab's HTTP proxy.
+	home, _, _ := targetUser()
+	root := firefoxProfileRoots(home)[0]
+	for _, r := range firefoxProfileRoots(home) {
+		if _, err := os.Stat(r); err == nil {
+			root = r
+			break
+		}
+	}
+	profile := filepath.Join(root, fmt.Sprintf("prismtest%d.webrtc", time.Now().UnixNano()))
+	if err := os.MkdirAll(profile, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(profile)
+	_, port, _ := net.SplitHostPort(lab.proxy.Addr().String())
+	base := fmt.Sprintf(`user_pref("network.proxy.type", 1);
+user_pref("network.proxy.http", "127.0.0.1");
+user_pref("network.proxy.http_port", %s);
+user_pref("network.proxy.allow_hijacking_localhost", true);
+user_pref("network.proxy.no_proxies_on", "");
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("datareporting.policy.dataSubmissionEnabled", false);
+user_pref("toolkit.telemetry.reportingpolicy.firstRun", false);
+user_pref("browser.aboutwelcome.enabled", false);
+`, port)
+	os.WriteFile(filepath.Join(profile, "prefs.js"), nil, 0o600)
+	userJS := filepath.Join(profile, "user.js")
+	os.WriteFile(userJS, []byte(base), 0o600)
+
+	run := func(label string) ([]string, int64) {
+		return lab.gather(label, bin, profile, "--headless", "--no-remote", "--profile", profile, lab.url())
+	}
+	if _, baseline := run("without the guard"); baseline == 0 {
+		t.Skip("this Firefox sends no STUN even without the prefs; nothing to compare against")
+	}
+	if err := writeFirefoxBlock(userJS, -1, -1); err != nil {
+		t.Fatal(err)
+	}
+	lab.assertNoLeak(run("with the guard"))
 }

@@ -1,7 +1,10 @@
 package main
 
 import (
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -43,3 +46,49 @@ func ksTestCrash(dev *tunDevice) {
 }
 
 func ksTestDump(t *testing.T) {}
+
+// ksTestBoot installs boot persistence into a scratch directory, then does
+// what the unit does at boot — runs its ExecStart line — and reports whether
+// that alone brings the ruleset back.
+func ksTestBoot(t *testing.T, p ksParams) (reinstated bool) {
+	dir := t.TempDir()
+	oldRules, oldUnit, oldCtl := ksBootRules, ksBootUnit, ksSystemctl
+	ksBootRules, ksBootUnit = filepath.Join(dir, "killswitch.nft"), filepath.Join(dir, "prism-killswitch.service")
+	var calls []string
+	ksSystemctl = func(args ...string) error { calls = append(calls, strings.Join(args, " ")); return nil }
+	defer func() { ksBootRules, ksBootUnit, ksSystemctl = oldRules, oldUnit, oldCtl }()
+
+	if err := persistKillSwitch(p); err != nil {
+		t.Fatalf("persistKillSwitch: %v", err)
+	}
+	if got := strings.Join(calls, "; "); got != "daemon-reload; enable prism-killswitch.service" {
+		t.Errorf("systemctl calls = %q", got)
+	}
+	unit, _ := os.ReadFile(ksBootUnit)
+	if out, err := exec.Command("systemd-analyze", "verify", ksBootUnit).CombinedOutput(); err != nil && strings.Contains(string(out), filepath.Base(ksBootUnit)) {
+		t.Errorf("systemd rejects the unit: %s", out)
+	}
+	var execStart string
+	for _, line := range strings.Split(string(unit), "\n") {
+		if v, ok := strings.CutPrefix(line, "ExecStart="); ok {
+			execStart = v
+		}
+	}
+	if execStart == "" || !strings.Contains(string(unit), "Before=network-pre.target") {
+		t.Fatalf("unit lacks ExecStart or early ordering:\n%s", unit)
+	}
+
+	// "Reboot": nothing loaded, then the unit's command runs.
+	exec.Command("nft", "delete", "table", "inet", ksTable).Run()
+	if out, err := exec.Command("sh", "-c", execStart).CombinedOutput(); err != nil {
+		t.Fatalf("boot command %q: %s: %v", execStart, out, err)
+	}
+	out, _ := exec.Command("nft", "list", "table", "inet", ksTable).CombinedOutput()
+	reinstated = strings.Contains(string(out), "chain out")
+
+	unpersistKillSwitch()
+	if _, err := os.Stat(ksBootUnit); err == nil {
+		t.Error("unit file left behind after unpersist")
+	}
+	return reinstated
+}

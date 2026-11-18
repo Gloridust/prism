@@ -197,10 +197,16 @@ func TestKillSwitch(t *testing.T) {
 		expect(t, "after the tunnel died, formerly tunnelled traffic", "198.51.100.7:80", "blocked")
 	}
 
-	// Re-applying is idempotent, and removal restores normal connectivity.
+	// Re-applying is idempotent.
 	if err := enableKillSwitch(p); err != nil {
 		t.Fatalf("re-enable: %v", err)
 	}
+	// Boot persistence: what runs at boot must reinstate the rules by itself.
+	if !ksTestBoot(t, p) {
+		t.Error("the boot hook did not reinstate the kill switch")
+	}
+	expect(t, "after the simulated boot", direct, "blocked")
+	// Removal restores normal connectivity.
 	if err := disableKillSwitch(); err != nil {
 		t.Fatalf("disableKillSwitch: %v", err)
 	}

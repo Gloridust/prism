@@ -174,6 +174,11 @@ func main() {
 			if err == nil {
 				err = enableKillSwitch(p)
 			}
+			if err == nil && cfg.TUN.KillSwitchBoot {
+				if err = persistKillSwitch(p); err != nil {
+					disableKillSwitch()
+				}
+			}
 			if err != nil {
 				serverHost, _, _ := net.SplitHostPort(cfg.Server)
 				removeDefaultRoute(tunDev, serverHost, cfg.TUN.OrigGateway)
@@ -207,7 +212,9 @@ func main() {
 			}
 		}
 		tunDev.Close()
-		if killSwitchOn {
+		if killSwitchOn && cfg.TUN.KillSwitchBoot {
+			log.Printf("kill switch stays on (kill_switch_boot): remove it with -killswitch-off")
+		} else if killSwitchOn {
 			if err := disableKillSwitch(); err != nil {
 				log.Printf("kill switch: %v", err)
 			}

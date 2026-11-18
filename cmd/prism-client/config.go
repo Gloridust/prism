@@ -143,6 +143,14 @@ type TUNConfig struct {
 	// machine has no internet until prism-client runs again or is asked to
 	// remove them (`prism-client -killswitch-off`). Requires set_routes.
 	KillSwitch bool `json:"kill_switch"`
+
+	// KillSwitchBoot also re-installs the kill switch at every boot (systemd
+	// unit on Linux, LaunchDaemon on macOS; Windows rules persist anyway), so
+	// the machine has no direct internet access between power-on and the
+	// tunnel coming up. With it set, a clean exit leaves the rules in place:
+	// only `prism-client -killswitch-off` lifts them. Run prism-client at
+	// boot, or the machine stays offline. Requires kill_switch.
+	KillSwitchBoot bool `json:"kill_switch_boot"`
 }
 
 func (c *ClientConfig) defaults() {
@@ -210,6 +218,9 @@ func (c *ClientConfig) validate() error {
 		}
 		if net.ParseIP(c.TUN.Gateway) == nil {
 			return fmt.Errorf("tun.gateway must be an IP address")
+		}
+		if c.TUN.KillSwitchBoot && !c.TUN.KillSwitch {
+			return fmt.Errorf("tun.kill_switch_boot requires tun.kill_switch")
 		}
 		if c.TUN.KillSwitch && !c.tunSetRoutes() {
 			return fmt.Errorf("tun.kill_switch requires tun.set_routes")

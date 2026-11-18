@@ -57,8 +57,8 @@
   "webrtc_guard": true,
 
   "_tun": "TUN 全局模式（需 root）。启用后创建 TUN 设备，IPv4 和 IPv6 全部经隧道，含 WebRTC 的 STUN/UDP；如果本机有公网 IPv6 却无法接管 IPv6，会拒绝启动，不会带着泄露运行。",
-  "_tun_example": {"device_name": "prism0", "address": "10.0.85.1/24", "gateway": "10.0.85.2", "orig_gateway": "192.168.1.1", "kill_switch": true},
-  "_kill_switch": "tun.kill_switch=true：用系统防火墙拒绝一切不经隧道的出站流量，客户端崩溃或被强杀后机器断网而不是回到直连。需同时配置 dns（发往局域网解析器的 DNS 也会被拒）。异常退出后恢复：重启客户端或执行 prism-client -killswitch-off。",
+  "_tun_example": {"device_name": "prism0", "address": "10.0.85.1/24", "gateway": "10.0.85.2", "orig_gateway": "192.168.1.1", "kill_switch": true, "kill_switch_boot": false},
+  "_kill_switch": "tun.kill_switch=true：用系统防火墙拒绝一切不经隧道的出站流量，客户端崩溃或被强杀后机器断网而不是回到直连。需同时配置 dns（发往局域网解析器的 DNS 也会被拒）。异常退出后恢复：重启客户端或执行 prism-client -killswitch-off。再加 kill_switch_boot=true 则每次开机自动装回规则（始终在线，需把客户端设为开机自启）。",
   "tun": null,
 
   "auto_connect": true

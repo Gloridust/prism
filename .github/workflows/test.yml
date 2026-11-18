@@ -37,8 +37,10 @@ jobs:
         run: |
           sudo unshare --net bash -c \
             'PRISM_ROOT_TEST=1 /tmp/prism-client-test -test.v -test.run "TestKillSwitch$" -test.timeout 120s'
-      - name: Real Chrome obeys the WebRTC guard (no STUN from the real address)
-        run: sudo PRISM_BROWSER_TEST=1 /tmp/prism-client-test -test.v -test.run 'TestChromeHonoursWebRTCGuard' -test.timeout 180s
+      - name: Real Chrome / Edge obey the WebRTC guard (no STUN from the real address)
+        run: sudo PRISM_BROWSER_TEST=1 /tmp/prism-client-test -test.v -test.run 'TestChromiumHonoursWebRTCGuard' -test.timeout 300s
+      - name: Real Firefox obeys the WebRTC guard
+        run: PRISM_BROWSER_TEST=1 /tmp/prism-client-test -test.v -test.run 'TestFirefoxHonoursWebRTCGuard' -test.timeout 300s
       - name: Fuzz protocol parsers and handshakes (short)
         run: |
           for f in FuzzDecodeAddr FuzzReadDatagram FuzzStealAndClientHello FuzzServerHandshakes FuzzDispatch; do
@@ -70,8 +72,8 @@ jobs:
         run: sudo PRISM_ROOT_TEST=1 /tmp/prism-client-test -test.v -test.run 'TestKillSwitch$' -test.timeout 120s
       - name: WebRTC browser policy via real defaults
         run: /tmp/prism-client-test -test.v -test.run 'TestChromiumWebRTCDefaults'
-      - name: Real Chrome obeys the WebRTC guard (no STUN from the real address)
-        run: PRISM_BROWSER_TEST=1 /tmp/prism-client-test -test.v -test.run 'TestChromeHonoursWebRTCGuard' -test.timeout 180s
+      - name: Real Chrome / Edge obey the WebRTC guard (no STUN from the real address)
+        run: PRISM_BROWSER_TEST=1 /tmp/prism-client-test -test.v -test.run 'TestChromiumHonoursWebRTCGuard|TestFirefoxHonoursWebRTCGuard' -test.timeout 400s
       - name: "System proxy + DNS on real macOS network services (repoints the machine briefly, so last)"
         run: sudo PRISM_SYSCFG_TEST=1 /tmp/prism-client-test -test.v -test.run 'TestSystemProxyAndDNSRoundTrip' -test.timeout 120s
 
@@ -96,11 +98,11 @@ jobs:
           go test -c -o wintun-test.exe ./cmd/prism-client/
           set PRISM_ROOT_TEST=1
           wintun-test.exe -test.v -test.run "TestWintunAdapterCreate|TestWintunOpenTUN|TestTUNCapturesIPv4AndIPv6" -test.timeout 120s
-      - name: Real Chrome obeys the WebRTC guard (no STUN from the real address)
+      - name: Real Chrome / Edge obey the WebRTC guard (no STUN from the real address)
         shell: cmd
         run: |
           set PRISM_BROWSER_TEST=1
-          wintun-test.exe -test.v -test.run "TestChromeHonoursWebRTCGuard" -test.timeout 180s
+          wintun-test.exe -test.v -test.run "TestChromiumHonoursWebRTCGuard|TestFirefoxHonoursWebRTCGuard" -test.timeout 400s
       - name: Kill switch on real Windows Firewall + wintun
         shell: cmd
         run: |
