@@ -44,7 +44,17 @@ func applyChromiumWebRTC(value string) (restore []func(), applied []string) {
 			continue
 		}
 		path := filepath.Join(b.policyDir, linuxPolicyFile)
-		data, _ := json.Marshal(map[string]string{b.key: value})
+		// Edge documents WebRtcLocalhostIpHandling for Windows and macOS only;
+		// on Linux it follows the Chromium policies instead (confirmed with a
+		// real Edge). Writing all of them is harmless: a browser ignores the
+		// names it does not know.
+		data, _ := json.Marshal(map[string]any{
+			b.key:              value,
+			"WebRtcIPHandling": value,
+			"WebRtcIPHandlingUrl": []map[string]string{
+				{"url": "*", "handling": value},
+			},
+		})
 		err := os.MkdirAll(b.policyDir, 0o755)
 		if err == nil {
 			err = os.WriteFile(path, data, 0o644)
