@@ -1,6 +1,6 @@
 # Prism 部署与运维手册
 
-面向负责上线和日常维护的工程师。协议细节见 [PROTOCOL.md](PROTOCOL.md)。
+面向负责上线和日常维护的工程师。首次安装见 [INSTALL.md](INSTALL.md)，全部配置项见 [CONFIG.md](CONFIG.md)，协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 
 ## 1. 拓扑
 

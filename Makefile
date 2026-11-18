@@ -2,7 +2,7 @@
 # Prereq: a build host WITH module access for the first `go` run — Prism now has
 # third-party deps (uTLS, golang.org/x/crypto), so `go mod download` (or
 # `go mod vendor`) them once for offline/cross builds. All deps are pure Go, so
-# GOOS/GOARCH cross-compiles need no CGO. See README "依赖与取舍".
+# GOOS/GOARCH cross-compiles need no CGO. See docs/DEVELOPMENT.md.
 
 VERSION ?= 0.2.0
 LDFLAGS := -s -w -X main.version=$(VERSION)

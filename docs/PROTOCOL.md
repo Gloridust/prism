@@ -444,7 +444,7 @@ WebRTC 会用 STUN（UDP）探测本机的公网地址（server-reflexive candid
    （`pkg/prism/aead_chacha.go` 的 `NewChaCha20Poly1305AEAD`）：客户端用配置 `cipher` 或构建标签 `prism_chacha`
    选择，服务端用 `ciphers` 列出接受集合并**按序试解密**自动识别每个客户端用的算法。两者**线格式完全一致**
    （12B nonce / 16B tag，首包仍 80 字节），**不在明文里携带算法选择符**（那会引入可识别特征并改变线格式）。
-   注意：引入 ChaCha 使 `go.mod` 依赖 `golang.org/x/crypto`（见 README「依赖与取舍」），不再是零第三方依赖。
+   注意：引入 ChaCha 使 `go.mod` 依赖 `golang.org/x/crypto`（见 [DEVELOPMENT.md](DEVELOPMENT.md#依赖)），不再是零第三方依赖。
 8. **QUIC 载波的指纹**：QUIC 入口有 HTTP/3 回落（§7.14），主动探测看到的是普通 H3 站点；但客户端的 QUIC 握手由 quic-go 生成，传输参数与 Chrome 不同，被动指纹上能区分「Go 写的 H3 客户端」。对抗性强的线路优先用 TCP 载波（uTLS 对齐 Chrome）。
 9. **Kill-switch 需显式开启**：默认关闭；未启用时，进程被强杀后流量回到直连。跨重启的保护需要再开 `kill_switch_boot`（Windows 的规则本身就跨重启）。Linux 的开机加载经过真实重启验证（`scripts/test-killswitch-reboot.sh`：以 systemd 为 1 号进程的机器装上钩子后真的重启，规则在网络服务启动前由 systemd 装回；解除后再重启不再出现）。macOS 的 LaunchDaemon 只验证到「文件通过 `plutil` 校验、开机时执行的那条命令能独立把规则装回去」，没有在真的重启的 Mac 上验证过，首次部署请实际重启一次确认。桌面模式写入的系统代理、系统 DNS、浏览器策略在异常退出后可能残留，重新启动并正常退出即可恢复。
 10. **计量**：每凭据流量与当日用量每 30 秒落盘（`stats_file`）并在正常退出时保存；异常掉电最多丢失最后 30 秒。未配置 `credentials_file`/`stats_file` 时仍只在内存中。
