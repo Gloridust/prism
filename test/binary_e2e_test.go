@@ -85,6 +85,22 @@ func freeTCP(t *testing.T) string {
 	return ln.Addr().String()
 }
 
+// freeTCPUDP returns an address whose port is free for both TCP and UDP (the
+// server listens on the same number for TLS and for QUIC).
+func freeTCPUDP(t *testing.T) string {
+	t.Helper()
+	for i := 0; i < 50; i++ {
+		addr := freeTCP(t)
+		pc, err := net.ListenPacket("udp", addr)
+		if err == nil {
+			pc.Close()
+			return addr
+		}
+	}
+	t.Fatal("no port free for both TCP and UDP")
+	return ""
+}
+
 // logBuf collects a child's output and prints it only if the test fails.
 type logBuf struct {
 	mu sync.Mutex
@@ -181,7 +197,7 @@ func deploy(t *testing.T, o deployOpts) *deployment {
 	psk, _ := prism.NewPSK()
 	id, _ := prism.NewClientID()
 	d := &deployment{
-		t: t, dir: dir, serverAddr: freeTCP(t), socks: freeTCP(t), admin: freeTCP(t),
+		t: t, dir: dir, serverAddr: freeTCPUDP(t), socks: freeTCP(t), admin: freeTCP(t),
 		token: "test-admin-token-0123456789", clientBin: clientBin,
 		id: prism.EncodeKey(id[:]), psk: prism.EncodeKey(psk), pub: prism.EncodeKey(kp.Public.Bytes()),
 	}

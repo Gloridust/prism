@@ -211,7 +211,7 @@ func TestSelfSignedSizedMatchesTarget(t *testing.T) {
 			t.Fatal(err)
 		}
 		got := len(cert.Certificate[0])
-		if size > 600 && (got < size-2 || got > size+2) {
+		if size > 600 && got != size {
 			t.Errorf("asked for a %d-byte certificate, got %d", size, got)
 		}
 	}

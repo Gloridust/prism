@@ -123,7 +123,9 @@ func selfSignedSized(domain string, size int) (tls.Certificate, error) {
 		return tls.Certificate{}, err
 	}
 	// ECDSA signatures vary by a byte or two, so converge on the exact size.
-	for pad, i := size-len(der)-24, 0; size > len(der) && pad > 0 && i < 8; i++ {
+	// Each attempt can land a byte or two off, because an ECDSA signature's
+	// encoded length varies; keep correcting until one lands exactly.
+	for pad, i := size-len(der)-24, 0; len(der) != size && pad > 0 && i < 64; i++ {
 		if der, err = build(pad); err != nil {
 			return tls.Certificate{}, err
 		}
