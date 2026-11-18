@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net"
 	"strings"
 	"testing"
 )
@@ -14,6 +15,21 @@ func ksRulesetText(p ksParams) string {
 	return b.String() + " 198.51.100.20 192.168.0.0"
 }
 
-func ksTestPrepare(t *testing.T) bool { return false }
+// ksTestPrepare records the physical adapter's address before the TUN exists.
+// Assigning the TUN an address with a gateway makes Windows add a default
+// route through it, so an unbound probe would enter the tunnel; binding the
+// probe to the physical address sends it out the physical adapter, which is
+// exactly the traffic the kill switch has to stop.
+func ksTestPrepare(t *testing.T) bool {
+	c, err := net.Dial("udp", "203.0.113.1:9")
+	if err != nil {
+		t.Fatalf("cannot determine the physical adapter address: %v", err)
+	}
+	probeLocal = c.LocalAddr().(*net.UDPAddr).IP
+	c.Close()
+	t.Logf("direct probes are sent from %s", probeLocal)
+	t.Cleanup(func() { probeLocal = nil })
+	return false
+}
 
 func ksTestCrash(dev *tunDevice) { dev.Close() }

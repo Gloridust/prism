@@ -71,7 +71,11 @@ func TestResolveCacheFallback(t *testing.T) {
 func probe(t *testing.T, addr string) string {
 	t.Helper()
 	start := time.Now()
-	c, err := net.DialTimeout("tcp", addr, 1500*time.Millisecond)
+	d := net.Dialer{Timeout: 1500 * time.Millisecond}
+	if probeLocal != nil && !strings.HasPrefix(addr, "198.51.100.") {
+		d.LocalAddr = &net.TCPAddr{IP: probeLocal}
+	}
+	c, err := d.Dial("tcp", addr)
 	if err == nil {
 		c.Close()
 		return "connected"
@@ -85,6 +89,10 @@ func probe(t *testing.T, addr string) string {
 	}
 	return "passed" // slow failure (e.g. host unreachable after ARP): it left the firewall
 }
+
+// probeLocal, when set, is the physical adapter's address that "direct" probes
+// are sent from (see ksTestPrepare on Windows).
+var probeLocal net.IP
 
 func expect(t *testing.T, what, addr, want string) {
 	t.Helper()
