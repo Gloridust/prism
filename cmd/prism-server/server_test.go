@@ -202,3 +202,16 @@ func TestCredentialsFileSeedAndReload(t *testing.T) {
 		t.Fatalf("file should override inline credentials, got %v %v", got, err)
 	}
 }
+
+func TestSelfSignedSizedMatchesTarget(t *testing.T) {
+	for _, size := range []int{0, 900, 2500, 4321, 6000} {
+		cert, err := selfSignedSized("www.example.com", size)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := len(cert.Certificate[0])
+		if size > 600 && (got < size-2 || got > size+2) {
+			t.Errorf("asked for a %d-byte certificate, got %d", size, got)
+		}
+	}
+}

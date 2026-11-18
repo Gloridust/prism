@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -74,14 +75,9 @@ func main() {
 		if h, _, err := net.SplitHostPort(sni); err == nil {
 			sni = h
 		}
-		cert, err := selfSigned(sni)
+		tlsCfg, err = stealTLSConfig(cfg.Steal.Dest, sni)
 		if err != nil {
-			log.Fatalf("steal self-signed cert: %v", err)
-		}
-		tlsCfg = &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS13,
-			NextProtos:   []string{"h2", "http/1.1"},
+			log.Fatalf("steal tls: %v", err)
 		}
 	} else {
 		tlsCfg, err = buildTLSConfig(cfg)
@@ -123,6 +119,7 @@ func main() {
 		aeads:        aeads,
 		allowPrivate: cfg.AllowPrivate,
 		shaping:      cfg.Shaping,
+		headPad:      headPadFrames(cfg.HeadPadding),
 		maxStreams:   maxStreams,
 		cfgPath:      *cfgPath,
 		wsPath:       cfg.WSPath,
@@ -199,6 +196,14 @@ func main() {
 	serveTCP(ln, handler, maxConns)
 }
 
+// headPadFrames maps the head_padding switch (default on) to a frame count.
+func headPadFrames(on *bool) int {
+	if on != nil && !*on {
+		return 0
+	}
+	return prism.DefaultHeadFrames
+}
+
 // serveTCP accepts connections until the listener closes, backing off on
 // transient errors (e.g. EMFILE) and shedding load past maxConns.
 func serveTCP(ln net.Listener, handler func(net.Conn), maxConns int) {
@@ -250,6 +255,7 @@ type server struct {
 	aeads        []prism.AEADFactory // carrier ciphers to trial, in order
 	allowPrivate bool                // permit egress to private/loopback targets
 	shaping      string              // egress length-shaping profile
+	headPad      int                 // per-stream head frames to length-randomise
 	maxStreams   int                 // per-carrier stream cap (0 = unlimited)
 	cfgPath      string              // for SIGHUP reload
 	stealDest    string              // steal mode: relay destination (e.g. "www.microsoft.com:443")
@@ -264,6 +270,9 @@ type server struct {
 
 	actMu  sync.Mutex // guards active
 	active map[*sessConn]struct{}
+
+	// Counters for /metrics.
+	nAuthed, nCover, nStealRelay atomic.Int64
 }
 
 // sessConn tracks a live authenticated session and the credential it used, so a
@@ -364,7 +373,7 @@ func (s *server) handshake(rw io.ReadWriter) (*prism.Keys, *prism.Credential, []
 
 // runSession serves one authenticated carrier until it ends.
 func (s *server) runSession(tr io.ReadWriteCloser, keys *prism.Keys, cred *prism.Credential, via string, remote net.Addr) {
-	sess, err := prism.NewSession(tr, keys, false, prism.WithShaping(s.shaping), prism.WithMaxStreams(s.maxStreams))
+	sess, err := prism.NewSession(tr, keys, false, prism.WithShaping(s.shaping), prism.WithMaxStreams(s.maxStreams), prism.WithHeadPadding(s.headPad))
 	if err != nil {
 		tr.Close()
 		return
@@ -387,6 +396,7 @@ func (s *server) runSession(tr io.ReadWriteCloser, keys *prism.Keys, cred *prism
 		return
 	}
 
+	s.nAuthed.Add(1)
 	m := s.acct.meter(cred.ID)
 	m.conns.Add(1)
 	m.lastSeen.Store(time.Now().Unix())
@@ -416,6 +426,7 @@ func (s *server) handle(raw net.Conn) {
 	keys, cred, consumed, hsErr := s.handshake(tlsConn)
 	_ = tlsConn.SetDeadline(time.Time{})
 	if hsErr != nil {
+		s.nCover.Add(1)
 		if s.wsPath != "" {
 			s.serveCoverOrWS(tlsConn, consumed)
 		} else {

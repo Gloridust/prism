@@ -6,11 +6,13 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	mrand "math/rand"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -29,26 +31,38 @@ import (
 // PoolSize carriers in parallel instead of queuing behind one slow dial, while
 // two requests racing on the same dead slot still dial only once.
 type Dialer struct {
-	server        string
-	sni           string
-	tlsCfg        *utls.Config
-	serverPub     *ecdh.PublicKey
-	cred          prism.Credential
-	aead          prism.AEADFactory
-	shaping       string
-	stealKey      []byte // non-nil in steal mode
-	wsPath        string // non-empty = WebSocket transport
-	maxLifetime   time.Duration
-	iatMaxMs      int
-	useNoise      bool   // use audited Noise_IKpsk2 handshake
-	useQUIC       bool   // use QUIC/H3 transport
-	echConfigList []byte // ECH config for QUIC transport
+	eps      []*endpoint  // primary first, then backups
+	cur      atomic.Int32 // index of the endpoint currently in use
+	failback atomic.Int64 // unix nanos of the last attempt to return to the primary
+
+	cred        prism.Credential
+	aead        prism.AEADFactory
+	shaping     string
+	headPad     int    // per-stream head frames to length-randomise
+	stealKey    []byte // non-nil in steal mode
+	wsPath      string // non-empty = WebSocket transport
+	maxLifetime time.Duration
+	iatMaxMs    int
+	useNoise    bool // use audited Noise_IKpsk2 handshake
+	useQUIC     bool // use QUIC/H3 transport
 
 	pool []*carrier
 
 	rrMu sync.Mutex
 	rr   int
 }
+
+// endpoint is one egress server the client may use.
+type endpoint struct {
+	server    string // "host:port"
+	sni       string
+	serverPub *ecdh.PublicKey
+	tlsCfg    *utls.Config
+	ech       []byte
+}
+
+// failbackEvery is how often a client running on a backup retries the primary.
+const failbackEvery = 5 * time.Minute
 
 // carrier is one pool slot: a (lazily dialed) session guarded by its own mutex.
 type carrier struct {
@@ -79,10 +93,6 @@ func dialBackoff(fails int) time.Duration {
 
 // NewDialer prepares the pool (connections are established lazily on first use).
 func NewDialer(c *ClientConfig, cred *prism.Credential) (*Dialer, error) {
-	pub, err := prism.ParseServerPublic(c.ServerPublicKey)
-	if err != nil {
-		return nil, err
-	}
 	aead, err := prism.AEADByName(c.cipher())
 	if err != nil {
 		return nil, err
@@ -104,65 +114,119 @@ func NewDialer(c *ClientConfig, cred *prism.Credential) (*Dialer, error) {
 			wsPath = "/_prism/ws"
 		}
 	}
+	headPad := prism.DefaultHeadFrames
+	if c.HeadPadding != nil && !*c.HeadPadding {
+		headPad = 0
+	}
 	var maxLife time.Duration
 	if c.MaxLifetimeSec > 0 {
 		maxLife = time.Duration(c.MaxLifetimeSec) * time.Second
 	}
-	// Resolve ECH config list (Encrypted Client Hello).
-	var echConfigList []byte
+	d := &Dialer{
+		cred:        *cred,
+		aead:        aead,
+		shaping:     c.Shaping,
+		headPad:     headPad,
+		stealKey:    stealKey,
+		wsPath:      wsPath,
+		maxLifetime: maxLife,
+		iatMaxMs:    c.IATMaxMs,
+		useNoise:    c.Handshake == "noise",
+		useQUIC:     c.Transport == "quic",
+		pool:        pool,
+	}
+	servers := append([]ServerEndpoint{{Server: c.Server, SNI: c.SNI, ServerPublicKey: c.ServerPublicKey}}, c.Backups...)
+	for i, se := range servers {
+		ep, err := newEndpoint(c, se, skipVerify)
+		if err != nil {
+			return nil, fmt.Errorf("server %d (%s): %w", i, se.Server, err)
+		}
+		d.eps = append(d.eps, ep)
+	}
+	return d, nil
+}
+
+// newEndpoint resolves one server's key, ECH config and TLS settings.
+func newEndpoint(c *ClientConfig, se ServerEndpoint, skipVerify bool) (*endpoint, error) {
+	pub, err := prism.ParseServerPublic(se.ServerPublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("server_public_key: %w", err)
+	}
+	var ech []byte
 	switch {
 	case c.ECH == "auto":
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		var fetchErr error
-		echConfigList, fetchErr = prism.FetchECHConfigList(ctx, c.SNI, c.ECHDoH)
+		ech, fetchErr = prism.FetchECHConfigList(ctx, se.SNI, c.ECHDoH)
 		cancel()
 		if fetchErr != nil {
-			log.Printf("ECH auto-fetch failed, continuing without ECH: %v", fetchErr)
-		} else if echConfigList != nil {
-			log.Printf("ECH config fetched from DNS (%d bytes)", len(echConfigList))
+			log.Printf("ECH auto-fetch for %s failed, continuing without ECH: %v", se.SNI, fetchErr)
+		} else if ech != nil {
+			log.Printf("ECH config for %s fetched from DNS (%d bytes)", se.SNI, len(ech))
 		}
 	case c.ECH != "":
-		var decErr error
-		echConfigList, decErr = base64.StdEncoding.DecodeString(c.ECH)
-		if decErr != nil {
+		if ech, err = base64.StdEncoding.DecodeString(c.ECH); err != nil {
 			return nil, errors.New("ech: invalid base64 config list")
 		}
 	}
-
 	minVersion := uint16(utls.VersionTLS12)
-	if len(echConfigList) > 0 {
+	if len(ech) > 0 || c.Steal {
 		minVersion = utls.VersionTLS13
 	}
-
-	return &Dialer{
-		server:        c.Server,
-		sni:           c.SNI,
-		serverPub:     pub,
-		cred:          *cred,
-		aead:          aead,
-		shaping:       c.Shaping,
-		stealKey:      stealKey,
-		wsPath:        wsPath,
-		maxLifetime:   maxLife,
-		iatMaxMs:      c.IATMaxMs,
-		useNoise:      c.Handshake == "noise",
-		useQUIC:       c.Transport == "quic",
-		echConfigList: echConfigList,
-		pool:          pool,
-		// uTLS Config carries only the fields we steer (SNI/ALPN/verify); the
-		// ClientHello itself is dictated by the mimicked browser profile below,
-		// which is the whole point — Go's native crypto/tls ClientHello is
-		// fingerprintable, so we present Chrome's instead.
-		// When ECH is set, ServerName is the inner (real) name; uTLS uses the
-		// ECH config's public_name as the outer SNI.
+	return &endpoint{
+		server:    se.Server,
+		sni:       se.SNI,
+		serverPub: pub,
+		ech:       ech,
+		// uTLS Config carries only the fields we steer (SNI/verify); the
+		// ClientHello itself is dictated by the mimicked browser profile, which
+		// is the whole point — Go's native crypto/tls ClientHello is
+		// fingerprintable, so we present Chrome's instead. When ECH is set,
+		// ServerName is the inner (real) name; uTLS uses the ECH config's
+		// public_name as the outer SNI.
 		tlsCfg: &utls.Config{
-			ServerName:                     c.SNI,
+			ServerName:                     se.SNI,
 			InsecureSkipVerify:             skipVerify, // #nosec G402 - gated by config or steal mode
 			MinVersion:                     minVersion,
 			NextProtos:                     []string{"http/1.1"},
-			EncryptedClientHelloConfigList: echConfigList,
+			EncryptedClientHelloConfigList: ech,
 		},
 	}, nil
+}
+
+// Server reports the egress currently in use.
+func (d *Dialer) Server() string { return d.eps[d.cur.Load()].server }
+
+// dialSession connects to the current egress, failing over to the next one in
+// order when it is unreachable, and periodically trying to return to the
+// primary once running on a backup.
+func (d *Dialer) dialSession() (*prism.Session, error) {
+	start := int(d.cur.Load())
+	if start != 0 {
+		now := time.Now().UnixNano()
+		if last := d.failback.Load(); now-last > int64(failbackEvery) && d.failback.CompareAndSwap(last, now) {
+			start = 0
+		}
+	}
+	var firstErr error
+	for i := range d.eps {
+		idx := (start + i) % len(d.eps)
+		sess, err := d.dialEndpoint(d.eps[idx])
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if prev := int(d.cur.Swap(int32(idx))); prev != idx {
+			log.Printf("egress switched: %s -> %s", d.eps[prev].server, d.eps[idx].server)
+			if idx != 0 {
+				d.failback.Store(time.Now().UnixNano())
+			}
+		}
+		return sess, nil
+	}
+	return nil, firstErr
 }
 
 func sessionDead(s *prism.Session) bool {
@@ -177,11 +241,11 @@ func sessionDead(s *prism.Session) bool {
 	}
 }
 
-func (d *Dialer) dialSession() (*prism.Session, error) {
+func (d *Dialer) dialEndpoint(ep *endpoint) (*prism.Session, error) {
 	if d.useQUIC {
-		return d.dialQUICSession()
+		return d.dialQUICSession(ep)
 	}
-	raw, err := net.DialTimeout("tcp", d.server, 10*time.Second)
+	raw, err := net.DialTimeout("tcp", ep.server, 10*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -192,7 +256,7 @@ func (d *Dialer) dialSession() (*prism.Session, error) {
 	// http/1.1 — selects http/1.1, exactly as a real Chrome would experience
 	// against an HTTP/1.1-only site. The prism inner handshake then runs
 	// unchanged on top of the established TLS stream.
-	tlsConn := utls.UClient(raw, d.tlsCfg, utls.HelloChrome_Auto)
+	tlsConn := utls.UClient(raw, ep.tlsCfg, utls.HelloChrome_Auto)
 	if d.wsPath != "" {
 		// A WebSocket handshake is HTTP/1.1-only, and Chrome opens wss://
 		// connections offering just http/1.1 — so do we, or the server would
@@ -228,7 +292,7 @@ func (d *Dialer) dialSession() (*prism.Session, error) {
 	// Choose transport: raw TLS stream or WebSocket inside TLS.
 	var transport io.ReadWriteCloser = tlsConn
 	if d.wsPath != "" {
-		ws, err := prism.WSClientUpgrade(tlsConn, d.sni, d.wsPath)
+		ws, err := prism.WSClientUpgrade(tlsConn, ep.sni, d.wsPath)
 		if err != nil {
 			raw.Close()
 			return nil, err
@@ -238,16 +302,16 @@ func (d *Dialer) dialSession() (*prism.Session, error) {
 
 	var keys *prism.Keys
 	if d.useNoise {
-		keys, err = prism.NoiseClientHandshake(transport, d.serverPub, d.cred, d.aead)
+		keys, err = prism.NoiseClientHandshake(transport, ep.serverPub, d.cred, d.aead)
 	} else {
-		keys, err = prism.ClientHandshake(transport, d.serverPub, d.cred, d.aead)
+		keys, err = prism.ClientHandshake(transport, ep.serverPub, d.cred, d.aead)
 	}
 	if err != nil {
 		raw.Close()
 		return nil, err
 	}
 	tlsConn.SetDeadline(time.Time{})
-	opts := []prism.Option{prism.WithShaping(d.shaping)}
+	opts := []prism.Option{prism.WithShaping(d.shaping), prism.WithHeadPadding(d.headPad)}
 	if d.maxLifetime > 0 {
 		opts = append(opts, prism.WithMaxLifetime(d.maxLifetime))
 	}
@@ -270,15 +334,15 @@ func forceHTTP1ALPN(c *utls.UConn) error {
 	return c.MarshalClientHello()
 }
 
-func (d *Dialer) dialQUICSession() (*prism.Session, error) {
+func (d *Dialer) dialQUICSession(ep *endpoint) (*prism.Session, error) {
 	tlsCfg := &tls.Config{
-		ServerName:                     d.sni,
-		InsecureSkipVerify:             d.tlsCfg.InsecureSkipVerify, // #nosec G402 - gated by config
+		ServerName:                     ep.sni,
+		InsecureSkipVerify:             ep.tlsCfg.InsecureSkipVerify, // #nosec G402 - gated by config
 		MinVersion:                     tls.VersionTLS13,
 		NextProtos:                     []string{"h3"},
-		EncryptedClientHelloConfigList: d.echConfigList,
+		EncryptedClientHelloConfigList: ep.ech,
 	}
-	qc, err := prism.QUICClientDial(d.server, tlsCfg, 10*time.Second)
+	qc, err := prism.QUICClientDial(ep.server, tlsCfg, 10*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -287,16 +351,16 @@ func (d *Dialer) dialQUICSession() (*prism.Session, error) {
 	qc.SetDeadline(time.Now().Add(10 * time.Second))
 	var keys *prism.Keys
 	if d.useNoise {
-		keys, err = prism.NoiseClientHandshake(qc, d.serverPub, d.cred, d.aead)
+		keys, err = prism.NoiseClientHandshake(qc, ep.serverPub, d.cred, d.aead)
 	} else {
-		keys, err = prism.ClientHandshake(qc, d.serverPub, d.cred, d.aead)
+		keys, err = prism.ClientHandshake(qc, ep.serverPub, d.cred, d.aead)
 	}
 	if err != nil {
 		qc.Close()
 		return nil, err
 	}
 	qc.SetDeadline(time.Time{})
-	opts := []prism.Option{prism.WithShaping(d.shaping)}
+	opts := []prism.Option{prism.WithShaping(d.shaping), prism.WithHeadPadding(d.headPad)}
 	if d.maxLifetime > 0 {
 		opts = append(opts, prism.WithMaxLifetime(d.maxLifetime))
 	}

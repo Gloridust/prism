@@ -114,6 +114,7 @@ type Session struct {
 	maxLife    time.Duration
 	draining   chan struct{} // closed when the session starts draining (max lifetime)
 	iatMaxMs   int           // inter-arrival time shaping: max random delay in ms (0 = off)
+	headFrames int           // per-stream head frames to length-randomise (0 = off)
 
 	// Reusable buffers — eliminate per-frame heap allocations on the hot path.
 	// wplain/wout are protected by wmu; rct is readLoop-only.
@@ -163,6 +164,34 @@ func WithMaxLifetime(d time.Duration) Option {
 // that could distinguish Prism from ordinary HTTPS browsing. 0 disables it.
 func WithIAT(maxMs int) Option {
 	return func(s *Session) { s.iatMaxMs = maxMs }
+}
+
+// DefaultHeadFrames is how many frames per stream the commands pad by default:
+// enough to cover a TLS 1.3 handshake in both directions.
+const DefaultHeadFrames = 8
+
+// WithHeadPadding randomises the length of the first n DATA frames of every
+// stream (and of the SYN that opens it). Those frames carry the tunnelled
+// connection's own handshake — typically a TLS ClientHello/ServerHello whose
+// sizes are a well-known TLS-in-TLS signature — so hiding their lengths removes
+// the signature while leaving bulk transfer untouched. Padding sits inside the
+// AEAD and is ignored on receipt, so each side enables it independently.
+func WithHeadPadding(n int) Option {
+	return func(s *Session) { s.headFrames = n }
+}
+
+// headPad picks the padding for a head frame carrying n payload bytes: short
+// frames are lifted to a random length in [900, 1400), longer ones get up to
+// 255 bytes, and near-full frames are left alone to stay inside one TLS record.
+func headPad(n int) int {
+	switch {
+	case n < 900:
+		return 900 + rand.Intn(500) - n
+	case n+255 <= maxPayload-64:
+		return rand.Intn(256)
+	default:
+		return 0
+	}
 }
 
 // NewSession wraps a post-handshake carrier. initiator must be true on the
@@ -474,7 +503,12 @@ func (s *Session) OpenStream(target string) (*Stream, error) {
 	s.streams[id] = st
 	s.mu.Unlock()
 
-	if err := s.writeFrame(cmdSYN, id, enc, 0); err != nil {
+	synPad := 0
+	if s.headFrames > 0 {
+		// Hide the target's length (a domain name's size) in the SYN.
+		synPad = 64 - len(enc)%64 + 64*rand.Intn(2)
+	}
+	if err := s.writeFrame(cmdSYN, id, enc, synPad); err != nil {
 		s.removeStream(id)
 		return nil, err
 	}
@@ -598,12 +632,13 @@ type Stream struct {
 	sendWin   int
 	writeErr  error
 	writeDone bool
+	headLeft  int // head frames still to pad (see WithHeadPadding)
 
 	closeOnce sync.Once
 }
 
 func (s *Session) newStream(id uint32, target string) *Stream {
-	st := &Stream{id: id, s: s, target: target, sendWin: streamWindow}
+	st := &Stream{id: id, s: s, target: target, sendWin: streamWindow, headLeft: s.headFrames}
 	st.rcond = sync.NewCond(&st.rmu)
 	st.wcond = sync.NewCond(&st.wmu)
 	return st
@@ -733,9 +768,14 @@ func (st *Stream) Write(p []byte) (int, error) {
 			n = st.sendWin
 		}
 		st.sendWin -= n
+		pad := 0
+		if st.headLeft > 0 {
+			st.headLeft--
+			pad = headPad(n)
+		}
 		st.wmu.Unlock()
 
-		if err := st.s.writeFrame(cmdData, st.id, p[:n], 0); err != nil {
+		if err := st.s.writeFrame(cmdData, st.id, p[:n], pad); err != nil {
 			return total, err
 		}
 		if sz := st.s.profile.ShouldCover(); sz > 0 {

@@ -144,3 +144,10 @@ func removeDefaultRoute(dev *tunDevice, serverHost, _ string) {
 	}
 	exec.Command("ip", "route", "del", serverHost+"/32").Run()
 }
+
+// addHostRoute sends traffic for one more server directly out the LAN gateway.
+func addHostRoute(host, gw string) error {
+	return runAll([][]string{{"ip", "route", "add", host + "/32", "via", gw}})
+}
+
+func delHostRoute(host, gw string) { exec.Command("ip", "route", "del", host+"/32").Run() }

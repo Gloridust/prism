@@ -59,6 +59,11 @@ func main() {
 			log.Fatalf("tun: %v", err)
 		}
 		cfg.Server = pinned
+		for i := range cfg.Backups {
+			if cfg.Backups[i].Server, err = pinServerIPv4(cfg.Backups[i].Server); err != nil {
+				log.Fatalf("tun: backups[%d]: %v", i, err)
+			}
+		}
 	}
 	d, err := NewDialer(cfg, cred)
 	if err != nil {
@@ -135,6 +140,13 @@ func main() {
 				tunDev.Close()
 				log.Fatalf("tun routes: %v", tunErr)
 			}
+			for _, b := range cfg.Backups {
+				if h, _, _ := net.SplitHostPort(b.Server); h != serverHost {
+					if tunErr = addHostRoute(h, cfg.TUN.OrigGateway); tunErr != nil {
+						log.Printf("tun: no direct route for backup %s (it will be unusable): %v", h, tunErr)
+					}
+				}
+			}
 			// IPv6 is captured too, otherwise WebRTC/STUN (and anything else)
 			// would leave over the physical link's IPv6 with the real address.
 			if tunErr = addIPv6Capture(tunDev); tunErr != nil {
@@ -162,6 +174,11 @@ func main() {
 		if cfg.tunSetRoutes() {
 			serverHost, _, _ := net.SplitHostPort(cfg.Server)
 			removeDefaultRoute(tunDev, serverHost, cfg.TUN.OrigGateway)
+			for _, b := range cfg.Backups {
+				if h, _, _ := net.SplitHostPort(b.Server); h != serverHost {
+					delHostRoute(h, cfg.TUN.OrigGateway)
+				}
+			}
 		}
 		tunDev.Close()
 	}
@@ -225,13 +242,13 @@ func (a *app) status() map[string]any {
 	connected := a.connected
 	webrtc := a.webrtc.Applied()
 	a.mu.Unlock()
-	live := 0
+	live, server := 0, a.cfg.Server
 	if a.d != nil {
-		live = a.d.Live()
+		live, server = a.d.Live(), a.d.Server()
 	}
 	return map[string]any{
 		"connected": connected,
-		"server":    a.cfg.Server,
+		"server":    server,
 		"live":      live,
 		"socks":     a.cfg.SocksListen,
 		"http":      a.cfg.HTTPListen,

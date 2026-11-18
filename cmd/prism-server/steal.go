@@ -87,6 +87,7 @@ func (s *server) handleSteal(raw net.Conn) {
 // steal target. The peer completes the TLS handshake with the real target and
 // sees its real certificate — indistinguishable from a direct connection.
 func (s *server) relayToStealDest(clientConn net.Conn, buffered []byte) {
+	s.nStealRelay.Add(1)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	var d net.Dialer

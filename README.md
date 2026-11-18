@@ -107,9 +107,9 @@ chmod +x /etc/init.d/prism-client
 | 审查手段 | Prism 的应对 |
 |---|---|
 | 被动 DPI / TLS 指纹 | 对自有域名的真实 TLS 1.3；**uTLS 模拟 Chrome ClientHello**；首包无明文特征 |
-| 主动探测 | 无凭据 → 同机真实网站回落，探测只见正常站点 |
+| 主动探测 | 无凭据 → 同机真实网站回落；steal 模式下整条连接转发到真实站点，标记绑定握手且不可重放 |
 | SNI / 证书封锁 | 自有域名 + 真实证书，SNI 即正常域名 |
-| TLS-in-TLS 检测 | 数据面不套内层 TLS，自有分帧 + 整形 |
+| TLS-in-TLS 检测 | 每条流的前几个帧随机化长度（默认开启），隐藏被承载连接自身的 TLS 握手特征；可叠加整形 |
 | 熵分析 | 高熵只出现在 TLS 记录体内，无裸随机段 |
 | 重放 | 一次性临时公钥 + 新鲜度窗口 + 重放集合 |
 
@@ -117,7 +117,8 @@ chmod +x /etc/init.d/prism-client
 
 ## 安全与合规（请读）
 
-- 握手为**自研未审计**构造，刻意对齐 Noise_IKpsk2 以便替换为成熟库；面对高风险对手上线前请做密码学评审。
+- 默认握手为**自研未审计**构造；可切换到基于 `flynn/noise` 的 Noise_IKpsk1（`handshake: "noise"`），但 Prism 对它的用法同样未经第三方评审。面对高风险对手上线前请做密码学评审。
+- 部署、运维、监控与排障见 [`docs/DEPLOY.md`](docs/DEPLOY.md)。
 - 载波已接 **uTLS 模拟 Chrome 指纹**（`cmd/prism-client/dialer.go`）；仍需跟随 Chrome 版本更新 uTLS，`HelloChrome_Auto` 只对齐到打包时的某个稳定版，且 uTLS 指纹本身也在被研究，需持续迭代。
 - 自有域名会被枚举/封锁，注意域名隔离与运维卫生。
 - UDP（DNS/QUIC/实时音视频）走 UDP-over-stream 转发，附带 TCP 可靠语义，对 QUIC 非最优但够用。
@@ -147,7 +148,11 @@ Prism 的协议核心 `pkg/prism/`（握手、KDF、分帧、mux、流控、重�
 ## 测试
 
 ```bash
-go test ./...        # 握手往返 / 重放拒绝 / AEAD(AES+ChaCha) / 算法协商矩阵 / 分帧 / mux / 流控(4MiB) /
-                     # 24并发流 / 回落 / uTLS 载波端到端(AES+ChaCha, 1MiB 完整性 + 并发)
-go test -race ./...  # 并发/mux 竞态检查
+go test -race ./...   # 单元 + 进程内端到端 + 真实二进制端到端
+go test -short ./...  # 跳过需要编译二进制的端到端用例
+go test ./pkg/prism/ -run '^$' -fuzz '^FuzzDispatch$' -fuzztime 30s   # 模糊测试（任选一个 Fuzz 目标）
 ```
+
+`test/binary_e2e_test.go` 会编译 `prism-server` 与 `prism-client`，按实际部署方式跑通：
+TLS / WebSocket / QUIC × 两种握手 × 两种算法、steal 模式、cover 回落（含探测洪泛）、管理 API 全流程（鉴权、统计、
+新增、配额、吊销踢线、持久化）、主备出口切换，以及错误配置在启动时被拒绝。需要 root 的真实 TUN 用例见 `.github/workflows/test.yml`。

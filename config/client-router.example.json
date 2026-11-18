@@ -20,5 +20,9 @@
   "ws_path": "",
   "iat_max_ms": 0,
   "max_lifetime_sec": 0,
-  "handshake": ""
+  "handshake": "",
+  "head_padding": true,
+
+  "_backups": "备用出口（可选）：[{\"server\": \"sg2.example.com:443\", \"sni\": \"sg2.example.com\", \"server_public_key\": \"...\"}]",
+  "backups": []
 }

@@ -103,6 +103,12 @@ func (l *logBuf) String() string {
 
 func start(t *testing.T, name, bin, cfgPath string) *logBuf {
 	t.Helper()
+	_, out := startProc(t, name, bin, cfgPath)
+	return out
+}
+
+func startProc(t *testing.T, name, bin, cfgPath string) (*exec.Cmd, *logBuf) {
+	t.Helper()
 	out := &logBuf{}
 	cmd := exec.Command(bin, "-c", cfgPath)
 	cmd.Stdout, cmd.Stderr = out, out
@@ -112,11 +118,11 @@ func start(t *testing.T, name, bin, cfgPath string) *logBuf {
 	t.Cleanup(func() {
 		cmd.Process.Kill()
 		cmd.Wait()
-		if t.Failed() {
+		if t.Failed() || os.Getenv("PRISM_E2E_LOGS") != "" {
 			t.Logf("---- %s output ----\n%s", name, out.String())
 		}
 	})
-	return out
+	return cmd, out
 }
 
 func waitTCP(t *testing.T, addr string) {
@@ -528,6 +534,12 @@ func TestBinariesAdminLifecycle(t *testing.T) {
 		t.Fatalf("stats = %s", raw)
 	}
 
+	// Prometheus metrics expose the same accounting.
+	if code, raw := d.adminCall("GET", "/metrics", nil); code != 200 ||
+		!bytes.Contains(raw, []byte("prism_sessions ")) || !bytes.Contains(raw, []byte(`prism_client_bytes_up_total{id="`)) {
+		t.Fatalf("metrics: %d %s", code, raw)
+	}
+
 	// Add a credential: persisted to the credentials file and usable at once.
 	code, raw := d.adminCall("POST", "/api/credentials/add", map[string]any{"name": "laptop-2"})
 	var added struct{ ID, PSK string }
@@ -663,4 +675,46 @@ func TestBinariesRejectBadConfig(t *testing.T) {
 	m := cwith("steal", true)
 	m["ech"] = "auto"
 	check(clientBin, m, "steal")
+}
+
+// TestBinariesFailover: when the primary egress dies the client moves to the
+// backup on its own, and existing applications just reconnect.
+func TestBinariesFailover(t *testing.T) {
+	serverBin, clientBin := binaries(t)
+	backup := deploy(t, deployOpts{}) // its server is the backup egress
+	echo := tcpEchoServer(t)
+
+	// A second server with its own identity, accepting the same credential.
+	kp, _ := prism.GenerateServerKeypair()
+	primaryAddr := freeTCP(t)
+	writeJSONFile(t, filepath.Join(backup.dir, "primary.json"), map[string]any{
+		"listen": primaryAddr, "self_signed": "localhost", "allow_private": true,
+		"private_key": prism.EncodeKey(kp.Private.Bytes()),
+		"credentials": []map[string]any{{"name": "e2e", "id": backup.id, "psk": backup.psk}},
+	})
+	primary, primaryLog := startProc(t, "prism-server-primary", serverBin, filepath.Join(backup.dir, "primary.json"))
+	waitTCP(t, primaryAddr)
+
+	socks := freeTCP(t)
+	cfg := map[string]any{}
+	for k, v := range backup.clientBase {
+		cfg[k] = v
+	}
+	cfg["server"], cfg["server_public_key"], cfg["socks_listen"] = primaryAddr, prism.EncodeKey(kp.Public.Bytes()), socks
+	cfg["backups"] = []map[string]any{{"server": backup.serverAddr, "sni": "localhost", "server_public_key": backup.pub}}
+	writeJSONFile(t, filepath.Join(backup.dir, "client-ha.json"), cfg)
+	clientLog := start(t, "prism-client-ha", clientBin, filepath.Join(backup.dir, "client-ha.json"))
+	waitTCP(t, socks)
+
+	echoThrough(t, socks, echo, 100_000)
+	if !strings.Contains(primaryLog.String(), "connected via tls") {
+		t.Fatal("client did not start on the primary")
+	}
+
+	primary.Process.Kill()
+	primary.Wait()
+	echoThrough(t, socks, echo, 100_000) // retries internally while carriers fail over
+	if !strings.Contains(clientLog.String(), "egress switched: "+primaryAddr+" -> "+backup.serverAddr) {
+		t.Fatalf("no failover to the backup; client log:\n%s", clientLog.String())
+	}
 }

@@ -18,6 +18,11 @@ type ClientConfig struct {
 	PSK             string `json:"psk"`               // base64 32 bytes
 	AllowInsecure   bool   `json:"allow_insecure"`    // skip cert verify (testing/self-signed)
 
+	// Backups are further egress servers, tried in order when the primary is
+	// unreachable. They accept the same id/psk and use the same transport
+	// settings; the client returns to the primary when it comes back.
+	Backups []ServerEndpoint `json:"backups"`
+
 	// Steal enables REALITY-style active probing resistance. When true, the
 	// client embeds an HMAC tag (derived from the PSK) in the TLS session_id
 	// so the server can distinguish it from probers before completing TLS.
@@ -48,6 +53,11 @@ type ClientConfig struct {
 	// Shaping enables egress length-shaping: "pad" rounds small frames up to
 	// fixed sizes to mask inner record lengths; "" / "none" disables it (default).
 	Shaping string `json:"shaping"`
+
+	// HeadPadding randomises the length of the first frames of every stream,
+	// hiding the size signature of the tunnelled connection's own TLS
+	// handshake (the TLS-in-TLS tell). Default true; set false to disable.
+	HeadPadding *bool `json:"head_padding"`
 
 	// IATMaxMs enables inter-arrival time shaping: each small outgoing frame is
 	// preceded by a random delay of 0–IATMaxMs milliseconds. This blurs per-frame
@@ -109,6 +119,13 @@ type DNSConfig struct {
 	Upstream string `json:"upstream"`
 }
 
+// ServerEndpoint identifies one egress server.
+type ServerEndpoint struct {
+	Server          string `json:"server"`            // "host:port"
+	SNI             string `json:"sni"`               // TLS ServerName
+	ServerPublicKey string `json:"server_public_key"` // base64 X25519
+}
+
 // TUNConfig configures the TUN global mode.
 type TUNConfig struct {
 	DeviceName  string `json:"device_name"`  // e.g. "prism0" (default)
@@ -144,6 +161,14 @@ func (c *ClientConfig) validate() error {
 	}
 	if c.SNI == "" {
 		return fmt.Errorf("sni is required")
+	}
+	for i, b := range c.Backups {
+		if _, _, err := net.SplitHostPort(b.Server); err != nil {
+			return fmt.Errorf("backups[%d].server must be host:port: %w", i, err)
+		}
+		if b.SNI == "" || b.ServerPublicKey == "" {
+			return fmt.Errorf("backups[%d] needs sni and server_public_key", i)
+		}
 	}
 	switch c.Mode {
 	case "desktop", "router":

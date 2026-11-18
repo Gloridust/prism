@@ -4,6 +4,8 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -308,6 +310,67 @@ func (a *adminAPI) handleSubscription(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleMetrics renders Prometheus text exposition.
+func (a *adminAPI) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	s := a.srv
+	s.credsMu.RLock()
+	ccs := s.credCfgs
+	s.credsMu.RUnlock()
+	live := make(map[prism.ClientID]int)
+	s.actMu.Lock()
+	total := len(s.active)
+	for rec := range s.active {
+		live[rec.id]++
+	}
+	s.actMu.Unlock()
+
+	var b strings.Builder
+	metric := func(name, typ, help string) {
+		fmt.Fprintf(&b, "# HELP %s %s\n# TYPE %s %s\n", name, help, name, typ)
+	}
+	metric("prism_sessions", "gauge", "Live authenticated carrier sessions.")
+	fmt.Fprintf(&b, "prism_sessions %d\n", total)
+	metric("prism_credentials", "gauge", "Provisioned credentials.")
+	fmt.Fprintf(&b, "prism_credentials %d\n", len(ccs))
+	metric("prism_authenticated_total", "counter", "Carriers that passed the Prism handshake.")
+	fmt.Fprintf(&b, "prism_authenticated_total %d\n", s.nAuthed.Load())
+	metric("prism_cover_served_total", "counter", "Connections that failed the handshake and were served the cover site.")
+	fmt.Fprintf(&b, "prism_cover_served_total %d\n", s.nCover.Load())
+	metric("prism_steal_relayed_total", "counter", "Connections relayed to the steal target.")
+	fmt.Fprintf(&b, "prism_steal_relayed_total %d\n", s.nStealRelay.Load())
+
+	type row struct {
+		labels string
+		m      *meter
+		quota  int64
+		live   int
+	}
+	rows := make([]row, 0, len(ccs))
+	for _, c := range ccs {
+		id, err := prism.ParseClientID(c.ID)
+		if err != nil {
+			continue
+		}
+		rows = append(rows, row{fmt.Sprintf(`{id=%q,name=%q}`, fmt.Sprintf("%x", id), c.Name), s.acct.meter(id), c.MaxBytesPerDay, live[id]})
+	}
+	per := func(name, typ, help string, val func(row) int64) {
+		metric(name, typ, help)
+		for _, r := range rows {
+			fmt.Fprintf(&b, "%s%s %d\n", name, r.labels, val(r))
+		}
+	}
+	per("prism_client_sessions", "gauge", "Live sessions per credential.", func(r row) int64 { return int64(r.live) })
+	per("prism_client_bytes_up_total", "counter", "Bytes from client to the internet.", func(r row) int64 { return r.m.up.Load() })
+	per("prism_client_bytes_down_total", "counter", "Bytes from the internet to client.", func(r row) int64 { return r.m.down.Load() })
+	per("prism_client_connects_total", "counter", "Carriers established per credential.", func(r row) int64 { return r.m.conns.Load() })
+	per("prism_client_bytes_today", "gauge", "Bytes used in the current UTC day.", func(r row) int64 { return r.m.usedToday() })
+	per("prism_client_quota_bytes", "gauge", "Daily quota in bytes (0 = unlimited).", func(r row) int64 { return r.quota })
+	per("prism_client_last_seen_seconds", "gauge", "Unix time of the credential's last activity.", func(r row) int64 { return r.m.lastSeen.Load() })
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	io.WriteString(w, b.String())
+}
+
 func (a *adminAPI) mux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/credentials", a.auth(http.MethodGet, a.handleListCredentials))
@@ -317,6 +380,7 @@ func (a *adminAPI) mux() *http.ServeMux {
 	mux.HandleFunc("/api/quota", a.auth(http.MethodPost, a.handleSetQuota))
 	mux.HandleFunc("/api/stats", a.auth(http.MethodGet, a.handleStats))
 	mux.HandleFunc("/api/subscription", a.auth(http.MethodGet, a.handleSubscription))
+	mux.HandleFunc("/metrics", a.auth(http.MethodGet, a.handleMetrics))
 	return mux
 }
 

@@ -26,6 +26,9 @@
     { "name": "staff-laptop-01", "id": "另一个ID", "psk": "另一个PSK" }
   ],
 
+  "_credentials_file": "可写的凭据库（推荐）。首次启动由上面的 credentials 生成，此后以该文件为准；管理 API 的新增/吊销/轮换/配额都写入这里，重启不丢。留空则管理 API 的修改类接口不可用。",
+  "credentials_file": "/var/lib/prism/credentials.json",
+
   "_ciphers": "接受的载波 AEAD，按序试解密。留空=['aes-256-gcm']。要同时服务有 AES-NI 的桌面和无 AES-NI 的路由器(用 ChaCha)，就列上两者——同线格式、无明文选择符，服务端自动识别每个客户端用的算法。",
   "ciphers": ["aes-256-gcm", "chacha20-poly1305"],
 
@@ -35,24 +38,30 @@
   "_shaping": "出口 egress 方向的长度整形：\"pad\" 把小帧填充到固定档位以掩盖内层记录长度；\"none\" 关闭(默认)。两端各自独立选择。",
   "shaping": "none",
 
+  "_head_padding": "流首填充（默认 true）：随机化每条流前 8 个帧的长度，隐藏被承载连接自身的 TLS 握手特征（TLS-in-TLS）。两端各自独立，无需协商。",
+  "head_padding": true,
+
+  "_max_conns": "并发入站连接上限（含未认证连接），防止连接洪泛耗尽内存与文件描述符。0=默认4096；负数=不限。",
+  "max_conns": 4096,
+
   "_max_streams": "每条载波的并发流上限（内存安全）。0=用内置默认1024；负数=不限。",
   "max_streams": 1024,
 
   "window_seconds": 120,
 
-  "_steal": "REALITY 风格的主动探测抗性。启用后，服务器检查原始 ClientHello 中的 HMAC 标记：匹配则走 Prism，不匹配则将 TCP 透明转发到 dest。探测者看到的是真实目标站点的证书。与 acme/cert_file 互斥。",
+  "_steal": "REALITY 风格的主动探测抗性，例：{\"dest\": \"www.example.org:443\"}。标记绑定整个 ClientHello、带加密时间戳、只接受一次；其余连接整条转发到 dest。启动时会探测 dest 并对齐 ALPN 与证书长度，日志有 WARNING/NOTE 时请换目标站。与 acme、quic_listen 互斥。",
   "steal": null,
 
   "_ws_path": "WebSocket 传输路径。设置后，客户端可通过 wss://…/该路径 升级 WebSocket 在 WS 内跑 Prism，以穿透只代理 HTTP 的 CDN（如 Cloudflare）。留空则不开启。",
   "ws_path": "",
 
-  "_handshake": "内层握手协议：\"\"(默认)=自研 Noise-IK 风格，\"noise\"=经审计的 flynn/noise Noise_IKpsk2。建议高风险场景用 noise。需两端一致。",
+  "_handshake": "内层握手协议：\"\"(默认)=自研握手，\"noise\"=基于 flynn/noise 的 Noise_IKpsk1（无 PSK 的对端得不到任何应答）。新部署建议 noise。需两端一致。",
   "handshake": "",
 
-  "_admin": "管理 API（可选）：凭据 CRUD、密钥轮换、per-CID 配额与流量统计、订阅分发。listen 绑 127.0.0.1 确保不暴露。",
+  "_admin": "管理 API（可选），例：{\"listen\": \"127.0.0.1:9090\", \"token\": \"至少16字符\"}。凭据增删/轮换、按日配额、流量统计、Prometheus /metrics。token 少于 16 字符拒绝启动；务必绑 127.0.0.1。详见 docs/DEPLOY.md。",
   "admin": null,
 
-  "_quic_listen": "QUIC/H3 监听地址（可选）。启用后客户端可用 transport:quic 经 QUIC 连接，获得 HTTP/3 伪装 + 按流拥塞控制。留空不启用。",
+  "_quic_listen": "QUIC 监听地址（可选，UDP）。客户端用 transport:quic 连接，弱网下延迟更稳。注意：该入口没有回落站点，主动探测可识别，对抗性线路不建议作为唯一入口。留空不启用。",
   "quic_listen": "",
 
   "_cover": "未通过鉴权的访问者（含主动探测）看到的内容。三选一，优先级 Backend > StaticDir > 内置占位页。强烈建议反代到一个真实网站。cover 现已支持 HTTP/2（h2 ALPN）。",

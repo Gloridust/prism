@@ -179,3 +179,10 @@ func removeDefaultRoute(dev *tunDevice, serverHost, origGateway string) {
 	}
 	exec.Command("route", "-n", "delete", "-host", serverHost, origGateway).Run()
 }
+
+// addHostRoute sends traffic for one more server directly out the LAN gateway.
+func addHostRoute(host, gw string) error {
+	return runAll([][]string{{"route", "-n", "add", "-host", host, gw}})
+}
+
+func delHostRoute(host, gw string) { exec.Command("route", "-n", "delete", "-host", host, gw).Run() }

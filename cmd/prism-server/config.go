@@ -60,6 +60,11 @@ type Config struct {
 	// Shaping enables egress length-shaping ("pad" or "none", default none).
 	Shaping string `json:"shaping"`
 
+	// HeadPadding randomises the length of the first frames of every stream,
+	// hiding the size signature of the tunnelled connection's own TLS
+	// handshake (the TLS-in-TLS tell). Default true; set false to disable.
+	HeadPadding *bool `json:"head_padding"`
+
 	// MaxStreams caps concurrent streams per carrier (memory safety). 0 uses the
 	// built-in default (1024); a negative value means unlimited.
 	MaxStreams int `json:"max_streams"`

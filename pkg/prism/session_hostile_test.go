@@ -261,3 +261,82 @@ func TestMaxStreamsResetsExcess(t *testing.T) {
 		t.Fatalf("excess stream read err = %v, want ErrStreamReset", err)
 	}
 }
+
+// wireSizes records the length of every frame a session writes.
+type wireSizes struct {
+	net.Conn
+	sizes chan int
+}
+
+func (w *wireSizes) Write(p []byte) (int, error) {
+	select {
+	case w.sizes <- len(p):
+	default:
+	}
+	return w.Conn.Write(p)
+}
+
+// With head padding, the frames that carry a tunnelled TLS handshake no longer
+// reveal its record sizes; bulk frames after the head are untouched.
+func TestHeadPaddingHidesHandshakeSizes(t *testing.T) {
+	a, b := net.Pipe()
+	rec := &wireSizes{Conn: a, sizes: make(chan int, 256)}
+	k1, k2 := bytes.Repeat([]byte{1}, keySize), bytes.Repeat([]byte{2}, keySize)
+	cli, _ := NewSession(rec, &Keys{Send: k1, Recv: k2}, true, WithHeadPadding(4))
+	srv, _ := NewSession(b, &Keys{Send: k2, Recv: k1}, false)
+	defer cli.Close()
+	defer srv.Close()
+
+	got := make(chan []byte, 1)
+	go func() {
+		st, err := srv.Accept()
+		if err != nil {
+			return
+		}
+		data, _ := io.ReadAll(st)
+		got <- data
+	}()
+
+	const overhead = 2 + tagSize + hdrSize
+	clientHello := bytes.Repeat([]byte{0x16}, 517)
+	var want []byte
+	seen := map[int]bool{}
+	for round := 0; round < 12; round++ {
+		st, err := cli.OpenStream("tls.example.com:443")
+		if err != nil {
+			t.Fatal(err)
+		}
+		syn := <-rec.sizes
+		if (syn-overhead)%64 != 0 {
+			t.Fatalf("SYN frame is %d bytes on the wire; target length not hidden", syn)
+		}
+		st.Write(clientHello)
+		sz := <-rec.sizes
+		if sz-overhead < 900 || sz-overhead >= 1400 {
+			t.Fatalf("517-byte hello went out as %d bytes, want padded into [900,1400)", sz-overhead)
+		}
+		seen[sz] = true
+		if round == 0 {
+			for i := 0; i < 3; i++ { // rest of the head
+				st.Write([]byte("x"))
+				<-rec.sizes
+			}
+			st.Write(clientHello) // past the head: exact size again
+			if sz := <-rec.sizes; sz != overhead+517 {
+				t.Fatalf("post-head frame is %d bytes, want unpadded %d", sz, overhead+517)
+			}
+			want = append(append(append([]byte{}, clientHello...), "xxx"...), clientHello...)
+			st.CloseWrite()
+			<-rec.sizes
+			if data := <-got; !bytes.Equal(data, want) {
+				t.Fatal("padding corrupted the stream payload")
+			}
+		} else {
+			st.Close()
+			<-rec.sizes
+		}
+	}
+	if len(seen) < 6 {
+		t.Fatalf("padded hello took only %d distinct sizes in 12 streams", len(seen))
+	}
+}

@@ -4,7 +4,7 @@
 # `go mod vendor`) them once for offline/cross builds. All deps are pure Go, so
 # GOOS/GOARCH cross-compiles need no CGO. See README "依赖与取舍".
 
-VERSION ?= 0.1.0
+VERSION ?= 0.2.0
 LDFLAGS := -s -w -X main.version=$(VERSION)
 OUT := dist
 

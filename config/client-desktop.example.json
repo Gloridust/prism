@@ -8,6 +8,9 @@
   "psk": "本设备PSK(base64)",
   "allow_insecure": false,
 
+  "_backups": "备用出口（可选）。主出口不可达时自动切换，每 5 分钟尝试回切。各出口使用同一组 id/psk。",
+  "backups": [],
+
   "_cipher": "载波 AEAD，桌面有 AES-NI 用默认 aes-256-gcm 即可；留空=aes-256-gcm。所选算法必须在服务端 ciphers 列表里。",
   "cipher": "aes-256-gcm",
 
@@ -18,12 +21,15 @@
   "pool_size": 4,
   "shaping": "none",
 
-  "_steal": "REALITY 风格主动探测抗性。服务端也需开启 steal。",
+  "_steal": "REALITY 风格主动探测抗性。服务端也需开启 steal，且 sni 填服务端 steal.dest 的域名。不能与 ech、transport:quic 同用。",
   "steal": false,
 
   "_transport": "载波传输层：\"\"(默认)=裸 TLS，\"ws\"=WebSocket over TLS（穿 CDN 时用），\"quic\"=QUIC/H3（原生 HTTP/3 伪装）。ws_path 须与服务端 ws_path 一致。",
   "transport": "",
   "ws_path": "",
+
+  "_head_padding": "流首填充（默认 true）：随机化每条流前 8 个帧的长度，隐藏隧道内 HTTPS 自身的 TLS 握手特征。",
+  "head_padding": true,
 
   "_iat_max_ms": "帧间到达时间抖动(毫秒)，模糊时序指纹。0=关闭。建议 20-50。",
   "iat_max_ms": 0,
@@ -36,7 +42,7 @@
   "_ech_doh": "ECH 自动获取所用的 DoH 解析器。默认 https://1.1.1.1/dns-query。",
   "ech_doh": "",
 
-  "_handshake": "内层握手协议：\"\"=自研(默认)，\"noise\"=经审计的 flynn/noise Noise_IKpsk2。需两端一致。",
+  "_handshake": "内层握手协议：\"\"=自研(默认)，\"noise\"=基于 flynn/noise 的 Noise_IKpsk1。需两端一致。",
   "handshake": "",
 
   "_shaping_profiles": "整形画像：\"none\"(默认)、\"pad\"(长度档位)、\"web\"(网页浏览)、\"video\"(视频流)、\"download\"(大文件)。",
