@@ -18,31 +18,38 @@ const (
 
 func ksRuleset(p ksParams) string {
 	var b strings.Builder
-	// Loopback and tunnel traffic are matched both by interface and by
-	// address: pf does not always attribute a packet to the interface a rule
-	// names (loopback delivery of local addresses, scoped routes), and a
-	// packet missed here would hit the final block.
-	b.WriteString("pass out quick on lo0 all\n")
-	b.WriteString("pass out quick inet to 127.0.0.0/8\n")
-	b.WriteString("pass out quick inet6 to ::1\n")
-	fmt.Fprintf(&b, "pass out quick on %s all\n", p.tunName)
+	// Every pass rule is stateless and matches any TCP flags. pf's default
+	// (match the SYN, pass the rest by state) breaks here: on loopback both
+	// directions of a connection are "out" packets, so the returning SYN-ACK
+	// matches neither the state nor a SYN-only rule; and connections that
+	// were already open when the rules load have no state at all. Either
+	// would fall through to the final block and be reset.
+	pass := func(format string, args ...any) {
+		fmt.Fprintf(&b, "pass out quick "+format+" flags any no state\n", args...)
+	}
+	// Loopback and tunnel traffic are matched by interface and by address, so
+	// a packet pf attributes to another interface is still let through.
+	pass("on lo0 all")
+	pass("inet from any to 127.0.0.0/8")
+	pass("inet6 from any to ::1")
+	pass("on %s all", p.tunName)
 	if p.tun4.IsValid() {
-		fmt.Fprintf(&b, "pass out quick inet from %s to any\n", p.tun4)
-		fmt.Fprintf(&b, "pass out quick inet to %s\n", p.tun4)
+		pass("inet from %s to any", p.tun4)
+		pass("inet from any to %s", p.tun4)
 	}
 	if p.tun6.IsValid() {
-		fmt.Fprintf(&b, "pass out quick inet6 from %s to any\n", p.tun6)
-		fmt.Fprintf(&b, "pass out quick inet6 to %s\n", p.tun6)
+		pass("inet6 from %s to any", p.tun6)
+		pass("inet6 from any to %s", p.tun6)
 	}
 	if len(p.servers) > 0 {
-		fmt.Fprintf(&b, "pass out quick inet to { %s }\n", joinAddrs(p.servers, ", "))
+		pass("inet from any to { %s }", joinAddrs(p.servers, ", "))
 	}
 	if ksTestKeep443 {
-		b.WriteString("pass out quick proto tcp to any port 443\n")
+		pass("proto tcp from any to any port 443")
 	}
 	b.WriteString("block return out quick proto { tcp, udp } to any port 53\n")
-	fmt.Fprintf(&b, "pass out quick inet to { %s }\n", joinAddrs(ksLocal4, ", "))
-	fmt.Fprintf(&b, "pass out quick inet6 to { %s }\n", joinAddrs(ksLocal6, ", "))
+	pass("inet from any to { %s }", joinAddrs(ksLocal4, ", "))
+	pass("inet6 from any to { %s }", joinAddrs(ksLocal6, ", "))
 	b.WriteString("block return out quick all\n")
 	return b.String()
 }
