@@ -50,9 +50,30 @@ func clearSystemProxy() error {
 	return nil
 }
 
+// prevDNS remembers each service's DNS servers so disconnect restores what
+// was there (a manually configured resolver, not just DHCP).
+var prevDNS = map[string][]string{}
+
+func currentDNS(svc string) []string {
+	out, err := exec.Command("networksetup", "-getdnsservers", svc).Output()
+	if err != nil {
+		return nil
+	}
+	var servers []string
+	for _, f := range strings.Fields(string(out)) {
+		if net.ParseIP(f) != nil {
+			servers = append(servers, f)
+		}
+	}
+	return servers
+}
+
 func setSystemDNS(dnsAddr string) error {
 	host, _, _ := net.SplitHostPort(dnsAddr)
 	for _, svc := range networkServices() {
+		if cur := currentDNS(svc); len(cur) != 1 || cur[0] != host {
+			prevDNS[svc] = cur
+		}
 		run("networksetup", "-setdnsservers", svc, host)
 	}
 	log.Printf("system DNS set to %s", host)
@@ -61,9 +82,15 @@ func setSystemDNS(dnsAddr string) error {
 
 func clearSystemDNS() error {
 	for _, svc := range networkServices() {
-		run("networksetup", "-setdnsservers", svc, "empty")
+		args := []string{"-setdnsservers", svc}
+		if prev := prevDNS[svc]; len(prev) > 0 {
+			args = append(args, prev...)
+		} else {
+			args = append(args, "empty")
+		}
+		run("networksetup", args...)
 	}
-	log.Printf("system DNS restored to DHCP defaults")
+	log.Printf("system DNS restored")
 	return nil
 }
 

@@ -11,6 +11,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -20,16 +21,35 @@ import (
 	"syscall"
 )
 
+// version is set at build time with -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
 	log.SetPrefix("[prism-client] ")
 
 	cfgPath := flag.String("c", "client.json", "path to config JSON")
+	showVersion := flag.Bool("version", false, "print version and exit")
+	checkOnly := flag.Bool("check", false, "validate the config and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println("prism-client", version)
+		return
+	}
 
 	cfg, cred, err := loadClientConfig(*cfgPath)
 	if err != nil {
 		log.Fatalf("config: %v", err)
+	}
+	if *checkOnly {
+		fmt.Println("config OK")
+		return
+	}
+	for name, addr := range map[string]string{"socks_listen": cfg.SocksListen, "http_listen": cfg.HTTPListen} {
+		if (name == "socks_listen" || cfg.Mode == "desktop") && !isLoopbackListen(addr) {
+			log.Printf("WARNING: %s %s is not loopback: anyone who can reach it can use this tunnel "+
+				"(the inbound has no authentication). Firewall it to your LAN.", name, addr)
+		}
 	}
 	if cfg.TUN != nil && cfg.tunSetRoutes() {
 		// The carrier must use the one IPv4 address that gets a host route via the

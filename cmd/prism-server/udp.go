@@ -14,12 +14,15 @@ import (
 // traffic from any target, bounding how many idle UDP sockets the egress holds.
 const udpIdleTimeout = 60 * time.Second
 
+// maxUDPTargets bounds the per-association resolved-target cache.
+const maxUDPTargets = 256
+
 // handleUDP relays a UDP-association stream: each datagram read from the stream
 // is sent to its (policy-checked) target over a shared UDP socket, and every
 // reply is framed back onto the stream tagged with its source address. The same
 // egress address policy as TCP applies (no private/loopback/metadata unless
 // allow_private).
-func (s *server) handleUDP(st *prism.Stream) {
+func (s *server) handleUDP(st *prism.Stream, m *meter) {
 	uconn, err := net.ListenUDP("udp", nil)
 	if err != nil {
 		return
@@ -46,8 +49,14 @@ func (s *server) handleUDP(st *prism.Stream) {
 					continue // blocked or unresolvable target: drop this datagram
 				}
 				mu.Lock()
+				if len(resolved) >= maxUDPTargets {
+					clear(resolved) // bound memory; entries are only a cache
+				}
 				resolved[hostport] = ua
 				mu.Unlock()
+			}
+			if !m.add(int64(len(data)), 0) {
+				return
 			}
 			_ = uconn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			uconn.WriteToUDP(data, ua)
@@ -61,6 +70,9 @@ func (s *server) handleUDP(st *prism.Stream) {
 		n, from, err := uconn.ReadFromUDP(buf)
 		if err != nil {
 			return // timeout or closed -> end the association
+		}
+		if !m.add(0, int64(n)) {
+			return
 		}
 		if err := prism.WriteDatagram(st, from.String(), buf[:n]); err != nil {
 			return

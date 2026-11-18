@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/netip"
 	"time"
 )
 
@@ -24,11 +25,40 @@ func isDisallowedIP(ip net.IP) bool {
 	}
 	if ip4 := ip.To4(); ip4 != nil {
 		ip = ip4
+	} else if a, ok := netip.AddrFromSlice(ip); ok {
+		// IPv6 forms that embed an IPv4 destination (NAT64, 6to4) are judged
+		// by that IPv4 address, or they would tunnel around the policy.
+		b := a.As16()
+		switch {
+		case nat64Prefix.Contains(a):
+			return isDisallowedIP(net.IP(b[12:16]))
+		case sixToFourPrefix.Contains(a):
+			return isDisallowedIP(net.IP(b[2:6]))
+		}
+	}
+	if a, ok := netip.AddrFromSlice(ip); ok {
+		for _, p := range reservedPrefixes {
+			if p.Contains(a) {
+				return true
+			}
+		}
 	}
 	return ip.IsLoopback() || ip.IsPrivate() ||
 		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
 		ip.IsMulticast() || ip.IsUnspecified() || isCGNAT(ip)
 }
+
+var (
+	nat64Prefix     = netip.MustParsePrefix("64:ff9b::/96")
+	sixToFourPrefix = netip.MustParsePrefix("2002::/16")
+	// Special-purpose blocks the stdlib predicates above do not cover.
+	reservedPrefixes = []netip.Prefix{
+		netip.MustParsePrefix("0.0.0.0/8"),     // "this network"
+		netip.MustParsePrefix("192.0.0.0/24"),  // IETF protocol assignments
+		netip.MustParsePrefix("198.18.0.0/15"), // benchmarking
+		netip.MustParsePrefix("240.0.0.0/4"),   // reserved + limited broadcast
+	}
+)
 
 // isCGNAT reports whether ip is in 100.64.0.0/10 (RFC 6598 carrier-grade NAT),
 // which commonly fronts an operator's internal network.

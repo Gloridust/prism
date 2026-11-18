@@ -14,7 +14,7 @@ func TestParseSVCBForECH(t *testing.T) {
 	// Build SVCB RDATA: priority=1, target=".", SvcParam key=5 (ech).
 	var rdata []byte
 	rdata = binary.BigEndian.AppendUint16(rdata, 1) // priority
-	rdata = append(rdata, 0)                         // root label (target ".")
+	rdata = append(rdata, 0)                        // root label (target ".")
 	rdata = binary.BigEndian.AppendUint16(rdata, svcParamKeyECH)
 	rdata = binary.BigEndian.AppendUint16(rdata, uint16(len(echPayload)))
 	rdata = append(rdata, echPayload...)
@@ -37,7 +37,7 @@ func TestParseSVCBForECH_NoECH(t *testing.T) {
 	// SVCB with ALPN (key=1) but no ECH.
 	var rdata []byte
 	rdata = binary.BigEndian.AppendUint16(rdata, 1)
-	rdata = append(rdata, 0) // root target
+	rdata = append(rdata, 0)                        // root target
 	rdata = binary.BigEndian.AppendUint16(rdata, 1) // alpn key
 	alpn := []byte{2, 'h', '2'}
 	rdata = binary.BigEndian.AppendUint16(rdata, uint16(len(alpn)))

@@ -163,3 +163,112 @@ func TestNoiseDataPhaseIntegration(t *testing.T) {
 		t.Errorf("echo mismatch: got %q want %q", buf[:n], msg)
 	}
 }
+
+// A peer that knows the server public key and a valid CID but not the PSK must
+// get no Noise reply at all, so the server can fall back to cover.
+func TestNoiseServerSilentWithoutPSK(t *testing.T) {
+	kp, _ := GenerateServerKeypair()
+	good, _ := NewPSK()
+	bad, _ := NewPSK()
+	id := ClientID{9, 9, 9, 9}
+
+	cl, sv := net.Pipe()
+	defer cl.Close()
+	defer sv.Close()
+
+	type result struct {
+		consumed []byte
+		err      error
+	}
+	sCh := make(chan result, 1)
+	go func() {
+		_, _, consumed, err := NoiseServerHandshake(sv, kp.Private, []Credential{{ID: id, PSK: good}}, nil, time.Minute)
+		sCh <- result{consumed, err}
+	}()
+
+	cErr := make(chan error, 1)
+	go func() {
+		_, err := NoiseClientHandshake(cl, kp.Public, Credential{ID: id, PSK: bad}, NewAEAD)
+		cErr <- err
+	}()
+
+	sr := <-sCh
+	if sr.err != ErrNotPrism {
+		t.Fatalf("server err = %v, want ErrNotPrism", sr.err)
+	}
+	if len(sr.consumed) != 2+noiseMsg1Size {
+		t.Fatalf("consumed %d bytes, want the whole first message for cover replay", len(sr.consumed))
+	}
+	cl.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	if err := <-cErr; err == nil {
+		t.Fatal("client without the PSK completed the handshake")
+	}
+}
+
+func TestNoiseCipherNegotiation(t *testing.T) {
+	kp, _ := GenerateServerKeypair()
+	psk, _ := NewPSK()
+	cred := Credential{ID: ClientID{1, 2, 3, 4}, PSK: psk}
+
+	run := func(client AEADFactory, enabled ...AEADFactory) (*Keys, *Keys, error) {
+		cl, sv := net.Pipe()
+		defer cl.Close()
+		defer sv.Close()
+		type res struct {
+			k   *Keys
+			err error
+		}
+		ch := make(chan res, 1)
+		go func() {
+			k, _, _, err := NoiseServerHandshake(sv, kp.Private, []Credential{cred}, nil, time.Minute, enabled...)
+			ch <- res{k, err}
+		}()
+		cl.SetDeadline(time.Now().Add(2 * time.Second))
+		ck, cerr := NoiseClientHandshake(cl, kp.Public, cred, client)
+		sr := <-ch
+		if sr.err != nil {
+			return nil, nil, sr.err
+		}
+		return ck, sr.k, cerr
+	}
+
+	// AES listed first, client uses ChaCha: the server must follow the client.
+	ck, sk, err := run(NewChaCha20Poly1305AEAD, NewAEAD, NewChaCha20Poly1305AEAD)
+	if err != nil {
+		t.Fatalf("mixed fleet handshake: %v", err)
+	}
+	cid, _ := cipherIDOf(ck.aead)
+	sid, _ := cipherIDOf(sk.aead)
+	if cid != cipherIDChaCha || sid != cipherIDChaCha {
+		t.Fatalf("data-phase cipher: client=%d server=%d, want ChaCha on both", cid, sid)
+	}
+
+	// A cipher the server did not enable is refused.
+	if _, _, err := run(NewChaCha20Poly1305AEAD, NewAEAD); err != ErrNotPrism {
+		t.Fatalf("disabled cipher: err = %v, want ErrNotPrism", err)
+	}
+}
+
+func TestNoiseShortHTTPFallsBackImmediately(t *testing.T) {
+	kp, _ := GenerateServerKeypair()
+	psk, _ := NewPSK()
+	cl, sv := net.Pipe()
+	defer cl.Close()
+	defer sv.Close()
+
+	req := []byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+	go cl.Write(req)
+	done := make(chan []byte, 1)
+	go func() {
+		_, _, consumed, _ := NoiseServerHandshake(sv, kp.Private, []Credential{{PSK: psk}}, nil, time.Minute)
+		done <- consumed
+	}()
+	select {
+	case consumed := <-done:
+		if string(consumed) != string(req[:len(consumed)]) || len(consumed) == 0 {
+			t.Fatalf("consumed %q", consumed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server blocked on a short HTTP request instead of falling back")
+	}
+}

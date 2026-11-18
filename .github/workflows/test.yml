@@ -16,7 +16,7 @@ jobs:
         with:
           go-version: "1.27"
       - name: Unit tests with race detector
-        run: go test -race -count=1 -timeout 120s ./...
+        run: go test -race -count=1 -timeout 300s ./...
       - name: Real /dev/net/tun + real Prism e2e (mipsle via QEMU)
         run: |
           sudo apt-get install -y qemu-user
@@ -33,6 +33,11 @@ jobs:
           go test -c -o /tmp/prism-client-test ./cmd/prism-client/
           sudo unshare --net bash -c \
             'PRISM_ROOT_TEST=1 /tmp/prism-client-test -test.v -test.run "TestTUNCapturesIPv4AndIPv6" -test.timeout 90s'
+      - name: Fuzz protocol parsers and handshakes (short)
+        run: |
+          for f in FuzzDecodeAddr FuzzReadDatagram FuzzStealAndClientHello FuzzServerHandshakes FuzzDispatch; do
+            go test ./pkg/prism/ -run '^$' -fuzz "^${f}\$" -fuzztime 15s
+          done
       - name: ECH live tests
         run: PRISM_LIVE_TEST=1 go test -v -run "TestECHHandshakeLive|TestECHWithPrismSession" -count=1 -timeout 60s ./test/ ./pkg/prism/
       - name: Cross-compile router (mipsle)
@@ -46,7 +51,7 @@ jobs:
         with:
           go-version: "1.27"
       - name: Unit tests
-        run: go test -race -count=1 -timeout 120s ./...
+        run: go test -race -count=1 -timeout 300s ./...
       - name: Real macOS utun device test
         run: sudo PRISM_ROOT_TEST=1 go test -v -run "TestDarwinUTunDevice" -count=1 -timeout 60s ./test/
       - name: Real macOS utun + real Prism e2e
@@ -70,7 +75,7 @@ jobs:
           Expand-Archive wintun.zip -DestinationPath wintun
           Copy-Item wintun\wintun\bin\amd64\wintun.dll .
       - name: Unit tests
-        run: go test -race -count=1 -timeout 120s ./...
+        run: go test -race -count=1 -timeout 300s ./...
       - name: Wintun adapter test (real Windows)
         shell: cmd
         run: |

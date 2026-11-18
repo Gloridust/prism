@@ -10,8 +10,8 @@ import (
 // occasionally injects cover frames of characteristic sizes.
 type Profile struct {
 	Name    string
-	Buckets []int    // length-shaping buckets (ascending); nil = no length shaping
-	Cover   []Cover  // cover traffic injections between real frames
+	Buckets []int   // length-shaping buckets (ascending); nil = no length shaping
+	Cover   []Cover // cover traffic injections between real frames
 }
 
 // Cover describes a probabilistic cover-traffic injection: with probability P

@@ -117,7 +117,13 @@ func handleConnect(c net.Conn, d *Dialer, target string) {
 // The TCP control connection stays open for the association's lifetime; when it
 // closes, the association is torn down.
 func handleUDPAssociate(c net.Conn, d *Dialer) {
-	uconn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	// Bind the relay on the address the client reached us on, so the BND.ADDR
+	// we return is one it can actually send to (not always loopback).
+	bindIP := net.IPv4(127, 0, 0, 1)
+	if ta, ok := c.LocalAddr().(*net.TCPAddr); ok && ta.IP != nil {
+		bindIP = ta.IP
+	}
+	uconn, err := net.ListenUDP("udp", &net.UDPAddr{IP: bindIP})
 	if err != nil {
 		c.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
@@ -125,8 +131,13 @@ func handleUDPAssociate(c net.Conn, d *Dialer) {
 	defer uconn.Close()
 
 	bnd := uconn.LocalAddr().(*net.UDPAddr)
-	reply := []byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0}
-	binary.BigEndian.PutUint16(reply[8:], uint16(bnd.Port))
+	reply := []byte{0x05, 0x00, 0x00}
+	if v4 := bnd.IP.To4(); v4 != nil {
+		reply = append(append(reply, 0x01), v4...)
+	} else {
+		reply = append(append(reply, 0x04), bnd.IP.To16()...)
+	}
+	reply = binary.BigEndian.AppendUint16(reply, uint16(bnd.Port))
 	if _, err := c.Write(reply); err != nil {
 		return
 	}
@@ -149,6 +160,10 @@ func handleUDPAssociate(c net.Conn, d *Dialer) {
 			n, src, err := uconn.ReadFromUDP(buf)
 			if err != nil {
 				return
+			}
+			// Only the host that owns the control connection may use the relay.
+			if ta, ok := c.RemoteAddr().(*net.TCPAddr); ok && !ta.IP.Equal(src.IP) {
+				continue
 			}
 			mu.Lock()
 			clientAddr = src

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"testing"
+	"time"
 )
 
 func TestStealKeyDeterministic(t *testing.T) {
@@ -19,62 +20,103 @@ func TestStealKeyDeterministic(t *testing.T) {
 	}
 }
 
+// fakeHello builds a ClientHello handshake message with a random 32-byte
+// session_id followed by extra bytes standing in for suites and extensions.
+func fakeHello(extra int) []byte {
+	body := make([]byte, 2+32+1+32+extra)
+	rand.Read(body)
+	body[0], body[1] = 3, 3
+	body[34] = 32
+	h := append([]byte{0x01, byte(len(body) >> 16), byte(len(body) >> 8), byte(len(body))}, body...)
+	return h
+}
+
 func TestStealMarkerRoundTrip(t *testing.T) {
 	psk, _ := NewPSK()
-	sk := StealKey(psk)
+	other, _ := NewPSK()
+	now := time.Unix(1_800_000_000, 0)
+	creds := []Credential{{ID: ClientID{9}, PSK: other}, {ID: ClientID{1, 2, 3, 4}, PSK: psk}}
 
-	// Build a 32-byte session_id with random seed
-	sid := make([]byte, 32)
-	rand.Read(sid)
-
-	EmbedStealMarker(sid, sk)
-
-	// Verify should match
-	cred := Credential{ID: ClientID{1, 2, 3, 4}, PSK: psk}
-	got := VerifyStealMarker(sid, []Credential{cred})
-	if got == nil {
-		t.Fatal("VerifyStealMarker should match the correct credential")
+	hello := fakeHello(300)
+	before := append([]byte(nil), hello...)
+	if err := EmbedStealMarker(hello, StealKey(psk), now); err != nil {
+		t.Fatal(err)
 	}
-	if got.ID != cred.ID {
-		t.Fatalf("matched credential ID = %v, want %v", got.ID, cred.ID)
+	if !bytes.Equal(hello[:helloSIDOff+20], before[:helloSIDOff+20]) || !bytes.Equal(hello[helloSIDOff+32:], before[helloSIDOff+32:]) {
+		t.Fatal("embedding touched bytes outside sid[20:32]")
 	}
-}
-
-func TestStealMarkerRejectsWrongPSK(t *testing.T) {
-	psk1, _ := NewPSK()
-	psk2, _ := NewPSK()
-
-	sid := make([]byte, 32)
-	rand.Read(sid)
-	EmbedStealMarker(sid, StealKey(psk1))
-
-	cred2 := Credential{ID: ClientID{5, 6, 7, 8}, PSK: psk2}
-	if VerifyStealMarker(sid, []Credential{cred2}) != nil {
-		t.Fatal("wrong PSK must not match")
+	got := VerifyStealMarker(hello, creds, 2*time.Minute, now.Add(30*time.Second))
+	if got == nil || got.ID != creds[1].ID {
+		t.Fatalf("matched %v, want credential 1", got)
 	}
 }
 
-func TestStealMarkerRejectsTamper(t *testing.T) {
+func TestStealMarkerRejects(t *testing.T) {
 	psk, _ := NewPSK()
-	sk := StealKey(psk)
+	wrong, _ := NewPSK()
+	now := time.Unix(1_800_000_000, 0)
+	creds := []Credential{{ID: ClientID{1}, PSK: psk}}
+	window := 2 * time.Minute
 
-	sid := make([]byte, 32)
-	rand.Read(sid)
-	EmbedStealMarker(sid, sk)
+	mk := func() []byte {
+		h := fakeHello(300)
+		EmbedStealMarker(h, StealKey(psk), now)
+		return h
+	}
 
-	sid[25] ^= 0xff // tamper the tag
+	if VerifyStealMarker(mk(), []Credential{{PSK: wrong}}, window, now) != nil {
+		t.Error("wrong PSK matched")
+	}
+	if VerifyStealMarker(mk(), creds, window, now.Add(window+time.Second)) != nil {
+		t.Error("expired marker matched")
+	}
+	if VerifyStealMarker(mk(), creds, window, now.Add(-window-time.Second)) != nil {
+		t.Error("marker from the future matched")
+	}
 
-	cred := Credential{ID: ClientID{1, 2, 3, 4}, PSK: psk}
-	if VerifyStealMarker(sid, []Credential{cred}) != nil {
-		t.Fatal("tampered tag must not match")
+	// The tag binds every byte of the hello: random, timestamp, and what
+	// follows the session_id (cipher suites, key share, versions).
+	for _, off := range []int{6, helloSIDOff, helloSIDOff + 21, helloSIDOff + 25, helloSIDOff + 40, len(mk()) - 1} {
+		h := mk()
+		h[off] ^= 0x01
+		if VerifyStealMarker(h, creds, window, now) != nil {
+			t.Errorf("hello tampered at offset %d still matched", off)
+		}
+	}
+
+	// A marker cannot be transplanted into a different hello.
+	a, b := mk(), fakeHello(300)
+	copy(b[helloSIDOff:helloSIDOff+32], a[helloSIDOff:helloSIDOff+32])
+	if VerifyStealMarker(b, creds, window, now) != nil {
+		t.Error("session_id lifted into another hello matched")
+	}
+
+	// Truncated / fragmented / non-hello inputs.
+	h := mk()
+	for _, bad := range [][]byte{nil, h[:20], h[:len(h)-1], append([]byte{0x02}, h[1:]...)} {
+		if VerifyStealMarker(bad, creds, window, now) != nil {
+			t.Error("malformed hello matched")
+		}
+	}
+	short := fakeHello(10)
+	short[helloSIDLenOff] = 16
+	if EmbedStealMarker(short, StealKey(psk), now) == nil {
+		t.Error("embedding into a 16-byte session_id should fail")
 	}
 }
 
-func TestStealMarkerShortSessionID(t *testing.T) {
+// The masked timestamp must not be recoverable or constant on the wire.
+func TestStealTimestampIsMasked(t *testing.T) {
 	psk, _ := NewPSK()
-	cred := Credential{ID: ClientID{1, 2, 3, 4}, PSK: psk}
-	if VerifyStealMarker(make([]byte, 16), []Credential{cred}) != nil {
-		t.Fatal("short session_id must not match")
+	now := time.Unix(1_800_000_000, 0)
+	seen := map[string]bool{}
+	for i := 0; i < 32; i++ {
+		h := fakeHello(64)
+		EmbedStealMarker(h, StealKey(psk), now)
+		seen[string(h[helloSIDOff+20:helloSIDOff+24])] = true
+	}
+	if len(seen) < 30 {
+		t.Fatalf("timestamp field repeated across hellos (%d distinct of 32)", len(seen))
 	}
 }
 

@@ -2,12 +2,13 @@ package main
 
 import (
 	"crypto/tls"
-	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sync"
 	"time"
 
 	"golang.org/x/net/http2"
@@ -37,6 +38,7 @@ func (c *prefixConn) Read(p []byte) (int, error) {
 type oneShotListener struct {
 	conn net.Conn
 	done chan struct{}
+	once sync.Once
 	ch   chan net.Conn
 }
 
@@ -54,8 +56,27 @@ func (l *oneShotListener) Accept() (net.Conn, error) {
 		return nil, net.ErrClosed
 	}
 }
-func (l *oneShotListener) Close() error   { close(l.done); return nil }
+func (l *oneShotListener) Close() error   { l.once.Do(func() { close(l.done) }); return nil }
 func (l *oneShotListener) Addr() net.Addr { return l.conn.LocalAddr() }
+
+// serveHTTP1 serves one connection with h and returns once that connection is
+// closed or hijacked, so the caller's goroutine never outlives the visitor.
+func serveHTTP1(conn net.Conn, h http.Handler) {
+	l := newOneShotListener(conn)
+	srv := &http.Server{
+		Handler:      h,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 60 * time.Second,
+		IdleTimeout:  2 * time.Minute,
+		ErrorLog:     log.New(io.Discard, "", 0),
+		ConnState: func(_ net.Conn, st http.ConnState) {
+			if st == http.StateClosed || st == http.StateHijacked {
+				l.Close()
+			}
+		},
+	}
+	srv.Serve(l)
+}
 
 // coverHandler builds the handler an unauthenticated visitor hits.
 func coverHandler(c *Config) http.Handler {
@@ -84,86 +105,48 @@ func coverHandler(c *Config) http.Handler {
 func serveCover(conn net.Conn, consumed []byte, h http.Handler) {
 	pc := &prefixConn{Conn: conn, pre: consumed}
 	if tc, ok := conn.(*tls.Conn); ok && tc.ConnectionState().NegotiatedProtocol == "h2" {
-		h2s := &http2.Server{}
+		h2s := &http2.Server{IdleTimeout: 2 * time.Minute}
 		h2s.ServeConn(pc, &http2.ServeConnOpts{Handler: h})
 		return
 	}
-	srv := &http.Server{
-		Handler:      h,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 60 * time.Second,
-	}
-	l := newOneShotListener(pc)
-	srv.Serve(l)
+	serveHTTP1(pc, h)
 }
 
-// serveCoverOrWS is like serveCover but intercepts WebSocket upgrades to
-// wsPath and runs a Prism session on the WebSocket stream. HTTP/2 connections
-// are served via http2.Server.ServeConn (WS upgrades only come over HTTP/1.1).
+// serveCoverOrWS is like serveCover but intercepts a WebSocket upgrade to
+// wsPath and runs a Prism session on it; it returns when that session ends.
+// HTTP/2 connections cannot carry the HTTP/1.1 upgrade, so they get cover.
 func (s *server) serveCoverOrWS(conn net.Conn, consumed []byte) {
-	pc := &prefixConn{Conn: conn, pre: consumed}
-
-	// HTTP/2 connections cannot carry WebSocket upgrades (the WS handshake is
-	// HTTP/1.1-only), so serve cover directly.
 	if tc, ok := conn.(*tls.Conn); ok && tc.ConnectionState().NegotiatedProtocol == "h2" {
-		h2s := &http2.Server{}
-		h2s.ServeConn(pc, &http2.ServeConnOpts{Handler: s.cover})
+		serveCover(conn, consumed, s.cover)
 		return
 	}
-
-	l := newOneShotListener(pc)
+	var wsDone chan struct{}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		done := make(chan struct{})
+		wsDone = done // set before the hijack, which is what releases serveHTTP1
 		ws := prism.WSServerUpgrade(w, r, s.wsPath)
 		if ws == nil {
+			wsDone = nil
 			s.cover.ServeHTTP(w, r)
 			return
 		}
-		l.Close()
+		defer close(done)
 		defer ws.Close()
 		s.handleWSSession(ws)
 	})
-
-	srv := &http.Server{
-		Handler:      handler,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 60 * time.Second,
+	serveHTTP1(&prefixConn{Conn: conn, pre: consumed}, handler)
+	if wsDone != nil {
+		<-wsDone
 	}
-	srv.Serve(l)
 }
 
-// handleWSSession runs the full Prism handshake and session on a WebSocket.
+// handleWSSession runs the Prism handshake and session on a WebSocket.
 func (s *server) handleWSSession(ws *prism.WSConn) {
-	_ = ws.SetReadDeadline(time.Now().Add(handshakeTimeout))
-	s.credsMu.RLock()
-	creds := s.creds
-	s.credsMu.RUnlock()
-	keys, cred, _, err := prism.ServerHandshake(ws, s.priv, creds, s.replay, s.window, s.aeads...)
+	_ = ws.SetDeadline(time.Now().Add(handshakeTimeout))
+	keys, cred, _, err := s.handshake(ws)
 	if err != nil {
 		return
 	}
-	_ = ws.SetReadDeadline(time.Time{})
-
-	name := "?"
-	if cred != nil {
-		name = fmt.Sprintf("%x", cred.ID)
-	}
-	sess, err := prism.NewSession(ws, keys, false, prism.WithShaping(s.shaping), prism.WithMaxStreams(s.maxStreams))
-	if err != nil {
-		return
-	}
-	defer sess.Close()
-	if cred != nil {
-		rec := &sessConn{sess: sess, id: cred.ID}
-		s.register(rec)
-		defer s.unregister(rec)
-	}
-	log.Printf("client %s connected via WebSocket from %s", name, ws.RemoteAddr())
-
-	for {
-		st, err := sess.Accept()
-		if err != nil {
-			return
-		}
-		go s.handleStream(st)
-	}
+	_ = ws.SetDeadline(time.Time{})
+	s.runSession(ws, keys, cred, "ws", ws.RemoteAddr())
 }

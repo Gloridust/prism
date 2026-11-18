@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	mrand "math/rand"
 	"net"
 	"sync"
 	"time"
@@ -28,17 +29,17 @@ import (
 // PoolSize carriers in parallel instead of queuing behind one slow dial, while
 // two requests racing on the same dead slot still dial only once.
 type Dialer struct {
-	server    string
-	sni       string
-	tlsCfg    *utls.Config
-	serverPub *ecdh.PublicKey
-	cred      prism.Credential
-	aead      prism.AEADFactory
-	shaping     string
-	stealKey    []byte // non-nil in steal mode
-	wsPath      string // non-empty = WebSocket transport
-	maxLifetime time.Duration
-	iatMaxMs    int
+	server        string
+	sni           string
+	tlsCfg        *utls.Config
+	serverPub     *ecdh.PublicKey
+	cred          prism.Credential
+	aead          prism.AEADFactory
+	shaping       string
+	stealKey      []byte // non-nil in steal mode
+	wsPath        string // non-empty = WebSocket transport
+	maxLifetime   time.Duration
+	iatMaxMs      int
 	useNoise      bool   // use audited Noise_IKpsk2 handshake
 	useQUIC       bool   // use QUIC/H3 transport
 	echConfigList []byte // ECH config for QUIC transport
@@ -53,6 +54,27 @@ type Dialer struct {
 type carrier struct {
 	mu   sync.Mutex // serialises (re)dial of this slot
 	sess *prism.Session
+
+	// Dial backoff: after a failed dial the slot fails fast until retryAt, so
+	// an unreachable server costs each new connection microseconds instead of
+	// a fresh 10s timeout per slot.
+	fails   int
+	retryAt time.Time
+	lastErr error
+}
+
+const (
+	dialBackoffMin = 500 * time.Millisecond
+	dialBackoffMax = 30 * time.Second
+)
+
+func dialBackoff(fails int) time.Duration {
+	d := dialBackoffMin << min(fails-1, 10)
+	if d > dialBackoffMax {
+		d = dialBackoffMax
+	}
+	// Jitter so a fleet does not redial in lockstep after an outage.
+	return d/2 + time.Duration(mrand.Int63n(int64(d/2)+1))
 }
 
 // NewDialer prepares the pool (connections are established lazily on first use).
@@ -113,20 +135,20 @@ func NewDialer(c *ClientConfig, cred *prism.Credential) (*Dialer, error) {
 	}
 
 	return &Dialer{
-		server:    c.Server,
-		sni:       c.SNI,
-		serverPub: pub,
-		cred:      *cred,
-		aead:      aead,
-		shaping:   c.Shaping,
-		stealKey:    stealKey,
-		wsPath:      wsPath,
-		maxLifetime: maxLife,
-		iatMaxMs:    c.IATMaxMs,
-		useNoise:    c.Handshake == "noise",
-		useQUIC:     c.Transport == "quic",
+		server:        c.Server,
+		sni:           c.SNI,
+		serverPub:     pub,
+		cred:          *cred,
+		aead:          aead,
+		shaping:       c.Shaping,
+		stealKey:      stealKey,
+		wsPath:        wsPath,
+		maxLifetime:   maxLife,
+		iatMaxMs:      c.IATMaxMs,
+		useNoise:      c.Handshake == "noise",
+		useQUIC:       c.Transport == "quic",
 		echConfigList: echConfigList,
-		pool:        pool,
+		pool:          pool,
 		// uTLS Config carries only the fields we steer (SNI/ALPN/verify); the
 		// ClientHello itself is dictated by the mimicked browser profile below,
 		// which is the whole point — Go's native crypto/tls ClientHello is
@@ -171,6 +193,15 @@ func (d *Dialer) dialSession() (*prism.Session, error) {
 	// against an HTTP/1.1-only site. The prism inner handshake then runs
 	// unchanged on top of the established TLS stream.
 	tlsConn := utls.UClient(raw, d.tlsCfg, utls.HelloChrome_Auto)
+	if d.wsPath != "" {
+		// A WebSocket handshake is HTTP/1.1-only, and Chrome opens wss://
+		// connections offering just http/1.1 — so do we, or the server would
+		// pick h2 and the upgrade could never happen.
+		if err := forceHTTP1ALPN(tlsConn); err != nil {
+			raw.Close()
+			return nil, err
+		}
+	}
 	if d.stealKey != nil {
 		// Steal mode: embed an HMAC tag in the TLS session_id so the server
 		// can distinguish us from probers before completing TLS. Build the
@@ -179,10 +210,14 @@ func (d *Dialer) dialSession() (*prism.Session, error) {
 			raw.Close()
 			return nil, err
 		}
-		sid := tlsConn.HandshakeState.Hello.SessionId
-		if len(sid) >= 32 {
-			prism.EmbedStealMarker(sid, d.stealKey)
+		// The marker is an HMAC over the whole marshaled hello, written into
+		// its session_id; mirror it into the struct field so both agree.
+		hello := tlsConn.HandshakeState.Hello
+		if err := prism.EmbedStealMarker(hello.Raw, d.stealKey, time.Now()); err != nil {
+			raw.Close()
+			return nil, err
 		}
+		copy(hello.SessionId, prism.HelloSessionID(hello.Raw))
 	}
 	tlsConn.SetDeadline(time.Now().Add(10 * time.Second))
 	if err := tlsConn.Handshake(); err != nil {
@@ -222,18 +257,34 @@ func (d *Dialer) dialSession() (*prism.Session, error) {
 	return prism.NewSession(transport, keys, true, opts...)
 }
 
+// forceHTTP1ALPN rewrites the mimicked ClientHello's ALPN list to http/1.1.
+func forceHTTP1ALPN(c *utls.UConn) error {
+	if err := c.BuildHandshakeState(); err != nil {
+		return err
+	}
+	for _, ext := range c.Extensions {
+		if alpn, ok := ext.(*utls.ALPNExtension); ok {
+			alpn.AlpnProtocols = []string{"http/1.1"}
+		}
+	}
+	return c.MarshalClientHello()
+}
+
 func (d *Dialer) dialQUICSession() (*prism.Session, error) {
 	tlsCfg := &tls.Config{
 		ServerName:                     d.sni,
-		InsecureSkipVerify:             d.stealKey != nil,
+		InsecureSkipVerify:             d.tlsCfg.InsecureSkipVerify, // #nosec G402 - gated by config
 		MinVersion:                     tls.VersionTLS13,
-		NextProtos:                     []string{"h3", "prism-quic"},
+		NextProtos:                     []string{"h3"},
 		EncryptedClientHelloConfigList: d.echConfigList,
 	}
 	qc, err := prism.QUICClientDial(d.server, tlsCfg, 10*time.Second)
 	if err != nil {
 		return nil, err
 	}
+	// Without a deadline a server that never answers the inner handshake would
+	// park this dial forever while holding the carrier slot.
+	qc.SetDeadline(time.Now().Add(10 * time.Second))
 	var keys *prism.Keys
 	if d.useNoise {
 		keys, err = prism.NoiseClientHandshake(qc, d.serverPub, d.cred, d.aead)
@@ -244,6 +295,7 @@ func (d *Dialer) dialQUICSession() (*prism.Session, error) {
 		qc.Close()
 		return nil, err
 	}
+	qc.SetDeadline(time.Time{})
 	opts := []prism.Option{prism.WithShaping(d.shaping)}
 	if d.maxLifetime > 0 {
 		opts = append(opts, prism.WithMaxLifetime(d.maxLifetime))
@@ -272,10 +324,23 @@ func (d *Dialer) ensure(c *carrier) (*prism.Session, error) {
 	if !sessionDead(c.sess) {
 		return c.sess, nil
 	}
+	if c.fails > 0 && time.Now().Before(c.retryAt) {
+		return nil, c.lastErr
+	}
 	ns, err := d.dialSession()
 	if err != nil {
+		c.fails++
+		c.lastErr = err
+		c.retryAt = time.Now().Add(dialBackoff(c.fails))
+		if c.fails == 1 {
+			log.Printf("carrier dial failed: %v", err)
+		}
 		return nil, err
 	}
+	if c.fails > 0 {
+		log.Printf("carrier re-established after %d failed attempt(s)", c.fails)
+	}
+	c.fails, c.lastErr = 0, nil
 	c.sess = ns
 	return ns, nil
 }

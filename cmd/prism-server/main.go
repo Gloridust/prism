@@ -27,6 +27,9 @@ import (
 
 const handshakeTimeout = 10 * time.Second
 
+// version is set at build time with -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
 	log.SetPrefix("[prism-server] ")
@@ -43,7 +46,13 @@ func main() {
 	}
 
 	cfgPath := flag.String("c", "server.json", "path to config JSON")
+	showVersion := flag.Bool("version", false, "print version and exit")
+	checkOnly := flag.Bool("check", false, "validate the config and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println("prism-server", version)
+		return
+	}
 
 	cfg, priv, creds, err := loadConfig(*cfgPath)
 	if err != nil {
@@ -56,12 +65,12 @@ func main() {
 		// In steal mode the server presents an ephemeral self-signed cert only
 		// to authenticated clients (they skip verification; real auth is the
 		// inner Prism handshake). Probers never see it — their connection is
-		// relayed to the real target site.
+		// relayed to the real target site. TLS 1.3 only, so that certificate is
+		// always encrypted under the client's key share.
 		sni := cfg.Steal.Dest
 		if len(cfg.Steal.ServerNames) > 0 {
 			sni = cfg.Steal.ServerNames[0]
 		}
-		// Strip port from SNI if present.
 		if h, _, err := net.SplitHostPort(sni); err == nil {
 			sni = h
 		}
@@ -71,11 +80,10 @@ func main() {
 		}
 		tlsCfg = &tls.Config{
 			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
+			MinVersion:   tls.VersionTLS13,
 			NextProtos:   []string{"h2", "http/1.1"},
 		}
 	} else {
-		var err error
 		tlsCfg, err = buildTLSConfig(cfg)
 		if err != nil {
 			log.Fatalf("tls: %v", err)
@@ -86,6 +94,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("ciphers: %v", err)
 	}
+	if *checkOnly {
+		fmt.Printf("config OK: %d credential(s)\n", len(creds))
+		return
+	}
 
 	maxStreams := cfg.MaxStreams
 	if maxStreams == 0 {
@@ -93,12 +105,19 @@ func main() {
 	} else if maxStreams < 0 {
 		maxStreams = 0 // explicit unlimited
 	}
+	maxConns := cfg.MaxConns
+	if maxConns == 0 {
+		maxConns = 4096
+	}
 
 	s := &server{
 		tls:          tlsCfg,
 		priv:         priv,
 		creds:        creds,
+		credCfgs:     cfg.creds,
+		credsFile:    cfg.CredentialsFile,
 		replay:       prism.NewReplayWindow(cfg.window()),
+		stealReplay:  prism.NewReplayWindow(2 * cfg.window()),
 		window:       cfg.window(),
 		cover:        coverHandler(cfg),
 		aeads:        aeads,
@@ -108,35 +127,34 @@ func main() {
 		cfgPath:      *cfgPath,
 		wsPath:       cfg.WSPath,
 		useNoise:     cfg.Handshake == "noise",
+		acct:         newAccounting(),
 		active:       make(map[*sessConn]struct{}),
 	}
+	s.acct.syncQuotas(cfg.creds)
 	if stealMode {
 		s.stealDest = cfg.Steal.Dest
 	}
 
 	if cfg.Admin != nil && cfg.Admin.Listen != "" {
 		admin := newAdminAPI(s, cfg.Admin.Token)
-		s.admin = admin
 		go func() {
 			if err := admin.listenAndServe(cfg.Admin.Listen); err != nil {
-				log.Printf("admin API: %v", err)
+				log.Fatalf("admin API: %v", err)
 			}
 		}()
 	}
 
-	// SIGHUP hot-reloads credentials and kicks any session whose credential was
-	// removed — revoke a leaked client without dropping everyone else.
-	sigc := make(chan os.Signal, 1)
-	signal.Notify(sigc, syscall.SIGHUP)
-	go func() {
-		for range sigc {
-			s.reload()
-		}
-	}()
-
-	// Start optional QUIC/H3 listener.
+	// Bind everything before serving so a bad address fails the start.
+	ln, err := net.Listen("tcp", cfg.Listen)
+	if err != nil {
+		log.Fatalf("listen %s: %v", cfg.Listen, err)
+	}
+	var ql *prism.QUICListener
 	if cfg.QUICListen != "" {
-		ql, err := prism.NewQUICListener(cfg.QUICListen, tlsCfg)
+		if stealMode {
+			log.Fatalf("quic_listen cannot be combined with steal (QUIC has no relay-to-real-site fallback)")
+		}
+		ql, err = prism.NewQUICListener(cfg.QUICListen, tlsCfg)
 		if err != nil {
 			log.Fatalf("quic listen %s: %v", cfg.QUICListen, err)
 		}
@@ -144,10 +162,25 @@ func main() {
 		log.Printf("QUIC listening on %s", cfg.QUICListen)
 	}
 
-	ln, err := net.Listen("tcp", cfg.Listen)
-	if err != nil {
-		log.Fatalf("listen %s: %v", cfg.Listen, err)
-	}
+	// SIGHUP hot-reloads credentials; SIGINT/SIGTERM shut down cleanly.
+	sigc := make(chan os.Signal, 2)
+	signal.Notify(sigc, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		for sig := range sigc {
+			if sig == syscall.SIGHUP {
+				s.reload()
+				continue
+			}
+			log.Printf("%v: shutting down", sig)
+			ln.Close()
+			if ql != nil {
+				ql.Close()
+			}
+			s.closeAll()
+			os.Exit(0)
+		}
+	}()
+
 	ciphers := cfg.Ciphers
 	if len(ciphers) == 0 {
 		ciphers = []string{prism.CipherAES256GCM}
@@ -157,22 +190,61 @@ func main() {
 		handler = s.handleSteal
 		log.Printf("STEAL mode: authenticated → Prism, others → %s", s.stealDest)
 	}
-	log.Printf("listening on %s with %d credential(s), ciphers %v", cfg.Listen, len(creds), ciphers)
+	hs := "legacy"
+	if s.useNoise {
+		hs = "noise"
+	}
+	log.Printf("prism-server %s listening on %s: %d credential(s), ciphers %v, handshake %s",
+		version, cfg.Listen, len(creds), ciphers, hs)
+	serveTCP(ln, handler, maxConns)
+}
+
+// serveTCP accepts connections until the listener closes, backing off on
+// transient errors (e.g. EMFILE) and shedding load past maxConns.
+func serveTCP(ln net.Listener, handler func(net.Conn), maxConns int) {
+	var sem chan struct{}
+	if maxConns > 0 {
+		sem = make(chan struct{}, maxConns)
+	}
+	var delay time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Printf("accept: %v", err)
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			if delay == 0 {
+				delay = 5 * time.Millisecond
+			} else if delay *= 2; delay > time.Second {
+				delay = time.Second
+			}
+			log.Printf("accept: %v (retrying in %v)", err, delay)
+			time.Sleep(delay)
 			continue
 		}
-		go handler(conn)
+		delay = 0
+		if sem != nil {
+			select {
+			case sem <- struct{}{}:
+			default:
+				conn.Close()
+				continue
+			}
+		}
+		go func() {
+			if sem != nil {
+				defer func() { <-sem }()
+			}
+			handler(conn)
+		}()
 	}
 }
 
 type server struct {
 	tls          *tls.Config
 	priv         *ecdh.PrivateKey
-	creds        []prism.Credential
 	replay       *prism.ReplayWindow
+	stealReplay  *prism.ReplayWindow // single-use steal markers
 	window       time.Duration
 	cover        http.Handler
 	aeads        []prism.AEADFactory // carrier ciphers to trial, in order
@@ -182,16 +254,20 @@ type server struct {
 	cfgPath      string              // for SIGHUP reload
 	stealDest    string              // steal mode: relay destination (e.g. "www.microsoft.com:443")
 	wsPath       string              // WebSocket upgrade path (e.g. "/_prism/ws"); empty = disabled
-	useNoise     bool                // use audited Noise_IKpsk2 handshake
-	admin        *adminAPI           // optional management API
+	useNoise     bool                // use the Noise handshake
+	acct         *accounting         // per-credential traffic + quotas
 
-	credsMu sync.RWMutex // guards creds (reloadable)
-	actMu   sync.Mutex   // guards active
-	active  map[*sessConn]struct{}
+	credsMu   sync.RWMutex // guards creds, credCfgs
+	creds     []prism.Credential
+	credCfgs  []CredConfig
+	credsFile string // writable credential store ("" = inline config only)
+
+	actMu  sync.Mutex // guards active
+	active map[*sessConn]struct{}
 }
 
 // sessConn tracks a live authenticated session and the credential it used, so a
-// credential reload can close (kick) sessions whose credential was revoked.
+// credential change can close (kick) sessions whose credential was revoked.
 type sessConn struct {
 	sess *prism.Session
 	id   prism.ClientID
@@ -209,27 +285,18 @@ func (s *server) unregister(r *sessConn) {
 	s.actMu.Unlock()
 }
 
-// reload re-reads the config file and swaps in its credentials, then closes any
-// live session whose credential is no longer present. Only credentials reload;
-// TLS cert, listener, ciphers and policy flags still need a restart.
-func (s *server) reload() {
-	_, _, creds, err := loadConfig(s.cfgPath)
-	if err != nil {
-		log.Printf("reload failed, keeping current config: %v", err)
-		return
-	}
-	s.credsMu.Lock()
-	s.creds = creds
-	s.credsMu.Unlock()
+func (s *server) snapshotCreds() []prism.Credential {
+	s.credsMu.RLock()
+	defer s.credsMu.RUnlock()
+	return s.creds
+}
 
-	valid := make(map[prism.ClientID]bool, len(creds))
-	for _, c := range creds {
-		valid[c.ID] = true
-	}
+// kick closes live sessions whose credential matches pred and returns how many.
+func (s *server) kick(pred func(prism.ClientID) bool) int {
 	s.actMu.Lock()
 	var kick []*sessConn
 	for r := range s.active {
-		if !valid[r.id] {
+		if pred(r.id) {
 			kick = append(kick, r)
 		}
 	}
@@ -237,7 +304,101 @@ func (s *server) reload() {
 	for _, r := range kick {
 		r.sess.Close()
 	}
-	log.Printf("reloaded %d credential(s); kicked %d revoked session(s)", len(creds), len(kick))
+	return len(kick)
+}
+
+func (s *server) closeAll() { s.kick(func(prism.ClientID) bool { return true }) }
+
+// setCreds swaps in a new credential list and kicks every session whose
+// credential was removed or whose PSK changed.
+func (s *server) setCreds(ccs []CredConfig) (kicked int, err error) {
+	creds, err := parseCreds(ccs)
+	if err != nil {
+		return 0, err
+	}
+	s.credsMu.Lock()
+	old := make(map[prism.ClientID][]byte, len(s.creds))
+	for _, c := range s.creds {
+		old[c.ID] = c.PSK
+	}
+	s.creds, s.credCfgs = creds, ccs
+	s.credsMu.Unlock()
+	if s.acct != nil {
+		s.acct.syncQuotas(ccs)
+	}
+
+	valid := make(map[prism.ClientID]bool, len(creds))
+	for _, c := range creds {
+		if prev, ok := old[c.ID]; !ok || string(prev) == string(c.PSK) {
+			valid[c.ID] = true
+		}
+	}
+	return s.kick(func(id prism.ClientID) bool { return !valid[id] }), nil
+}
+
+// reload re-reads the config (and credentials file) and applies its
+// credentials. Only credentials and quotas reload; TLS cert, listeners, ciphers
+// and policy flags need a restart.
+func (s *server) reload() {
+	cfg, _, _, err := loadConfig(s.cfgPath)
+	if err != nil {
+		log.Printf("reload failed, keeping current config: %v", err)
+		return
+	}
+	kicked, err := s.setCreds(cfg.creds)
+	if err != nil {
+		log.Printf("reload failed, keeping current config: %v", err)
+		return
+	}
+	log.Printf("reloaded %d credential(s); kicked %d revoked session(s)", len(cfg.creds), kicked)
+}
+
+// handshake runs the configured inner handshake on an established carrier.
+func (s *server) handshake(rw io.ReadWriter) (*prism.Keys, *prism.Credential, []byte, error) {
+	creds := s.snapshotCreds()
+	if s.useNoise {
+		return prism.NoiseServerHandshake(rw, s.priv, creds, s.replay, s.window, s.aeads...)
+	}
+	return prism.ServerHandshake(rw, s.priv, creds, s.replay, s.window, s.aeads...)
+}
+
+// runSession serves one authenticated carrier until it ends.
+func (s *server) runSession(tr io.ReadWriteCloser, keys *prism.Keys, cred *prism.Credential, via string, remote net.Addr) {
+	sess, err := prism.NewSession(tr, keys, false, prism.WithShaping(s.shaping), prism.WithMaxStreams(s.maxStreams))
+	if err != nil {
+		tr.Close()
+		return
+	}
+	defer sess.Close()
+
+	rec := &sessConn{sess: sess, id: cred.ID}
+	s.register(rec)
+	defer s.unregister(rec)
+	// The credential may have been revoked between the handshake snapshot and
+	// registration, in which case no kick would ever reach this session.
+	still := false
+	for _, c := range s.snapshotCreds() {
+		if c.ID == cred.ID && string(c.PSK) == string(cred.PSK) {
+			still = true
+			break
+		}
+	}
+	if !still {
+		return
+	}
+
+	m := s.acct.meter(cred.ID)
+	m.conns.Add(1)
+	m.lastSeen.Store(time.Now().Unix())
+	log.Printf("client %x (%s) connected via %s from %s", cred.ID, cred.Name, via, remote)
+
+	for {
+		st, err := sess.Accept()
+		if err != nil {
+			return
+		}
+		go s.handleStream(st, m)
+	}
 }
 
 func (s *server) handle(raw net.Conn) {
@@ -245,28 +406,16 @@ func (s *server) handle(raw net.Conn) {
 
 	tlsConn := tls.Server(raw, s.tls)
 	ctx, cancel := context.WithTimeout(context.Background(), handshakeTimeout)
-	defer cancel()
-	if err := tlsConn.HandshakeContext(ctx); err != nil {
+	err := tlsConn.HandshakeContext(ctx)
+	cancel()
+	if err != nil {
 		return
 	}
 
-	_ = tlsConn.SetReadDeadline(time.Now().Add(handshakeTimeout))
-	s.credsMu.RLock()
-	creds := s.creds
-	s.credsMu.RUnlock()
-	var (
-		keys     *prism.Keys
-		cred     *prism.Credential
-		consumed []byte
-		hsErr    error
-	)
-	if s.useNoise {
-		keys, cred, consumed, hsErr = prism.NoiseServerHandshake(tlsConn, s.priv, creds, s.replay, s.window, s.aeads...)
-	} else {
-		keys, cred, consumed, hsErr = prism.ServerHandshake(tlsConn, s.priv, creds, s.replay, s.window, s.aeads...)
-	}
+	_ = tlsConn.SetDeadline(time.Now().Add(handshakeTimeout))
+	keys, cred, consumed, hsErr := s.handshake(tlsConn)
+	_ = tlsConn.SetDeadline(time.Time{})
 	if hsErr != nil {
-		_ = tlsConn.SetReadDeadline(time.Time{})
 		if s.wsPath != "" {
 			s.serveCoverOrWS(tlsConn, consumed)
 		} else {
@@ -274,41 +423,13 @@ func (s *server) handle(raw net.Conn) {
 		}
 		return
 	}
-	_ = tlsConn.SetReadDeadline(time.Time{})
-
-	name := "?"
-	if cred != nil {
-		name = fmt.Sprintf("%x", cred.ID)
-	}
-	sess, err := prism.NewSession(tlsConn, keys, false, prism.WithShaping(s.shaping), prism.WithMaxStreams(s.maxStreams))
-	if err != nil {
-		return
-	}
-	defer sess.Close()
-	if cred != nil {
-		rec := &sessConn{sess: sess, id: cred.ID}
-		s.register(rec)
-		defer s.unregister(rec)
-		if s.admin != nil {
-			s.admin.recordConnect(cred.ID)
-		}
-	}
-	log.Printf("client %s connected from %s", name, raw.RemoteAddr())
-
-	for {
-		st, err := sess.Accept()
-		if err != nil {
-			return
-		}
-		go s.handleStream(st)
-	}
+	s.runSession(tlsConn, keys, cred, "tls", raw.RemoteAddr())
 }
 
 func (s *server) serveQUIC(ql *prism.QUICListener) {
 	for {
 		conn, err := ql.Accept(context.Background())
 		if err != nil {
-			log.Printf("quic accept: %v", err)
 			return
 		}
 		go s.handleQUICConn(conn)
@@ -318,62 +439,27 @@ func (s *server) serveQUIC(ql *prism.QUICListener) {
 func (s *server) handleQUICConn(qconn *quic.Conn) {
 	qc, err := prism.QUICServerAccept(qconn, handshakeTimeout)
 	if err != nil {
+		qconn.CloseWithError(0, "")
 		return
 	}
 	defer qc.Close()
 
 	qc.SetDeadline(time.Now().Add(handshakeTimeout))
-	s.credsMu.RLock()
-	creds := s.creds
-	s.credsMu.RUnlock()
-
-	var (
-		keys  *prism.Keys
-		cred  *prism.Credential
-		hsErr error
-	)
-	if s.useNoise {
-		keys, cred, _, hsErr = prism.NoiseServerHandshake(qc, s.priv, creds, s.replay, s.window, s.aeads...)
-	} else {
-		keys, cred, _, hsErr = prism.ServerHandshake(qc, s.priv, creds, s.replay, s.window, s.aeads...)
-	}
+	keys, cred, _, hsErr := s.handshake(qc)
 	if hsErr != nil {
 		return
 	}
 	qc.SetDeadline(time.Time{})
-
-	name := "?"
-	if cred != nil {
-		name = fmt.Sprintf("%x", cred.ID)
-	}
-	sess, err := prism.NewSession(qc, keys, false, prism.WithShaping(s.shaping), prism.WithMaxStreams(s.maxStreams))
-	if err != nil {
-		return
-	}
-	defer sess.Close()
-	if cred != nil {
-		rec := &sessConn{sess: sess, id: cred.ID}
-		s.register(rec)
-		defer s.unregister(rec)
-		if s.admin != nil {
-			s.admin.recordConnect(cred.ID)
-		}
-	}
-	log.Printf("QUIC client %s connected from %s", name, qconn.RemoteAddr())
-
-	for {
-		st, err := sess.Accept()
-		if err != nil {
-			return
-		}
-		go s.handleStream(st)
-	}
+	s.runSession(qc, keys, cred, "quic", qconn.RemoteAddr())
 }
 
-func (s *server) handleStream(st *prism.Stream) {
+func (s *server) handleStream(st *prism.Stream, m *meter) {
 	defer st.Close()
+	if !m.allowed() {
+		return // daily quota exhausted
+	}
 	if st.IsUDP() {
-		s.handleUDP(st)
+		s.handleUDP(st, m)
 		return
 	}
 	remote, err := safeDial(st.Target(), s.allowPrivate, 10*time.Second)
@@ -384,25 +470,30 @@ func (s *server) handleStream(st *prism.Stream) {
 		return
 	}
 	defer remote.Close()
-	relay(st, remote)
+	relay(st, remote, m)
 }
 
 // relay copies bidirectionally between a Prism stream and a TCP connection,
-// propagating half-close in each direction.
-func relay(st *prism.Stream, remote net.Conn) {
+// propagating half-close in each direction and metering both.
+func relay(st *prism.Stream, remote net.Conn, m *meter) {
 	done := make(chan struct{}, 2)
 	go func() {
-		io.Copy(remote, st)
+		copyMetered(remote, st, func(n int64) bool { return m.add(n, 0) })
 		if tc, ok := remote.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
 		done <- struct{}{}
 	}()
 	go func() {
-		io.Copy(st, remote)
+		copyMetered(st, remote, func(n int64) bool { return m.add(0, n) })
 		st.CloseWrite()
 		done <- struct{}{}
 	}()
 	<-done
+	if !m.allowed() {
+		// Out of quota: don't leave the other direction parked on a read.
+		st.Close()
+		remote.Close()
+	}
 	<-done
 }

@@ -18,6 +18,7 @@ type dnsProxy struct {
 	dialer   *Dialer
 	upstream string // "1.1.1.1:53" etc.
 	conn     *net.UDPConn
+	tcp      net.Listener // DNS-over-TCP (truncated answers, large records)
 
 	mu      sync.Mutex
 	stopped bool
@@ -35,17 +36,39 @@ func newDNSProxy(d *Dialer, listen, upstream string) (*dnsProxy, error) {
 	if upstream == "" {
 		upstream = "1.1.1.1:53"
 	}
-	dp := &dnsProxy{
-		dialer:   d,
-		upstream: upstream,
-		conn:     conn,
+	// Resolvers retry over TCP when a UDP answer is truncated; without this
+	// listener those lookups would fail (or fall back to a leaking resolver).
+	tcp, err := net.Listen("tcp", conn.LocalAddr().String())
+	if err != nil {
+		conn.Close()
+		return nil, err
 	}
-	return dp, nil
+	return &dnsProxy{dialer: d, upstream: upstream, conn: conn, tcp: tcp}, nil
+}
+
+func (dp *dnsProxy) serveTCP() {
+	for {
+		c, err := dp.tcp.Accept()
+		if err != nil {
+			return
+		}
+		go func() {
+			defer c.Close()
+			st, err := dp.dialer.Open(dp.upstream)
+			if err != nil {
+				return
+			}
+			defer st.Close()
+			c.SetDeadline(time.Now().Add(30 * time.Second))
+			relayConn(c, st)
+		}()
+	}
 }
 
 func (dp *dnsProxy) Addr() net.Addr { return dp.conn.LocalAddr() }
 
 func (dp *dnsProxy) Serve() {
+	go dp.serveTCP()
 	buf := make([]byte, 4096)
 	for {
 		n, clientAddr, err := dp.conn.ReadFromUDP(buf)
@@ -104,5 +127,6 @@ func (dp *dnsProxy) Close() error {
 	dp.mu.Lock()
 	dp.stopped = true
 	dp.mu.Unlock()
+	dp.tcp.Close()
 	return dp.conn.Close()
 }

@@ -3,9 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"fmt"
 	"io"
-	"log"
 	"net"
 	"time"
 
@@ -50,71 +48,39 @@ func (s *server) handleSteal(raw net.Conn) {
 	}
 	_ = raw.SetReadDeadline(time.Time{})
 
-	// Extract session_id and verify the steal marker.
-	sid, err := prism.ParseClientHelloSessionID(record)
-	if err != nil {
-		s.relayToStealDest(raw, record)
-		return
-	}
-
-	s.credsMu.RLock()
-	creds := s.creds
-	s.credsMu.RUnlock()
-
-	if prism.VerifyStealMarker(sid, creds) == nil {
-		// Not an authenticated client — relay to real target.
+	// An authenticated client's hello carries a marker bound to the whole
+	// ClientHello and to the current time; each one is accepted once.
+	hello := record[5:]
+	cred := prism.VerifyStealMarker(hello, s.snapshotCreds(), s.window, time.Now())
+	if cred == nil || !s.stealReplay.Accept(prism.HelloSessionID(hello)) {
 		s.relayToStealDest(raw, record)
 		return
 	}
 
 	// Authenticated Prism client. Replay the ClientHello into our own TLS
-	// server (self-signed cert for the steal SNI). The client skips cert
-	// verification in steal mode; real authentication happens inside (Prism
-	// handshake with PSK + X25519).
+	// server (ephemeral cert). The client skips cert verification in steal
+	// mode; real authentication is the inner Prism handshake.
 	pc := &prefixConn{Conn: raw, pre: record}
 	tlsConn := tls.Server(pc, s.tls)
 	ctx, cancel := context.WithTimeout(context.Background(), handshakeTimeout)
-	defer cancel()
-	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		return
-	}
-
-	// From here, identical to the normal handle() path.
-	_ = tlsConn.SetReadDeadline(time.Now().Add(handshakeTimeout))
-	s.credsMu.RLock()
-	creds = s.creds // re-snapshot under lock (may have changed)
-	s.credsMu.RUnlock()
-	keys, cred, consumed, err := prism.ServerHandshake(tlsConn, s.priv, creds, s.replay, s.window, s.aeads...)
-	if err != nil {
-		_ = tlsConn.SetReadDeadline(time.Time{})
-		serveCover(tlsConn, consumed, s.cover)
-		return
-	}
-	_ = tlsConn.SetReadDeadline(time.Time{})
-
-	name := "?"
-	if cred != nil {
-		name = fmt.Sprintf("%x", cred.ID)
-	}
-	sess, err := prism.NewSession(tlsConn, keys, false, prism.WithShaping(s.shaping), prism.WithMaxStreams(s.maxStreams))
+	err := tlsConn.HandshakeContext(ctx)
+	cancel()
 	if err != nil {
 		return
 	}
-	defer sess.Close()
-	if cred != nil {
-		rec := &sessConn{sess: sess, id: cred.ID}
-		s.register(rec)
-		defer s.unregister(rec)
-	}
-	log.Printf("steal: client %s connected from %s", name, raw.RemoteAddr())
 
-	for {
-		st, err := sess.Accept()
-		if err != nil {
-			return
+	_ = tlsConn.SetDeadline(time.Now().Add(handshakeTimeout))
+	keys, cred, consumed, err := s.handshake(tlsConn)
+	_ = tlsConn.SetDeadline(time.Time{})
+	if err != nil {
+		if s.wsPath != "" {
+			s.serveCoverOrWS(tlsConn, consumed)
+		} else {
+			serveCover(tlsConn, consumed, s.cover)
 		}
-		go s.handleStream(st)
+		return
 	}
+	s.runSession(tlsConn, keys, cred, "steal", raw.RemoteAddr())
 }
 
 // relayToStealDest relays a connection (with already-buffered bytes) to the

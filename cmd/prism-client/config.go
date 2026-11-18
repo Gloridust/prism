@@ -136,6 +136,62 @@ func (c *ClientConfig) defaults() {
 	}
 }
 
+// validate rejects configurations that cannot work or would silently weaken
+// the tunnel, so mistakes fail at startup rather than at the first connection.
+func (c *ClientConfig) validate() error {
+	if _, _, err := net.SplitHostPort(c.Server); err != nil {
+		return fmt.Errorf("server must be host:port: %w", err)
+	}
+	if c.SNI == "" {
+		return fmt.Errorf("sni is required")
+	}
+	switch c.Mode {
+	case "desktop", "router":
+	default:
+		return fmt.Errorf("mode: unknown value %q (want \"desktop\" or \"router\")", c.Mode)
+	}
+	switch c.Transport {
+	case "", "tls", "ws", "quic":
+	default:
+		return fmt.Errorf("transport: unknown value %q (want \"\", \"tls\", \"ws\" or \"quic\")", c.Transport)
+	}
+	switch c.Handshake {
+	case "", "legacy", "noise":
+	default:
+		return fmt.Errorf("handshake: unknown value %q (want \"\", \"legacy\" or \"noise\")", c.Handshake)
+	}
+	if c.Steal && c.Transport == "quic" {
+		return fmt.Errorf("steal cannot be combined with transport \"quic\"")
+	}
+	if c.Steal && c.ECH != "" {
+		return fmt.Errorf("steal cannot be combined with ech (the steal marker lives in the outer ClientHello)")
+	}
+	if c.IATMaxMs < 0 || c.IATMaxMs > 1000 {
+		return fmt.Errorf("iat_max_ms must be between 0 and 1000")
+	}
+	if c.TUN != nil {
+		if _, _, err := net.ParseCIDR(c.TUN.Address); err != nil {
+			return fmt.Errorf("tun.address must be CIDR, e.g. 10.0.85.1/24: %w", err)
+		}
+		if net.ParseIP(c.TUN.Gateway) == nil {
+			return fmt.Errorf("tun.gateway must be an IP address")
+		}
+		if c.tunSetRoutes() && net.ParseIP(c.TUN.OrigGateway) == nil {
+			return fmt.Errorf("tun.orig_gateway (your LAN's default gateway IP) is required when tun.set_routes is on")
+		}
+	}
+	return nil
+}
+
+func isLoopbackListen(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return host == "localhost" || (ip != nil && ip.IsLoopback())
+}
+
 func (c *ClientConfig) autoConnect() bool {
 	return c.AutoConnect == nil || *c.AutoConnect
 }
@@ -191,6 +247,9 @@ func loadClientConfig(path string) (*ClientConfig, *prism.Credential, error) {
 		return nil, nil, fmt.Errorf("parsing %s: %w", path, err)
 	}
 	c.defaults()
+	if err := c.validate(); err != nil {
+		return nil, nil, err
+	}
 	id, err := prism.ParseClientID(c.ID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("id: %w", err)

@@ -252,12 +252,7 @@ func serveSteal(raw net.Conn, tlsCfg *tls.Config, priv *ecdh.PrivateKey, creds [
 	}
 	_ = raw.SetReadDeadline(time.Time{})
 
-	sid, err := prism.ParseClientHelloSessionID(record)
-	if err != nil {
-		relayTCP(raw, record, realTarget)
-		return
-	}
-	if prism.VerifyStealMarker(sid, creds) == nil {
+	if prism.VerifyStealMarker(record[5:], creds, 2*time.Minute, time.Now()) == nil {
 		relayTCP(raw, record, realTarget)
 		return
 	}
@@ -411,11 +406,11 @@ func TestStealModeEndToEnd(t *testing.T) {
 		if err := uconn.BuildHandshakeState(); err != nil {
 			t.Fatalf("BuildHandshakeState: %v", err)
 		}
-		sid := uconn.HandshakeState.Hello.SessionId
-		if len(sid) < 32 {
-			t.Fatalf("session_id too short: %d", len(sid))
+		hello := uconn.HandshakeState.Hello
+		if err := prism.EmbedStealMarker(hello.Raw, stealKey, time.Now()); err != nil {
+			t.Fatalf("EmbedStealMarker: %v", err)
 		}
-		prism.EmbedStealMarker(sid, stealKey)
+		copy(hello.SessionId, prism.HelloSessionID(hello.Raw))
 
 		_ = uconn.SetDeadline(time.Now().Add(10 * time.Second))
 		if err := uconn.Handshake(); err != nil {
@@ -1098,7 +1093,7 @@ func TestQUICTransportEndToEnd(t *testing.T) {
 	tlsCfg := &tls.Config{
 		Certificates: []tls.Certificate{selfSignedCert(t)},
 		MinVersion:   tls.VersionTLS13,
-		NextProtos:   []string{"h3", "prism-quic"},
+		NextProtos:   []string{"h3"},
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1114,7 +1109,7 @@ func TestQUICTransportEndToEnd(t *testing.T) {
 	t.Run("quic-echo", func(t *testing.T) {
 		clientTLS := &tls.Config{
 			InsecureSkipVerify: true,
-			NextProtos:         []string{"h3", "prism-quic"},
+			NextProtos:         []string{"h3"},
 		}
 		qc, err := prism.QUICClientDial(ql.Addr().String(), clientTLS, 5*time.Second)
 		if err != nil {
@@ -1150,7 +1145,7 @@ func TestQUICTransportEndToEnd(t *testing.T) {
 	t.Run("quic-concurrent-streams", func(t *testing.T) {
 		clientTLS := &tls.Config{
 			InsecureSkipVerify: true,
-			NextProtos:         []string{"h3", "prism-quic"},
+			NextProtos:         []string{"h3"},
 		}
 		qc, err := prism.QUICClientDial(ql.Addr().String(), clientTLS, 5*time.Second)
 		if err != nil {

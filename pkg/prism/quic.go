@@ -20,13 +20,20 @@ type QUICConn struct {
 	mu     sync.Mutex
 }
 
+// quicTLS returns a copy of cfg for QUIC: ALPN is always exactly "h3" (what
+// every HTTP/3 endpoint speaks — a private ALPN would be a fingerprint, and the
+// TCP listener's h2/http1.1 list is meaningless over QUIC) and TLS 1.3 only.
+func quicTLS(cfg *tls.Config) *tls.Config {
+	c := cfg.Clone()
+	c.NextProtos = []string{"h3"}
+	c.MinVersion = tls.VersionTLS13
+	return c
+}
+
 // QUICClientDial establishes a QUIC connection to the server and opens a
 // single bidirectional stream for the Prism handshake + data phase.
 func QUICClientDial(addr string, tlsCfg *tls.Config, timeout time.Duration) (*QUICConn, error) {
-	if tlsCfg.NextProtos == nil {
-		tlsCfg = tlsCfg.Clone()
-		tlsCfg.NextProtos = []string{"h3", "prism-quic"}
-	}
+	tlsCfg = quicTLS(tlsCfg)
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -105,10 +112,7 @@ type QUICListener struct {
 
 // NewQUICListener creates a QUIC listener on the given address.
 func NewQUICListener(addr string, tlsCfg *tls.Config) (*QUICListener, error) {
-	if tlsCfg.NextProtos == nil {
-		tlsCfg = tlsCfg.Clone()
-		tlsCfg.NextProtos = []string{"h3", "prism-quic"}
-	}
+	tlsCfg = quicTLS(tlsCfg)
 
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {

@@ -12,6 +12,8 @@ import (
 	"log"
 	"math/big"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/acme"
@@ -64,7 +66,12 @@ func acmeTLSConfig(a *ACMEConfig) (*tls.Config, error) {
 	}
 	cacheDir := a.CacheDir
 	if cacheDir == "" {
-		cacheDir = "/etc/prism/acme"
+		// Under systemd, StateDirectory= exports a writable per-service dir.
+		if sd := os.Getenv("STATE_DIRECTORY"); sd != "" {
+			cacheDir = filepath.Join(strings.Split(sd, ":")[0], "acme")
+		} else {
+			cacheDir = "/etc/prism/acme"
+		}
 	}
 	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
 		return nil, fmt.Errorf("acme cache dir %s: %w", cacheDir, err)

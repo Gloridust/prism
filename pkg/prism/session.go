@@ -74,6 +74,8 @@ var (
 	// ErrSessionDraining is returned when new streams are rejected because
 	// the session's max lifetime has been reached and it is draining.
 	ErrSessionDraining = errors.New("prism: session draining (max lifetime reached)")
+	// ErrFlowControl ends a session whose peer sent more than its window allows.
+	ErrFlowControl = errors.New("prism: peer violated stream flow control")
 )
 
 var be = binary.BigEndian
@@ -106,12 +108,12 @@ type Session struct {
 	keepEvery   time.Duration
 	idleTimeout time.Duration
 
-	buckets    []int     // egress length-shaping buckets; nil = no shaping
-	profile    *Profile  // traffic profile (superset of buckets; nil = no profile)
-	maxStreams int   // cap on concurrent streams; 0 = unlimited
+	buckets    []int    // egress length-shaping buckets; nil = no shaping
+	profile    *Profile // traffic profile (superset of buckets; nil = no profile)
+	maxStreams int      // cap on concurrent streams; 0 = unlimited
 	maxLife    time.Duration
 	draining   chan struct{} // closed when the session starts draining (max lifetime)
-	iatMaxMs   int          // inter-arrival time shaping: max random delay in ms (0 = off)
+	iatMaxMs   int           // inter-arrival time shaping: max random delay in ms (0 = off)
 
 	// Reusable buffers — eliminate per-frame heap allocations on the hot path.
 	// wplain/wout are protected by wmu; rct is readLoop-only.
@@ -409,11 +411,16 @@ func (s *Session) dispatch(plain []byte) {
 		}
 	case cmdData:
 		if st := s.lookup(id); st != nil {
-			st.deliver(append([]byte(nil), data...))
+			if !st.deliver(append([]byte(nil), data...)) {
+				// The peer sent past the window it was granted. A conforming
+				// sender cannot do this, so treat it as hostile: buffering it
+				// would let one stream exhaust memory.
+				s.teardown(ErrFlowControl)
+			}
 		}
 	case cmdWnd:
 		if st := s.lookup(id); st != nil && len(data) >= 4 {
-			st.addCredit(int(be.Uint32(data)))
+			st.addCredit(be.Uint32(data))
 		}
 	case cmdFIN:
 		if st := s.lookup(id); st != nil {
@@ -613,14 +620,23 @@ func (st *Stream) IsUDP() bool { return st.udp }
 // deliver is called by the session read loop. It never blocks: the sender's
 // flow-control window bounds how much can be queued here, so appending is safe
 // and the read loop stays free to service other streams.
-func (st *Stream) deliver(b []byte) {
+//
+// It returns false if the peer overran the receive window. Bytes the reader
+// has consumed but not yet credited back still count against the window, so a
+// conforming sender can never have more than streamWindow outstanding.
+func (st *Stream) deliver(b []byte) bool {
 	st.rmu.Lock()
-	if st.readErr == nil {
-		st.queue = append(st.queue, b)
-		st.queued += len(b)
-		st.rcond.Broadcast()
+	defer st.rmu.Unlock()
+	if st.readErr != nil {
+		return true
 	}
-	st.rmu.Unlock()
+	if st.queued+st.consumed+len(b) > streamWindow {
+		return false
+	}
+	st.queue = append(st.queue, b)
+	st.queued += len(b)
+	st.rcond.Broadcast()
+	return true
 }
 
 func (st *Stream) closeRead(err error) {
@@ -641,9 +657,16 @@ func (st *Stream) failWrite(err error) {
 	st.wmu.Unlock()
 }
 
-func (st *Stream) addCredit(n int) {
+// addCredit grows the send window by a peer-supplied amount. The value is
+// untrusted: it is clamped so the window can never exceed streamWindow (or go
+// negative on 32-bit targets), whatever the peer sends.
+func (st *Stream) addCredit(n uint32) {
 	st.wmu.Lock()
-	st.sendWin += n
+	if room := streamWindow - st.sendWin; uint64(n) > uint64(room) {
+		st.sendWin = streamWindow
+	} else {
+		st.sendWin += int(n)
+	}
 	st.wcond.Broadcast()
 	st.wmu.Unlock()
 }
