@@ -21,28 +21,27 @@ func ksRules(p ksParams) [][]string {
 	local4 := "localip=" + joinAddrs(complementRanges(false, append(hostPrefixes(p.tun4), netip.MustParsePrefix("127.0.0.0/8"))), ",")
 	local6 := "localip=" + joinAddrs(complementRanges(true, hostPrefixes(p.tun6, netip.IPv6Loopback())), ",")
 
-	if ksTestScope != nil {
-		v4, v6 := splitFamilies(ksTestScope)
-		var out [][]string
-		if len(v4) > 0 {
-			out = append(out, rule(local4, "remoteip="+joinAddrs(v4, ",")))
-		}
-		if len(v6) > 0 {
-			out = append(out, rule(local6, "remoteip="+joinAddrs(v6, ",")))
-		}
-		return out
-	}
-
 	allow4 := append(append([]netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}, ksLocal4...), hostPrefixes(p.servers...)...)
 	allow6 := append([]netip.Prefix{netip.PrefixFrom(netip.IPv6Loopback(), 128)}, ksLocal6...)
-	return [][]string{
-		rule(local4, "remoteip="+joinAddrs(complementRanges(false, allow4), ",")),
-		rule(local6, "remoteip="+joinAddrs(complementRanges(true, allow6), ",")),
+	remote4 := "remoteip=" + joinAddrs(complementRanges(false, allow4), ",")
+	remote6 := "remoteip=" + joinAddrs(complementRanges(true, allow6), ",")
+
+	out := [][]string{
 		rule(local4, "protocol=UDP", "remoteport=53"),
 		rule(local4, "protocol=TCP", "remoteport=53"),
 		rule(local6, "protocol=UDP", "remoteport=53"),
 		rule(local6, "protocol=TCP", "remoteport=53"),
 	}
+	if ksTestKeep443 {
+		// Same remote set, but per protocol so TCP 443 can be left out.
+		for _, fam := range [][2]string{{local4, remote4}, {local6, remote6}} {
+			out = append(out,
+				rule(fam[0], fam[1], "protocol=TCP", "remoteport=1-442,444-65535"),
+				rule(fam[0], fam[1], "protocol=UDP"))
+		}
+		return out
+	}
+	return append(out, rule(local4, remote4), rule(local6, remote6))
 }
 
 func enableKillSwitch(p ksParams) error {

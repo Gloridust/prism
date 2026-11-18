@@ -103,19 +103,19 @@ func expect(t *testing.T, what, addr, want string) {
 
 // TestKillSwitch installs the real firewall rules around a real TUN device and
 // checks what gets out. On Linux it runs in an isolated network namespace with
-// the full production ruleset; on macOS and Windows, where the host must keep
-// its connectivity, the final "reject everything else" is narrowed to a
-// documentation prefix (ksTestScope) and everything else is identical.
+// exactly the production ruleset. On macOS and Windows it runs on the host
+// itself with the production ruleset plus one exception — TCP 443 stays open
+// (ksTestKeep443) so a CI agent keeps its control connection.
 //
 // Requires root/admin: PRISM_ROOT_TEST=1.
 func TestKillSwitch(t *testing.T) {
 	if os.Getenv("PRISM_ROOT_TEST") == "" {
 		t.Skip("set PRISM_ROOT_TEST=1 (requires root/admin)")
 	}
-	full := ksTestPrepare(t)
-	if !full {
-		ksTestScope = mustPrefixes("203.0.113.0/24")
-		defer func() { ksTestScope = nil }()
+	isolated := ksTestPrepare(t)
+	if !isolated {
+		ksTestKeep443 = true
+		defer func() { ksTestKeep443 = false }()
 	}
 
 	echoAddr, stopEcho := startEchoServer(t)
@@ -177,10 +177,10 @@ func TestKillSwitch(t *testing.T) {
 
 	viaTunnel("with the kill switch on")
 	expect(t, "kill switch on", direct, "blocked")
-	if full {
-		expect(t, "the Prism server stays reachable", "192.0.2.50:443", "passed")
-		expect(t, "the local network stays reachable", "192.168.77.9:445", "passed")
-		expect(t, "DNS to a LAN resolver", "192.168.77.1:53", "blocked")
+	expect(t, "the Prism server stays reachable", "192.0.2.50:8443", "passed")
+	expect(t, "the local network stays reachable", "192.168.77.9:445", "passed")
+	expect(t, "DNS to a LAN resolver", "192.168.77.1:53", "blocked")
+	if isolated {
 		expect(t, "IPv6 direct", "[2001:db8::7]:81", "blocked")
 	}
 
@@ -188,7 +188,7 @@ func TestKillSwitch(t *testing.T) {
 	ksTestCrash(dev)
 	time.Sleep(300 * time.Millisecond)
 	expect(t, "after the tunnel died", direct, "blocked")
-	if full {
+	if isolated {
 		expect(t, "after the tunnel died, formerly tunnelled traffic", "198.51.100.7:80", "blocked")
 	}
 

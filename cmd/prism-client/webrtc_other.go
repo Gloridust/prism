@@ -6,18 +6,31 @@ import (
 	"encoding/json"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 )
 
 type chromiumBrowser struct {
-	name, installDir, policyDir, key string
+	name      string
+	binaries  []string // any of these on PATH means the browser is installed
+	policyDir string
+	key       string
 }
 
 var chromiumBrowsers = []chromiumBrowser{
-	{"Chrome", "/etc/opt/chrome", "/etc/opt/chrome/policies/managed", "WebRtcIPHandling"},
-	{"Chromium", "/etc/chromium", "/etc/chromium/policies/managed", "WebRtcIPHandling"},
-	{"Edge", "/etc/opt/edge", "/etc/opt/edge/policies/managed", "WebRtcLocalhostIpHandling"},
-	{"Brave", "/etc/brave", "/etc/brave/policies/managed", "WebRtcIPHandling"},
+	{"Chrome", []string{"google-chrome", "google-chrome-stable"}, "/etc/opt/chrome/policies/managed", "WebRtcIPHandling"},
+	{"Chromium", []string{"chromium", "chromium-browser"}, "/etc/chromium/policies/managed", "WebRtcIPHandling"},
+	{"Edge", []string{"microsoft-edge", "microsoft-edge-stable"}, "/etc/opt/edge/policies/managed", "WebRtcLocalhostIpHandling"},
+	{"Brave", []string{"brave-browser", "brave"}, "/etc/brave/policies/managed", "WebRtcIPHandling"},
+}
+
+func (b chromiumBrowser) installed() bool {
+	for _, name := range b.binaries {
+		if _, err := exec.LookPath(name); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 const linuxPolicyFile = "prism-webrtc.json"
@@ -27,7 +40,7 @@ const linuxPolicyFile = "prism-webrtc.json"
 // (which TUN mode already has); otherwise it just explains what to do.
 func applyChromiumWebRTC(value string) (restore []func(), applied []string) {
 	for _, b := range chromiumBrowsers {
-		if _, err := os.Stat(b.installDir); err != nil {
+		if !b.installed() {
 			continue
 		}
 		path := filepath.Join(b.policyDir, linuxPolicyFile)

@@ -24,20 +24,13 @@ func ksRuleset(p ksParams) string {
 		fmt.Fprintf(&b, "\t\t%smeta l4proto tcp reject with tcp reset\n", match)
 		fmt.Fprintf(&b, "\t\t%sreject with icmpx type admin-prohibited\n", match)
 	}
-	if ksTestScope != nil {
-		v4, v6 := splitFamilies(ksTestScope)
-		if len(v4) > 0 {
-			reject(fmt.Sprintf("ip daddr { %s } ", joinAddrs(v4, ", ")))
-		}
-		if len(v6) > 0 {
-			reject(fmt.Sprintf("ip6 daddr { %s } ", joinAddrs(v6, ", ")))
-		}
-	} else {
-		reject("meta l4proto { tcp, udp } th dport 53 ")
-		fmt.Fprintf(&b, "\t\tip daddr { %s } accept\n", joinAddrs(ksLocal4, ", "))
-		fmt.Fprintf(&b, "\t\tip6 daddr { %s } accept\n", joinAddrs(ksLocal6, ", "))
-		reject("")
+	if ksTestKeep443 {
+		b.WriteString("\t\ttcp dport 443 accept\n")
 	}
+	reject("meta l4proto { tcp, udp } th dport 53 ")
+	fmt.Fprintf(&b, "\t\tip daddr { %s } accept\n", joinAddrs(ksLocal4, ", "))
+	fmt.Fprintf(&b, "\t\tip6 daddr { %s } accept\n", joinAddrs(ksLocal6, ", "))
+	reject("")
 	b.WriteString("\t}\n}\n")
 	return b.String()
 }

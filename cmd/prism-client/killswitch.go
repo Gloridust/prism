@@ -40,10 +40,10 @@ var (
 	ksLocal4 = mustPrefixes("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "224.0.0.0/4", "255.255.255.255/32")
 	ksLocal6 = mustPrefixes("fe80::/10", "fc00::/7", "ff00::/8")
 
-	// ksTestScope, when set, narrows "reject everything else" to these
-	// prefixes (and skips the DNS rule) so the rules can be exercised on a
-	// machine that must keep its real connectivity. Tests only.
-	ksTestScope []netip.Prefix
+	// ksTestKeep443 additionally lets TCP port 443 out. Tests only: it keeps a
+	// CI agent's control connection alive while the rest of the production
+	// ruleset is exercised on a machine that cannot be cut off entirely.
+	ksTestKeep443 bool
 )
 
 func ksParamsFor(dev *tunDevice, cfg *ClientConfig) (ksParams, error) {
@@ -78,17 +78,6 @@ func joinAddrs[T fmt.Stringer](xs []T, sep string) string {
 		ss[i] = x.String()
 	}
 	return strings.Join(ss, sep)
-}
-
-func splitFamilies(ps []netip.Prefix) (v4, v6 []netip.Prefix) {
-	for _, p := range ps {
-		if p.Addr().Is4() {
-			v4 = append(v4, p)
-		} else {
-			v6 = append(v6, p)
-		}
-	}
-	return
 }
 
 // addrRange is an inclusive address range.

@@ -23,9 +23,8 @@ func ksRuleset(p ksParams) string {
 	if len(p.servers) > 0 {
 		fmt.Fprintf(&b, "pass out quick inet to { %s }\n", joinAddrs(p.servers, ", "))
 	}
-	if ksTestScope != nil {
-		fmt.Fprintf(&b, "block return out quick to { %s }\n", joinAddrs(ksTestScope, ", "))
-		return b.String()
+	if ksTestKeep443 {
+		b.WriteString("pass out quick proto tcp to any port 443\n")
 	}
 	b.WriteString("block return out quick proto { tcp, udp } to any port 53\n")
 	fmt.Fprintf(&b, "pass out quick inet to { %s }\n", joinAddrs(ksLocal4, ", "))
