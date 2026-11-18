@@ -28,7 +28,7 @@ const channelSize = 512
 
 // tunUDPIdle ends a TUN UDP flow after this long with no traffic either way,
 // matching the server's per-association idle timeout.
-var tunUDPIdle = 60 * time.Second
+const tunUDPIdle = 60 * time.Second
 
 // ULA used on the TUN interface so the OS will source IPv6 traffic from it.
 // Every IPv6 destination is then routed into the tunnel (::/1 + 8000::/1), so
@@ -178,6 +178,10 @@ func relayTCP(local net.Conn, dialer proxyDialer, target string) {
 // datagram is framed with its destination (prism.WriteDatagram), which is what
 // the server's UDP egress expects; replies come back framed the same way.
 func relayUDP(local net.Conn, dialer proxyDialer, target string) {
+	relayUDPIdle(local, dialer, target, tunUDPIdle)
+}
+
+func relayUDPIdle(local net.Conn, dialer proxyDialer, target string, idle time.Duration) {
 	defer local.Close()
 
 	st, err := dialer.OpenUDP()
@@ -206,11 +210,11 @@ func relayUDP(local net.Conn, dialer proxyDialer, target string) {
 
 	buf := make([]byte, 65535)
 	for {
-		_ = local.SetReadDeadline(time.Now().Add(tunUDPIdle))
+		_ = local.SetReadDeadline(time.Now().Add(idle))
 		n, err := local.Read(buf)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() &&
-				time.Since(time.Unix(0, last.Load())) < tunUDPIdle {
+				time.Since(time.Unix(0, last.Load())) < idle {
 				continue
 			}
 			return

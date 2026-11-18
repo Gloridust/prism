@@ -452,14 +452,10 @@ func TestTunRouterIPv6(t *testing.T) {
 }
 
 func TestTunRouterUDPIdleTimeout(t *testing.T) {
-	old := tunUDPIdle
-	tunUDPIdle = 200 * time.Millisecond
-	defer func() { tunUDPIdle = old }()
-
 	local, peer := net.Pipe()
 	defer peer.Close()
 	done := make(chan struct{})
-	go func() { relayUDP(local, &mockDialer{}, "192.0.2.1:53"); close(done) }()
+	go func() { relayUDPIdle(local, &mockDialer{}, "192.0.2.1:53", 200*time.Millisecond); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(3 * time.Second):
