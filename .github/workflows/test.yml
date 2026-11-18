@@ -37,6 +37,8 @@ jobs:
         run: |
           sudo unshare --net bash -c \
             'PRISM_ROOT_TEST=1 /tmp/prism-client-test -test.v -test.run "TestKillSwitch$" -test.timeout 120s'
+      - name: Kill switch survives a real reboot (systemd machine restarted for real)
+        run: ./scripts/test-killswitch-reboot.sh
       - name: Real Chrome / Edge obey the WebRTC guard (no STUN from the real address)
         run: sudo PRISM_BROWSER_TEST=1 /tmp/prism-client-test -test.v -test.run 'TestChromiumHonoursWebRTCGuard' -test.timeout 300s
       - name: Real Firefox obeys the WebRTC guard

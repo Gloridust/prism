@@ -65,6 +65,9 @@ func ksUnitText(nft string) string {
 	return `[Unit]
 Description=Prism kill switch (no direct traffic until the tunnel is up)
 DefaultDependencies=no
+# The distribution's own nftables.service starts with "flush ruleset"; load
+# after it so it cannot wipe the kill switch.
+After=nftables.service
 Before=network-pre.target
 Wants=network-pre.target
 

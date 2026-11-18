@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -91,4 +92,31 @@ func ksTestBoot(t *testing.T, p ksParams) (reinstated bool) {
 		t.Error("unit file left behind after unpersist")
 	}
 	return reinstated
+}
+
+// The two tests below are the in-machine half of scripts/test-killswitch-reboot.sh,
+// which runs them inside a container whose PID 1 is systemd and really
+// restarts it in between. They use the production paths and the real systemctl.
+
+func bootTestParams() ksParams {
+	return ksParams{tunName: "prism0", tun4: netip.MustParseAddr("10.0.85.1"), tun6: netip.MustParseAddr(tunAddr6),
+		servers: []netip.Addr{netip.MustParseAddr("192.0.2.50")}}
+}
+
+func TestKillSwitchBootInstall(t *testing.T) {
+	if os.Getenv("PRISM_BOOT_TEST") == "" {
+		t.Skip("run by scripts/test-killswitch-reboot.sh inside a disposable systemd machine")
+	}
+	if err := persistKillSwitch(bootTestParams()); err != nil {
+		t.Fatalf("persistKillSwitch: %v", err)
+	}
+}
+
+func TestKillSwitchBootRemove(t *testing.T) {
+	if os.Getenv("PRISM_BOOT_TEST") == "" {
+		t.Skip("run by scripts/test-killswitch-reboot.sh inside a disposable systemd machine")
+	}
+	if err := disableKillSwitch(); err != nil {
+		t.Fatalf("disableKillSwitch: %v", err)
+	}
 }
